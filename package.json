@@ -1,0 +1,47 @@
+{
+  "name": "@nilskluewer/pi-permission-gate",
+  "version": "0.1.0",
+  "description": "Confirm or block dangerous bash commands before the Pi coding agent executes them.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "pi-extension",
+    "permission",
+    "safety",
+    "guardrail",
+    "bash",
+    "security"
+  ],
+  "author": {
+    "name": "Nils Klüwer",
+    "url": "https://github.com/nilskluewer"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nilskluewer/pi-extensions.git",
+    "directory": "packages/permission-gate"
+  },
+  "bugs": {
+    "url": "https://github.com/nilskluewer/pi-extensions/issues"
+  },
+  "homepage": "https://github.com/nilskluewer/pi-extensions/tree/main/packages/permission-gate#readme",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/permission-gate.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "scripts": {
+    "pack:dry": "npm pack --dry-run"
+  }
+}
