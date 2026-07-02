@@ -21,13 +21,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nilskluewer/pi-extensions.git",
-    "directory": "packages/permission-gate"
+    "url": "git+https://github.com/nilskluewer/pi-permission-gate.git"
   },
   "bugs": {
-    "url": "https://github.com/nilskluewer/pi-extensions/issues"
+    "url": "https://github.com/nilskluewer/pi-permission-gate/issues"
   },
-  "homepage": "https://github.com/nilskluewer/pi-extensions/tree/main/packages/permission-gate#readme",
+  "homepage": "https://github.com/nilskluewer/pi-permission-gate#readme",
   "files": [
     "extensions",
     "README.md",
