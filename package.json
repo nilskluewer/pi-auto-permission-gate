@@ -41,7 +41,8 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "scripts": {
-    "pack:dry": "npm pack --dry-run"
+    "pack:dry": "npm pack --dry-run",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs"
   },
   "publishConfig": {
     "access": "public",
