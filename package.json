@@ -1,6 +1,6 @@
 {
-  "name": "@nilskluewer/pi-permission-gate",
-  "version": "0.2.0",
+  "name": "@nilskluewer/pi-auto-permission-gate",
+  "version": "0.3.0",
   "description": "Confirm or block dangerous bash commands before the Pi coding agent executes them.",
   "type": "module",
   "keywords": [
@@ -24,12 +24,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nilskluewer/pi-permission-gate.git"
+    "url": "git+https://github.com/nilskluewer/pi-auto-permission-gate.git"
   },
   "bugs": {
-    "url": "https://github.com/nilskluewer/pi-permission-gate/issues"
+    "url": "https://github.com/nilskluewer/pi-auto-permission-gate/issues"
   },
-  "homepage": "https://github.com/nilskluewer/pi-permission-gate#readme",
+  "homepage": "https://github.com/nilskluewer/pi-auto-permission-gate#readme",
   "files": [
     "extensions",
     "README.md",

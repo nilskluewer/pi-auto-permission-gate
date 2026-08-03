@@ -19,6 +19,10 @@ function createHarness({
   webSearchExtensionPath = webSearchAvailable ? "test-web-search.ts" : undefined,
   webEvidence = "web evidence: package documentation and security advisories",
   branch = [],
+  globalModeState = { current: undefined },
+  globalRules = { current: undefined },
+  editedRules,
+  ruleSaveChoice = "Apply to this session only",
 } = {}) {
   const handlers = new Map();
   const commands = new Map();
@@ -98,9 +102,16 @@ function createHarness({
         return { auth: { apiKey: "test-token", headers: {} }, env: {} };
       },
     },
+    isProjectTrusted() {
+      return false;
+    },
     ui: {
-      async select() {
+      async select(title) {
+        if (title === "Save permission gate rules:") return ruleSaveChoice;
         return choice;
+      },
+      async editor() {
+        return editedRules;
       },
       notify(message, level) {
         notifications.push({ message, level });
@@ -121,9 +132,24 @@ function createHarness({
     };
   };
 
-  createPermissionGate(pi, { complete, webSearchExtensionPath });
+  createPermissionGate(pi, {
+    complete,
+    webSearchExtensionPath,
+    loadGlobalModeState: async () => globalModeState.current,
+    saveGlobalModeState: async (state) => {
+      globalModeState.current = { ...state };
+    },
+    loadGlobalRules: async () => globalRules.current,
+    saveGlobalRules: async (config) => {
+      globalRules.current = {
+        allowedCommands: [...config.allowedCommands],
+        disallowedCommands: [...config.disallowedCommands],
+      };
+    },
+  });
 
   return {
+    handlers,
     commands,
     entries,
     renderers,
@@ -150,6 +176,16 @@ function createHarness({
 test("recognizes soft and hard permission rules", () => {
   assert.deepEqual(matchedReasons("rm -rf /tmp/example"), ["recursive/forced rm"]);
   assert.deepEqual(hardDenyReasons("rm -rf /tmp/example"), []);
+  assert.deepEqual(matchedReasons("rtk uv run pytest"), []);
+  assert.deepEqual(matchedReasons("rtk uv run ruff check ."), []);
+  assert.deepEqual(matchedReasons("rtk uv run mypy"), []);
+  assert.ok(matchedReasons("uv run python script.py").includes("package execution or publish"));
+  assert.deepEqual(matchedReasons("npm install ruff"), []);
+  assert.deepEqual(matchedReasons("rm -rf build", undefined, "/tmp/project"), []);
+  assert.deepEqual(matchedReasons("find build -type f -delete", undefined, "/tmp/project"), []);
+  assert.ok(matchedReasons("rm -rf ../outside", undefined, "/tmp/project").includes("recursive/forced rm"));
+  assert.ok(matchedReasons("find . -delete", undefined, "/tmp/project").includes("find delete"));
+  assert.ok(matchedReasons("rtk uv run pytest && rm -rf /tmp/example").includes("recursive/forced rm"));
   assert.ok(hardDenyReasons("rm -rf /").includes("recursive delete of a system or home root"));
   assert.ok(hardDenyReasons('rm -rf "${HOME}"').includes("recursive delete of a system or home root"));
   assert.ok(hardDenyReasons("rm -rf /{etc,usr}").includes("unresolved recursive delete target"));
@@ -176,6 +212,45 @@ test("parses strict and fenced auto-mode decisions", () => {
   assert.equal(parseAutoModeDecision("not JSON"), undefined);
 });
 
+test("edits allowed and disallowed command patterns through /permission-rules", async () => {
+  const globalRules = { current: undefined };
+  const harness = createHarness({
+    hasUI: true,
+    globalRules,
+    editedRules: JSON.stringify({
+      allowedCommands: ["uv run python*", "rm -rf *"],
+      disallowedCommands: ["npm install evil*"],
+    }),
+    ruleSaveChoice: "Save as global default",
+  });
+
+  await harness.startSession();
+  await harness.commands.get("permission-rules").handler("edit", harness.context);
+  assert.deepEqual(globalRules.current, {
+    allowedCommands: ["uv run python*", "rm -rf *"],
+    disallowedCommands: ["npm install evil*"],
+  });
+
+  assert.equal(
+    await harness.invoke({ toolName: "bash", input: { command: "uv run python script.py" } }),
+    undefined,
+  );
+  const disallowed = await harness.invoke({
+    toolName: "bash",
+    input: { command: "npm install evil-package" },
+  });
+  assert.equal(disallowed.block, true);
+  assert.equal(harness.decisionEntries().at(-1).data.source, "user-rule");
+
+  const hardDenied = await harness.invoke({
+    toolName: "bash",
+    input: { command: "rm -rf /" },
+  });
+  assert.equal(hardDenied.block, true);
+  assert.equal(harness.decisionEntries().at(-1).data.source, "hard-deny");
+  assert.equal(harness.classifierCalls.length, 0);
+});
+
 test("ignores non-bash tool calls", async () => {
   const harness = createHarness();
 
@@ -198,6 +273,31 @@ test("allows safe bash commands", async () => {
 
   assert.equal(result, undefined);
   assert.equal(harness.entries.length, 0);
+});
+
+test("allows local verification commands without the classifier", async () => {
+  const harness = createHarness({ hasUI: false });
+  await harness.startSession();
+
+  for (const command of [
+    "rtk uv run pytest",
+    "rtk uv run ruff check .",
+    "rtk uv run mypy",
+    "rm -rf build",
+    "find build -type f -delete",
+    "npm install ruff",
+    "uv pip install ruff",
+  ]) {
+    const result = await harness.invoke({
+      toolName: "bash",
+      input: { command },
+    });
+
+    assert.equal(result, undefined, command);
+  }
+
+  assert.equal(harness.classifierCalls.length, 0);
+  assert.equal(harness.decisionEntries().length, 0);
 });
 
 test("blocks dangerous commands without a UI when auto mode is off", async () => {
@@ -351,17 +451,11 @@ test("auto mode fails closed when classification fails", async () => {
   assert.equal(harness.decisionEntries()[0].data.status, "blocked");
 });
 
-test("restores persisted auto-mode state on session start", async () => {
+test("loads globally persisted auto-mode state on session start", async () => {
   const harness = createHarness({
     hasUI: true,
     classifierText: '{"decision":"allow","rationale":"The explicit test command is safe."}',
-    branch: [
-      {
-        type: "custom",
-        customType: "permission-gate-mode",
-        data: { autoModeEnabled: true, webVerificationEnabled: false },
-      },
-    ],
+    globalModeState: { current: { autoModeEnabled: true, webVerificationEnabled: false } },
   });
 
   await harness.startSession();
@@ -374,23 +468,26 @@ test("restores persisted auto-mode state on session start", async () => {
   assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (gpt-5.6-luna, high, web off)");
 });
 
-test("fork reset persists when the fork is reloaded", async () => {
-  const harness = createHarness({
-    hasUI: true,
-    branch: [
-      {
-        type: "custom",
-        customType: "permission-gate-mode",
-        data: { autoModeEnabled: true, webVerificationEnabled: true },
-      },
-    ],
-  });
+test("keeps the global auto-mode state across new sessions, forks, reloads, and tree navigation", async () => {
+  const globalModeState = { current: undefined };
+  const firstSession = createHarness({ hasUI: true, globalModeState });
 
-  await harness.startSession({ type: "session_start", reason: "fork" });
-  assert.equal(harness.statuses.get("permission-gate"), undefined);
-  await harness.startSession({ type: "session_start", reason: "reload" });
-  assert.equal(harness.statuses.get("permission-gate"), undefined);
-  assert.deepEqual(harness.modeEntries().at(-1).data, { autoModeEnabled: false, webVerificationEnabled: true });
+  await firstSession.startSession({ type: "session_start", reason: "startup" });
+  assert.equal(firstSession.statuses.get("permission-gate"), "auto mode: ON (gpt-5.6-luna, high, web on)");
+  await firstSession.commands.get("automode").handler("web off", firstSession.context);
+
+  const nextSession = createHarness({ hasUI: true, globalModeState });
+  await nextSession.startSession({ type: "session_start", reason: "fork" });
+  assert.equal(nextSession.statuses.get("permission-gate"), "auto mode: ON (gpt-5.6-luna, high, web off)");
+
+  await nextSession.startSession({ type: "session_start", reason: "reload" });
+  nextSession.handlers.get("session_tree")({}, nextSession.context);
+  assert.equal(nextSession.statuses.get("permission-gate"), "auto mode: ON (gpt-5.6-luna, high, web off)");
+
+  await nextSession.commands.get("automode").handler("off", nextSession.context);
+  const resumedSession = createHarness({ hasUI: true, globalModeState });
+  await resumedSession.startSession({ type: "session_start", reason: "resume" });
+  assert.equal(resumedSession.statuses.get("permission-gate"), undefined);
 });
 
 test("automode toggles and reports its state", async () => {

@@ -8,7 +8,11 @@
  * `github-copilot/gpt-5.6-luna` with high reasoning effort.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join, relative, resolve, sep } from "node:path";
+import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
 type DangerousPattern = {
@@ -42,11 +46,30 @@ type ClassifierComplete = (
 	},
 ) => Promise<ClassifierResponse>;
 
+type ModeState = {
+	autoModeEnabled: boolean;
+	webVerificationEnabled: boolean;
+};
+
+type CommandRuleConfig = {
+	allowedCommands: string[];
+	disallowedCommands: string[];
+};
+
+type ModeStateLoader = () => Promise<ModeState | undefined>;
+type ModeStateSaver = (state: ModeState) => Promise<void>;
+type CommandRuleLoader = () => Promise<CommandRuleConfig | undefined>;
+type CommandRuleSaver = (config: CommandRuleConfig) => Promise<void>;
+
 export type PermissionGateDependencies = {
 	complete?: ClassifierComplete;
 	exec?: ExtensionAPI["exec"];
 	webSearchAvailable?: boolean;
 	webSearchExtensionPath?: string;
+	loadGlobalModeState?: ModeStateLoader;
+	saveGlobalModeState?: ModeStateSaver;
+	loadGlobalRules?: CommandRuleLoader;
+	saveGlobalRules?: CommandRuleSaver;
 };
 
 export type ParsedAutoDecision = {
@@ -56,14 +79,9 @@ export type ParsedAutoDecision = {
 	searchQuery?: string;
 };
 
-type DecisionSource = "hard-deny" | "auto-model";
+type DecisionSource = "hard-deny" | "auto-model" | "user-rule";
 type DecisionStatus = "approved" | "blocked";
 type ClassifierContext = Pick<ExtensionContext, "cwd" | "signal" | "modelRegistry" | "sessionManager">;
-
-type ModeState = {
-	autoModeEnabled: boolean;
-	webVerificationEnabled: boolean;
-};
 
 type DecisionEntry = {
 	command: string;
@@ -78,12 +96,30 @@ type DecisionEntry = {
 };
 
 const AUTO_MODE_COMMAND = "automode";
+const RULES_COMMAND = "permission-rules";
 const AUTO_MODE_MODEL_PROVIDER = "github-copilot";
 const AUTO_MODE_MODEL_ID = "gpt-5.6-luna";
 const AUTO_MODE_REASONING = "high" as const;
 const STATUS_ID = "permission-gate";
 const MODE_ENTRY_TYPE = "permission-gate-mode";
 const DECISION_ENTRY_TYPE = "permission-gate-decision";
+const GLOBAL_MODE_STATE_FILENAME = "permission-gate.json";
+const RULES_FILE_NAME = "permission-gate-rules.json";
+const DEFAULT_MODE_STATE: ModeState = {
+	autoModeEnabled: true,
+	webVerificationEnabled: true,
+};
+const DEFAULT_COMMAND_RULE_CONFIG: CommandRuleConfig = {
+	allowedCommands: [
+		"uv run pytest*",
+		"rtk uv run pytest*",
+		"uv run ruff check*",
+		"rtk uv run ruff check*",
+		"uv run mypy*",
+		"rtk uv run mypy*",
+	],
+	disallowedCommands: [],
+};
 const MAX_PREVIEW_LENGTH = 1200;
 const MAX_RATIONALE_LENGTH = 800;
 const MAX_RECENT_CONTEXT_LENGTH = 6000;
@@ -106,6 +142,123 @@ const AUTO_MODE_SYSTEM_PROMPT = [
 	'Use this schema: {"decision":"allow"|"deny","needs_web_search":true|false,"search_query":"optional concise query","rationale":"short explanation"}',
 ].join("\n");
 
+// User-editable command patterns use shell-style '*' and '?' wildcards.
+// Shell control syntax is never accepted by an allow pattern; hard-deny rules
+// remain non-overridable even when a user adds a broad allow pattern.
+const SHELL_CONTROL_CHARACTERS = /[\r\n;&|<>$`()\\]/;
+
+function commandGlobToRegExp(pattern: string): RegExp {
+	let source = "^";
+	for (const character of pattern) {
+		if (character === "*") source += "[\\s\\S]*";
+		else if (character === "?") source += "[\\s\\S]";
+		else source += character.replace(/[\\^$\\\\.+()[\]{}|]/g, "\\\\$&");
+	}
+	return new RegExp(`${source}$`, "i");
+}
+
+function matchesCommandPattern(command: string, pattern: string, allowShellControl: boolean): boolean {
+	const normalizedPattern = pattern.trim();
+	if (!normalizedPattern || normalizedPattern.includes("\n") || normalizedPattern.includes("\r")) return false;
+	if (!allowShellControl && SHELL_CONTROL_CHARACTERS.test(command)) return false;
+	return commandGlobToRegExp(normalizedPattern).test(command.trim());
+}
+
+function matchesAnyCommandPattern(command: string, patterns: string[], allowShellControl: boolean): string | undefined {
+	return patterns.find((pattern) => matchesCommandPattern(command, pattern, allowShellControl));
+}
+
+function evaluateUserCommandRules(
+	command: string,
+	config: CommandRuleConfig,
+): { decision: "allow" | "deny"; pattern: string } | undefined {
+	const deniedPattern = matchesAnyCommandPattern(command, config.disallowedCommands, true);
+	if (deniedPattern) return { decision: "deny", pattern: deniedPattern };
+
+	const allowedPattern = matchesAnyCommandPattern(command, config.allowedCommands, false);
+	if (allowedPattern) return { decision: "allow", pattern: allowedPattern };
+	return undefined;
+}
+
+const LOCAL_DELETION_REASONS = new Set(["recursive/forced rm", "find delete"]);
+const PATH_GLOB_CHARACTERS = /[*?\[\]{}]/;
+const FIND_NARROWING_PREDICATES = new Set([
+	"-atime",
+	"-ctime",
+	"-empty",
+	"-group",
+	"-iname",
+	"-ipath",
+	"-iregex",
+	"-links",
+	"-maxdepth",
+	"-mindepth",
+	"-mtime",
+	"-name",
+	"-newer",
+	"-newermt",
+	"-path",
+	"-perm",
+	"-regex",
+	"-size",
+	"-type",
+	"-user",
+]);
+
+function isSafeRelativeDeletionTarget(target: string, cwd: string, allowCurrentDirectory: boolean): boolean {
+	if (!target || target.startsWith("/") || target.startsWith("~") || target.startsWith("$") || /^[A-Za-z]:[\\/]/.test(target)) {
+		return false;
+	}
+	if (PATH_GLOB_CHARACTERS.test(target)) return false;
+
+	const normalizedSegments = target.replace(/^\.\/+/, "").split(/[\\/]/);
+	if (!allowCurrentDirectory && normalizedSegments.length === 1 && normalizedSegments[0] === "") return false;
+	if (normalizedSegments.some((segment) => segment === ".." || segment === ".git")) return false;
+
+	const projectRoot = resolve(cwd);
+	const resolvedTarget = resolve(projectRoot, target);
+	const relativeTarget = relative(projectRoot, resolvedTarget);
+	return Boolean(relativeTarget) && relativeTarget !== ".." && !relativeTarget.startsWith(`..${sep}`) && !relativeTarget.startsWith(sep);
+}
+
+function isScopedRmCommand(command: string, cwd: string): boolean {
+	if (SHELL_CONTROL_CHARACTERS.test(command) || PATH_GLOB_CHARACTERS.test(command)) return false;
+	const tokens = command.trim().split(/[ \t]+/).filter(Boolean);
+	if (tokens.shift()?.toLowerCase() !== "rm") return false;
+
+	let optionsEnded = false;
+	const targets: string[] = [];
+	for (const token of tokens) {
+		if (!optionsEnded && token === "--") {
+			optionsEnded = true;
+			continue;
+		}
+		if (!optionsEnded && token.startsWith("-")) continue;
+		if (token.startsWith("-")) return false;
+		targets.push(token);
+	}
+
+	return targets.length > 0 && targets.every((target) => isSafeRelativeDeletionTarget(target, cwd, false));
+}
+
+function isScopedFindDeleteCommand(command: string, cwd: string): boolean {
+	if (SHELL_CONTROL_CHARACTERS.test(command) || PATH_GLOB_CHARACTERS.test(command)) return false;
+	const tokens = command.trim().split(/[ \t]+/).filter(Boolean);
+	if (tokens.shift()?.toLowerCase() !== "find" || tokens.includes("-exec") || tokens.includes("-execdir")) return false;
+	if (!tokens.includes("-delete")) return false;
+
+	const expressionStart = tokens.findIndex((token) => token.startsWith("-") || token === "!" || token === "(" || token === ")");
+	if (expressionStart <= 0) return false;
+
+	const roots = tokens.slice(0, expressionStart);
+	const hasNarrowingPredicate = tokens.some((token) => FIND_NARROWING_PREDICATES.has(token));
+	return roots.length > 0 && roots.every((root) => isSafeRelativeDeletionTarget(root, cwd, hasNarrowingPredicate));
+}
+
+function isScopedLocalDeletionCommand(command: string, cwd: string): boolean {
+	return isScopedRmCommand(command, cwd) || isScopedFindDeleteCommand(command, cwd);
+}
+
 const dangerousPatterns: DangerousPattern[] = [
 	// File deletion / destructive filesystem traversal
 	{
@@ -116,10 +269,10 @@ const dangerousPatterns: DangerousPattern[] = [
 	{ name: "find delete", pattern: /\bfind\b[^\n;&|]*\s-delete\b/i },
 	{ name: "xargs rm", pattern: /\bxargs\b[^\n;&|]*\brm\b/i },
 
-	// Package managers and package runners can execute third-party lifecycle code.
+	// Package execution and publishing can execute third-party code or affect remote state.
 	{
-		name: "package installation or execution",
-		pattern: /\b(?:npm|pnpm|yarn|bun|pip|pip3|uv|poetry|cargo|gem|go|brew|apt(?:-get)?|dnf|pacman)\b[^\n;&|]*\b(?:install|add|remove|uninstall|update|upgrade|exec|run|dlx|publish)\b/i,
+		name: "package execution or publish",
+		pattern: /\b(?:npm|pnpm|yarn|bun|pip|pip3|uv|poetry|cargo|gem|go|brew|apt(?:-get)?|dnf|pacman)\b[^\n;&|]*\b(?:exec|run|dlx|publish)\b/i,
 	},
 	{ name: "package runner", pattern: /\b(?:npx|pnpm\s+dlx|yarn\s+dlx|bunx|pipx|uvx)\b/i },
 
@@ -227,8 +380,14 @@ function unique(values: string[]): string[] {
 	return [...new Set(values)];
 }
 
-export function matchedReasons(command: string): string[] {
-	return unique(dangerousPatterns.filter(({ pattern }) => pattern.test(command)).map(({ name }) => name));
+export function matchedReasons(command: string, rules: CommandRuleConfig = DEFAULT_COMMAND_RULE_CONFIG, cwd?: string): string[] {
+	if (evaluateUserCommandRules(command, rules)?.decision === "allow") return [];
+
+	const reasons = unique(dangerousPatterns.filter(({ pattern }) => pattern.test(command)).map(({ name }) => name));
+	if (cwd && isScopedLocalDeletionCommand(command, cwd)) {
+		return reasons.filter((reason) => !LOCAL_DELETION_REASONS.has(reason));
+	}
+	return reasons;
 }
 
 export function hardDenyReasons(command: string): string[] {
@@ -845,32 +1004,227 @@ function recordDecision(pi: ExtensionAPI, entry: DecisionEntry): void {
 	}
 }
 
-function restoreModeState(
-	ctx: { sessionManager: { getBranch: () => unknown[] } },
-	defaults: ModeState,
-): ModeState {
-	const branch = ctx.sessionManager.getBranch();
-	for (let index = branch.length - 1; index >= 0; index -= 1) {
-		const entry = branch[index];
-		if (!entry || typeof entry !== "object") continue;
-		const candidate = entry as {
-			type?: unknown;
-			customType?: unknown;
-			data?: unknown;
-		};
-		if (candidate.type !== "custom" || candidate.customType !== MODE_ENTRY_TYPE) continue;
-		if (!candidate.data || typeof candidate.data !== "object") continue;
+function getGlobalModeStatePath(): string {
+	const configDirectory = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+	return join(configDirectory, GLOBAL_MODE_STATE_FILENAME);
+}
 
-		const data = candidate.data as Partial<ModeState>;
+function parseModeState(value: unknown): ModeState | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const candidate = value as Partial<ModeState>;
+	if (typeof candidate.autoModeEnabled !== "boolean" || typeof candidate.webVerificationEnabled !== "boolean") {
+		return undefined;
+	}
+	return {
+		autoModeEnabled: candidate.autoModeEnabled,
+		webVerificationEnabled: candidate.webVerificationEnabled,
+	};
+}
+
+async function loadModeStateFromDisk(): Promise<ModeState | undefined> {
+	try {
+		const raw = await readFile(getGlobalModeStatePath(), "utf8");
+		return parseModeState(JSON.parse(raw));
+	} catch (error) {
+		if (error && typeof error === "object" && (error as { code?: unknown }).code === "ENOENT") {
+			return undefined;
+		}
+		throw error;
+	}
+}
+
+async function saveModeStateToDisk(state: ModeState): Promise<void> {
+	const path = getGlobalModeStatePath();
+	const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+
+	try {
+		await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+		await rename(temporaryPath, path);
+	} finally {
+		await unlink(temporaryPath).catch(() => undefined);
+	}
+}
+
+async function loadConfiguredModeState(dependencies: PermissionGateDependencies): Promise<ModeState | undefined> {
+	const loader = dependencies.loadGlobalModeState ?? loadModeStateFromDisk;
+	return parseModeState(await loader());
+}
+
+async function saveConfiguredModeState(dependencies: PermissionGateDependencies, state: ModeState): Promise<void> {
+	const saver = dependencies.saveGlobalModeState ?? saveModeStateToDisk;
+	await saver(state);
+}
+
+async function persistGlobalModeState(dependencies: PermissionGateDependencies, state: ModeState): Promise<boolean> {
+	try {
+		await saveConfiguredModeState(dependencies, state);
+		return true;
+	} catch (error) {
+		console.warn("[permission-gate] Could not persist global mode state:", error);
+		return false;
+	}
+}
+
+async function initializeModeState(
+	dependencies: PermissionGateDependencies,
+	ctx: { hasUI: boolean; ui: { notify: (message: string, level: "info" | "warning" | "error") => void } },
+): Promise<ModeState> {
+	try {
+		const persisted = await loadConfiguredModeState(dependencies);
+		if (persisted) return persisted;
+
+		const defaults = { ...DEFAULT_MODE_STATE };
+		await saveConfiguredModeState(dependencies, defaults);
+		return defaults;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.warn("[permission-gate] Could not load global mode state:", error);
+		notify(
+			ctx,
+			`Permission gate could not load or save global mode settings; using defaults: ${truncate(message, 200)}`,
+			"warning",
+		);
+		return { ...DEFAULT_MODE_STATE };
+	}
+}
+
+function getGlobalRulesPath(): string {
+	const configDirectory = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+	return join(configDirectory, RULES_FILE_NAME);
+}
+
+function getProjectRulesPath(cwd: string): string {
+	return join(cwd, CONFIG_DIR_NAME, RULES_FILE_NAME);
+}
+
+function cloneDefaultCommandRuleConfig(): CommandRuleConfig {
+	return {
+		allowedCommands: [...DEFAULT_COMMAND_RULE_CONFIG.allowedCommands],
+		disallowedCommands: [...DEFAULT_COMMAND_RULE_CONFIG.disallowedCommands],
+	};
+}
+
+function parseCommandRuleConfig(value: unknown): CommandRuleConfig | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const candidate = value as Partial<CommandRuleConfig>;
+	if (!Array.isArray(candidate.allowedCommands) || !Array.isArray(candidate.disallowedCommands)) return undefined;
+	if (
+		candidate.allowedCommands.some((pattern) => typeof pattern !== "string") ||
+		candidate.disallowedCommands.some((pattern) => typeof pattern !== "string")
+	) {
+		return undefined;
+	}
+	return {
+		allowedCommands: unique(candidate.allowedCommands.map((pattern) => pattern.trim()).filter(Boolean)),
+		disallowedCommands: unique(candidate.disallowedCommands.map((pattern) => pattern.trim()).filter(Boolean)),
+	};
+}
+
+async function readCommandRuleConfig(path: string): Promise<CommandRuleConfig | undefined> {
+	let raw: string;
+	try {
+		raw = await readFile(path, "utf8");
+	} catch (error) {
+		if (error && typeof error === "object" && (error as { code?: unknown }).code === "ENOENT") return undefined;
+		throw new Error(`Cannot read ${path}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (error) {
+		throw new Error(`${path} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+	}
+
+	const config = parseCommandRuleConfig(parsed);
+	if (!config) throw new Error(`${path} must contain string arrays named allowedCommands and disallowedCommands.`);
+	return config;
+}
+
+async function loadGlobalRulesFromDisk(): Promise<CommandRuleConfig | undefined> {
+	return readCommandRuleConfig(getGlobalRulesPath());
+}
+
+async function saveCommandRuleConfig(path: string, config: CommandRuleConfig): Promise<void> {
+	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+	await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+}
+
+async function loadEffectiveCommandRules(
+	dependencies: PermissionGateDependencies,
+	ctx: { cwd: string; isProjectTrusted: () => boolean },
+): Promise<{ config: CommandRuleConfig; scope: "global" | "project" }> {
+	if (dependencies.loadGlobalRules) {
 		return {
-			autoModeEnabled: typeof data.autoModeEnabled === "boolean" ? data.autoModeEnabled : defaults.autoModeEnabled,
-			webVerificationEnabled:
-				typeof data.webVerificationEnabled === "boolean"
-					? data.webVerificationEnabled
-					: defaults.webVerificationEnabled,
+			config: (await dependencies.loadGlobalRules()) ?? cloneDefaultCommandRuleConfig(),
+			scope: "global",
 		};
 	}
-	return defaults;
+
+	if (ctx.isProjectTrusted()) {
+		const projectConfig = await readCommandRuleConfig(getProjectRulesPath(ctx.cwd));
+		if (projectConfig) return { config: projectConfig, scope: "project" };
+	}
+
+	return {
+		config: (await loadGlobalRulesFromDisk()) ?? cloneDefaultCommandRuleConfig(),
+		scope: "global",
+	};
+}
+
+async function saveCommandRules(
+	dependencies: PermissionGateDependencies,
+	scope: "global" | "project",
+	cwd: string,
+	config: CommandRuleConfig,
+): Promise<void> {
+	if (scope === "global" && dependencies.saveGlobalRules) {
+		await dependencies.saveGlobalRules(config);
+		return;
+	}
+	await saveCommandRuleConfig(scope === "global" ? getGlobalRulesPath() : getProjectRulesPath(cwd), config);
+}
+
+async function initializeCommandRules(
+	dependencies: PermissionGateDependencies,
+	ctx: {
+		cwd: string;
+		hasUI: boolean;
+		isProjectTrusted: () => boolean;
+		ui: { notify: (message: string, level: "info" | "warning" | "error") => void };
+	},
+): Promise<{ config: CommandRuleConfig; scope: "global" | "project" }> {
+	try {
+		return await loadEffectiveCommandRules(dependencies, ctx);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.warn("[permission-gate] Could not load command rules:", error);
+		notify(ctx, `Permission gate could not load command rules; using built-in defaults: ${truncate(message, 300)}`, "warning");
+		return { config: cloneDefaultCommandRuleConfig(), scope: "global" };
+	}
+}
+
+function formatCommandRules(config: CommandRuleConfig, scope: string): string {
+	const formatList = (patterns: string[]) => (patterns.length > 0 ? patterns.map((pattern) => `  - ${pattern}`).join("\n") : "  (none)");
+	return [
+		`Permission gate command rules (${scope})`,
+		"",
+		"Allowed command patterns:",
+		formatList(config.allowedCommands),
+		"",
+		"Disallowed command patterns:",
+		formatList(config.disallowedCommands),
+		"",
+		"Patterns use shell-style * and ? wildcards.",
+		"Hard-deny safety rules cannot be overridden.",
+		"",
+		"Built-in soft-deny categories:",
+		...unique(dangerousPatterns.map(({ name }) => `  - ${name}`)),
+		"",
+		"Hard-deny categories:",
+		...unique(hardDenyPatterns.map(({ name }) => `  - ${name}`)),
+	].join("\n");
 }
 
 function persistModeState(pi: ExtensionAPI, state: ModeState): void {
@@ -898,9 +1252,22 @@ function notify(
 }
 
 export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionGateDependencies = {}): void {
+	// The extension is initialized before session_start, so keep the pre-session
+	// value conservative and load the globally persisted preference at startup.
 	let autoModeEnabled = false;
-	let webVerificationEnabled = true;
-	const persistMode = () => persistModeState(pi, { autoModeEnabled, webVerificationEnabled });
+	let webVerificationEnabled = DEFAULT_MODE_STATE.webVerificationEnabled;
+	let ruleConfig = cloneDefaultCommandRuleConfig();
+	let ruleScope: "global" | "project" | "session" = "global";
+	const persistMode = async (ctx: {
+		hasUI: boolean;
+		ui: { notify: (message: string, level: "info" | "warning" | "error") => void };
+	}) => {
+		const state = { autoModeEnabled, webVerificationEnabled };
+		persistModeState(pi, state);
+		if (!(await persistGlobalModeState(dependencies, state))) {
+			notify(ctx, "Permission gate mode could not be persisted globally.", "warning");
+		}
+	};
 
 	pi.registerEntryRenderer(DECISION_ENTRY_TYPE, (entry, { expanded }, theme) => {
 		const data = entry.data as Partial<DecisionEntry> | undefined;
@@ -908,7 +1275,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 
 		const approved = data.status === "approved";
 		const title = approved ? "Permission Gate: APPROVED" : "Permission Gate: BLOCKED";
-		const source = data.source === "auto-model" ? "auto model" : "hard deny";
+		const source = data.source === "auto-model" ? "auto model" : data.source === "user-rule" ? "user rule" : "hard deny";
 		const color = approved ? "success" : "error";
 		const lines = [
 			`${theme.fg(color, theme.bold(title))} ${theme.fg("dim", `via ${source}`)}`,
@@ -941,7 +1308,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 					return;
 				}
 
-				persistMode();
+				await persistMode(ctx);
 				setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled);
 				notify(
 					ctx,
@@ -970,33 +1337,128 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				return;
 			}
 
-			persistMode();
+			await persistMode(ctx);
 			setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled);
 			notify(
 				ctx,
 				autoModeEnabled
-					? `Permission gate auto mode enabled. ${AUTO_MODE_MODEL_PROVIDER}/${AUTO_MODE_MODEL_ID} will decide soft-deny commands at high reasoning. Web verification is ${webVerificationEnabled ? "on" : "off"}.`
-					: "Permission gate auto mode disabled. Dangerous commands require manual confirmation.",
+					? `Permission gate auto mode enabled globally. ${AUTO_MODE_MODEL_PROVIDER}/${AUTO_MODE_MODEL_ID} will decide soft-deny commands at high reasoning. Web verification is ${webVerificationEnabled ? "on" : "off"}.`
+					: "Permission gate auto mode disabled globally. Dangerous commands require manual confirmation.",
 				"info",
 			);
 		},
 	});
 
-	pi.on("session_start", (event, ctx) => {
-		const shouldRestore = event.reason === "startup" || event.reason === "reload" || event.reason === "resume";
-		const restored = shouldRestore
-			? restoreModeState(ctx, { autoModeEnabled: false, webVerificationEnabled: true })
-			: { autoModeEnabled: false, webVerificationEnabled: true };
+	pi.registerCommand(RULES_COMMAND, {
+		description: "Edit allowed and disallowed permission-gate command patterns",
+		handler: async (args, ctx) => {
+			const parts = String(args ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+			const action = parts[0] ?? "edit";
+
+			if (action === "list") {
+				notify(ctx, formatCommandRules(ruleConfig, ruleScope), "info");
+				return;
+			}
+
+			if (action === "reset") {
+				const requestedScope = parts[1] ?? (ruleScope === "project" ? "project" : "global");
+				if (requestedScope !== "global" && requestedScope !== "project") {
+					notify(ctx, "Usage: /permission-rules [edit|list|reset [global|project]]", "warning");
+					return;
+				}
+				if (requestedScope === "project" && !ctx.isProjectTrusted()) {
+					notify(ctx, "Permission gate: project rules require a trusted project.", "error");
+					return;
+				}
+				const resetConfig = cloneDefaultCommandRuleConfig();
+				try {
+					await saveCommandRules(dependencies, requestedScope, ctx.cwd, resetConfig);
+				} catch (error) {
+					notify(ctx, `Permission gate: could not reset ${requestedScope} rules: ${error instanceof Error ? error.message : String(error)}`, "error");
+					return;
+				}
+				if (ruleScope === requestedScope) ruleConfig = resetConfig;
+				notify(ctx, `Permission gate ${requestedScope} command rules reset.`, "info");
+				return;
+			}
+
+			if (action !== "edit") {
+				notify(ctx, "Usage: /permission-rules [edit|list|reset [global|project]]", "warning");
+				return;
+			}
+			if (!ctx.hasUI) {
+				notify(ctx, "/permission-rules needs an interactive UI. Edit permission-gate-rules.json directly instead.", "error");
+				return;
+			}
+
+			let edited: string | undefined;
+			try {
+				edited = await ctx.ui.editor(
+					"Permission gate rules JSON. Use shell-style * and ? patterns.",
+					JSON.stringify(ruleConfig, null, 2),
+				);
+			} catch (error) {
+				notify(ctx, `Permission gate: rule editor failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+				return;
+			}
+			if (edited === undefined) return;
+
+			let nextConfig: CommandRuleConfig | undefined;
+			try {
+				nextConfig = parseCommandRuleConfig(JSON.parse(edited));
+			} catch (error) {
+				notify(ctx, `Permission gate: invalid rules JSON: ${error instanceof Error ? error.message : String(error)}`, "error");
+				return;
+			}
+			if (!nextConfig) {
+				notify(ctx, "Permission gate: rules must contain string arrays named allowedCommands and disallowedCommands.", "error");
+				return;
+			}
+
+			const saveOptions = ["Apply to this session only", "Save as global default"];
+			if (ctx.isProjectTrusted()) saveOptions.push("Save as project default");
+			saveOptions.push("Cancel");
+			const choice = await ctx.ui.select("Save permission gate rules:", saveOptions);
+			if (!choice || choice === "Cancel") return;
+			if (choice === "Apply to this session only") {
+				ruleConfig = nextConfig;
+				ruleScope = "session";
+				notify(ctx, "Permission gate command rules applied to this session only.", "info");
+				return;
+			}
+
+			const scope = choice === "Save as project default" ? "project" : "global";
+			if (scope === "project" && !ctx.isProjectTrusted()) {
+				notify(ctx, "Permission gate: project rules require a trusted project.", "error");
+				return;
+			}
+			try {
+				await saveCommandRules(dependencies, scope, ctx.cwd, nextConfig);
+			} catch (error) {
+				notify(ctx, `Permission gate: could not save ${scope} rules: ${error instanceof Error ? error.message : String(error)}`, "error");
+				return;
+			}
+			ruleConfig = nextConfig;
+			ruleScope = scope;
+			notify(ctx, `Permission gate command rules saved as the ${scope} default.`, "info");
+		},
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		const [restored, loadedRules] = await Promise.all([
+			initializeModeState(dependencies, ctx),
+			initializeCommandRules(dependencies, ctx),
+		]);
 		autoModeEnabled = restored.autoModeEnabled;
 		webVerificationEnabled = restored.webVerificationEnabled;
-		if (!shouldRestore) persistMode();
+		ruleConfig = loadedRules.config;
+		ruleScope = loadedRules.scope;
 		setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled);
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
-		const restored = restoreModeState(ctx, { autoModeEnabled: false, webVerificationEnabled: true });
-		autoModeEnabled = restored.autoModeEnabled;
-		webVerificationEnabled = restored.webVerificationEnabled;
+		// Mode is a global preference, so navigating a conversation branch must not
+		// silently turn auto mode off or restore an obsolete branch-local value.
 		setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled);
 	});
 
@@ -1005,9 +1467,9 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 
 		const command = typeof event.input.command === "string" ? event.input.command : "";
 		const hardReasons = hardDenyReasons(command);
-		const reasons = matchedReasons(command);
+		const userRule = evaluateUserCommandRules(command, ruleConfig);
+		const reasons = matchedReasons(command, ruleConfig, ctx.cwd);
 
-		if (hardReasons.length === 0 && reasons.length === 0) return undefined;
 		if (hardReasons.length > 0) {
 			const rationale = `Non-negotiable safety rule matched: ${hardReasons.join(", ")}.`;
 			recordDecision(pi, {
@@ -1020,6 +1482,21 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			});
 			return { block: true, reason: `${rationale} The command was blocked.` };
 		}
+
+		if (userRule?.decision === "deny") {
+			const rationale = `User disallowed command pattern matched: ${userRule.pattern}.`;
+			recordDecision(pi, {
+				command: preview(command),
+				reasons: ["user disallowed command"],
+				status: "blocked",
+				source: "user-rule",
+				rationale,
+				timestamp: Date.now(),
+			});
+			return { block: true, reason: `${rationale} The command was blocked.` };
+		}
+
+		if (userRule?.decision === "allow" || reasons.length === 0) return undefined;
 
 		if (autoModeEnabled) {
 			const result = await classifyWithModel(pi, command, reasons, ctx, dependencies, webVerificationEnabled);

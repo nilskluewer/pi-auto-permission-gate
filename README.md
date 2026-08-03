@@ -1,8 +1,43 @@
-# @nilskluewer/pi-permission-gate
+# @nilskluewer/pi-auto-permission-gate
 
 A Pi extension that asks for confirmation before potentially destructive bash commands run.
 
 The extension fails closed for matching commands when Pi has no user interface available.
+
+## Two-minute rules reference
+
+The extension only intercepts model-generated `bash` tool calls.
+It does not intercept Pi's direct `!` or `!!` shell commands, and it does not inspect `read`, `write`, `edit`, `grep`, `find`, or `ls` tool calls.
+
+### Decision flow
+
+| Order | Match | Result |
+| --- | --- | --- |
+| 1 | No built-in or user rule | Run |
+| 2 | Hard-deny rule | Block immediately, without the model or a prompt |
+| 3 | User `disallowedCommands` pattern | Block immediately |
+| 4 | User `allowedCommands` pattern | Run, unless a hard-deny rule matched |
+| 5 | Built-in soft rule with auto mode on | Ask the classifier |
+| 6 | Built-in soft rule with auto mode off | Ask the user in a UI, or block when no UI exists |
+
+### Command coverage
+
+| Command group | Examples | Default treatment |
+| --- | --- | --- |
+| Local checks | `uv run pytest`, `rtk uv run ruff check .`, `uv run mypy` | Allowed |
+| Package installation, update, removal | `npm install`, `uv pip install`, `cargo add` | Allowed |
+| Scoped local deletion | `rm -rf build`, `find build -type f -delete` | Allowed when explicit relative targets stay below the current working directory |
+| Other deletion | `.git` deletion, parent paths, roots, broad `find . -delete`, `xargs rm` | Checked or hard-blocked |
+| Package execution and publishing | `npm run`, `npm exec`, `npx`, `uvx`, `uv run python`, `npm publish` | Checked |
+| Privilege and permissions | `sudo`, `chmod 777`, recursive `chmod` or `chown` | Checked |
+| Filesystems and disks | `mkfs`, `wipefs`, `shred`, `diskutil`, `dd ... of=/dev/...` | Checked, with catastrophic cases hard-blocked |
+| Destructive Git operations | `reset --hard`, `clean -f`, force push, `branch -D`, `tag -d`, `git rm`, aggressive prune | Checked, with protected force pushes hard-blocked |
+| Docker state removal | `docker system prune`, volume removal, `compose down -v` | Checked |
+| Downloaded scripts | `curl ... \| sh`, `wget ... \| bash` | Checked |
+| Other bash commands | `git status`, `printf`, ordinary project commands | Allowed unless a user rule matches |
+
+Edit the user-controlled lists with `/permission-rules`.
+Hard-deny rules cannot be overridden by an allow pattern.
 
 ## What it protects
 
@@ -11,7 +46,11 @@ The gate checks bash tool calls for common destructive or high-impact operations
 - Recursive or forced file deletion such as `rm -rf`.
 - Removal of Git metadata.
 - `find -delete` and `xargs rm` patterns.
-- Package installation and package-runner commands such as `npm install` and `npx`.
+
+Scoped local deletion is allowed by default when explicit relative targets stay below the current working directory.
+For example, `rm -rf build` and `find build -type f -delete` pass without confirmation.
+Parent paths, filesystem roots, `.git` metadata, shell expansions, globs, and broad `find . -delete` remain protected.
+- Package execution and publishing commands such as `npm run`, `npm publish`, and `npx`.
 - `sudo` and recursive `chmod` or `chown` commands.
 - World-writable permissions such as `chmod 777`.
 - Filesystem formatting, signature wiping, disk wiping, and partition editing.
@@ -19,6 +58,16 @@ The gate checks bash tool calls for common destructive or high-impact operations
 - Destructive Git operations such as hard resets, forced pushes, forced branch deletion, and aggressive reflog or object pruning.
 - Docker and Docker Compose commands that prune or remove volumes and other development state.
 - Downloaded scripts piped into a shell.
+
+Routine package installation, update, and removal commands are allowed by default.
+The user-editable rules can add extra command patterns to allow or disallow.
+The built-in local verification allowlist includes these commands, with an optional `rtk` prefix:
+
+- `uv run pytest`.
+- `uv run ruff check ...`.
+- `uv run mypy ...`.
+
+Allow patterns never match shell chaining, redirection, command substitution, or other shell control syntax.
 
 The checks are intentionally conservative pattern checks rather than a shell parser or a sandbox.
 A command that matches a pattern is shown to the user for review, but confirmation does not make the command safe.
@@ -34,19 +83,43 @@ In non-interactive, JSON, and print modes, matching commands are blocked because
 Safe commands and non-bash tool calls pass through unchanged.
 Approvals are not persisted, so every matching tool call is reviewed independently.
 
+## User-editable command rules
+
+Use `/permission-rules` or `/permission-rules edit` to edit the command rule list in Pi.
+The editor accepts shell-style `*` and `?` patterns matched against the complete command.
+The editor starts with the built-in local verification allowlist, and saving replaces the two lists with the edited values.
+
+```json
+{
+  "allowedCommands": [
+    "rm -rf build*",
+    "uv run python -m mypy*"
+  ],
+  "disallowedCommands": [
+    "npm publish*"
+  ]
+}
+```
+
+The precedence is hard-deny rules, user disallowed patterns, user allowed patterns, then the built-in soft-deny rules.
+Hard-deny rules cannot be overridden through the editor.
+
+The save menu supports the current session, a global default, or a trusted-project default.
+Global rules are stored in `~/.pi/agent/permission-gate-rules.json`.
+Project rules are stored in `.pi/permission-gate-rules.json` and override the global rules for that project.
+
+Use `/permission-rules list` to inspect the active rules or `/permission-rules reset [global|project]` to restore the built-in allowlist.
+
 ## Auto mode
 
 Auto mode adds a model-backed decision layer for matching commands that are not in the non-negotiable hard-deny list.
 
-Enable it for the current session with:
+Auto mode is enabled by default.
+The first session after installation initializes the global setting as enabled.
 
-```text
-/automode
-```
-
-The command toggles the mode.
 Use `/automode on`, `/automode off`, or `/automode status` for explicit control.
 Web verification is enabled by default and can be controlled with `/automode web on` or `/automode web off`.
+The bare `/automode` command still toggles the current global setting.
 
 When auto mode is enabled, each soft-deny command is evaluated by:
 
@@ -67,8 +140,8 @@ The query is sent through the configured Pi web-search provider, so use `/automo
 
 The decision is recorded in the chat as a session entry showing the command, matched rules, model, outcome, and rationale.
 The decision entry is kept out of the model's normal conversation context so it does not create a feedback loop.
-Auto-mode settings are persisted as session state so `/reload` and session resume retain the explicit mode choice.
-New sessions and forks start with auto mode disabled, while tree navigation follows the selected branch's last persisted mode.
+Auto-mode and web-verification settings are persisted globally in `~/.pi/agent/permission-gate.json`, or under `PI_CODING_AGENT_DIR` when that environment variable is set.
+`/automode on` and `/automode off` update that global preference, so new sessions, resumes, forks, reloads, and tree navigation keep the setting without another command.
 
 Auto mode fails closed if the model is unavailable, authentication fails, the request is cancelled, the response is malformed, requested web verification is unavailable or fails, or the model is uncertain.
 
@@ -82,7 +155,8 @@ The following catastrophic operations are blocked without asking the model:
 - macOS disk erasure or partitioning.
 - Forced pushes to protected branch names such as `main`, `master`, `production`, or `prod`.
 
-Package installation and package-runner commands are soft-deny matches and can trigger web verification.
+Package installation, update, and removal commands are not gated by default.
+Package execution, package runners, and publishing remain soft-deny matches and can trigger web verification.
 
 This separation follows the useful part of Claude Code's auto-mode design: deterministic hard denies remain non-negotiable, while lower-confidence safety matches can be classified with context.
 
@@ -94,19 +168,19 @@ Do not enable it when the process must be prevented from making any autonomous c
 Install the published package globally:
 
 ```bash
-pi install npm:@nilskluewer/pi-permission-gate
+pi install npm:@nilskluewer/pi-auto-permission-gate
 ```
 
 Install directly from GitHub:
 
 ```bash
-pi install git:github.com/nilskluewer/pi-permission-gate
+pi install git:github.com/nilskluewer/pi-auto-permission-gate
 ```
 
 Install from a local checkout:
 
 ```bash
-pi install /path/to/pi-permission-gate
+pi install /path/to/pi-auto-permission-gate
 ```
 
 ## Development
