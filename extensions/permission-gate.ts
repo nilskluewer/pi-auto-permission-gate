@@ -6,9 +6,18 @@
  *
  * Auto mode can delegate soft-deny decisions to a dedicated Pi model:
  * `github-copilot/gpt-5.6-luna` with high reasoning effort.
+ *
+ * The same extension also loads inside subagent child processes (global
+ * extension discovery applies to children too). There it is the single source
+ * of dangerous-command policy: hard-deny rules and user rules apply as usual,
+ * auto mode classifies without a UI, and a remaining manual confirmation is
+ * proxied to the parent process over the subagent coordinator socket
+ * (`PI_SUBAGENT_COORDINATOR_SOCKET`). Without that socket the call is blocked,
+ * so the gate always fails closed.
  */
 
 import { randomUUID } from "node:crypto";
+import { connect } from "node:net";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
@@ -31,14 +40,18 @@ type ClassifierResponse = {
 	stopReason?: string;
 };
 
+const CLASSIFIER_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+type ClassifierThinkingLevel = (typeof CLASSIFIER_THINKING_LEVELS)[number];
+type ClassifierReasoningLevel = Exclude<ClassifierThinkingLevel, "off">;
+
 type ClassifierComplete = (
 	model: unknown,
 	context: { systemPrompt: string; messages: ClassifierMessage[] },
 	options: {
-		apiKey: string;
+		apiKey?: string;
 		headers?: Record<string, string | null>;
 		env?: Record<string, string>;
-		reasoningEffort: "high";
+		reasoning?: ClassifierReasoningLevel;
 		maxTokens: number;
 		timeoutMs: number;
 		signal?: AbortSignal;
@@ -46,9 +59,34 @@ type ClassifierComplete = (
 	},
 ) => Promise<ClassifierResponse>;
 
+type ClassifierModelReference = {
+	provider: string;
+	id: string;
+};
+
+type RegistryModel = {
+	provider: string;
+	id: string;
+	baseUrl?: string;
+	name?: string;
+	input?: readonly string[];
+	reasoning?: boolean;
+	thinkingLevelMap?: Partial<Record<ClassifierThinkingLevel, string | null>>;
+};
+
+type AvailableClassifierModel = {
+	model: RegistryModel;
+	canonicalId: string;
+	providerDisplayName: string;
+	modelName: string;
+};
+
 type ModeState = {
 	autoModeEnabled: boolean;
 	webVerificationEnabled: boolean;
+	// null represents an explicitly malformed persisted model reference.
+	classifierModel: ClassifierModelReference | null;
+	classifierThinkingLevel: ClassifierThinkingLevel;
 };
 
 type CommandRuleConfig = {
@@ -79,7 +117,7 @@ export type ParsedAutoDecision = {
 	searchQuery?: string;
 };
 
-type DecisionSource = "hard-deny" | "auto-model" | "user-rule";
+type DecisionSource = "hard-deny" | "auto-model" | "user-rule" | "parent-approval";
 type DecisionStatus = "approved" | "blocked";
 type ClassifierContext = Pick<ExtensionContext, "cwd" | "signal" | "modelRegistry" | "sessionManager">;
 
@@ -96,10 +134,17 @@ type DecisionEntry = {
 };
 
 const AUTO_MODE_COMMAND = "automode";
+const AUTO_MODE_MODEL_COMMAND = "automode-model";
+const AUTO_MODE_THINKING_COMMAND = "automode-thinking";
 const RULES_COMMAND = "permission-rules";
 const AUTO_MODE_MODEL_PROVIDER = "github-copilot";
 const AUTO_MODE_MODEL_ID = "gpt-5.6-luna";
 const AUTO_MODE_REASONING = "high" as const;
+const DEFAULT_CLASSIFIER_THINKING_LEVEL: ClassifierThinkingLevel = "high";
+const DEFAULT_CLASSIFIER_MODEL: ClassifierModelReference = {
+	provider: AUTO_MODE_MODEL_PROVIDER,
+	id: AUTO_MODE_MODEL_ID,
+};
 const STATUS_ID = "permission-gate";
 const MODE_ENTRY_TYPE = "permission-gate-mode";
 const DECISION_ENTRY_TYPE = "permission-gate-decision";
@@ -108,6 +153,8 @@ const RULES_FILE_NAME = "permission-gate-rules.json";
 const DEFAULT_MODE_STATE: ModeState = {
 	autoModeEnabled: true,
 	webVerificationEnabled: true,
+	classifierModel: { ...DEFAULT_CLASSIFIER_MODEL },
+	classifierThinkingLevel: DEFAULT_CLASSIFIER_THINKING_LEVEL,
 };
 const DEFAULT_COMMAND_RULE_CONFIG: CommandRuleConfig = {
 	allowedCommands: [
@@ -378,6 +425,256 @@ function preview(command: string): string {
 
 function unique(values: string[]): string[] {
 	return [...new Set(values)];
+}
+
+function cloneClassifierModelReference(reference: ClassifierModelReference | null): ClassifierModelReference | null {
+	return reference ? { provider: reference.provider, id: reference.id } : null;
+}
+
+function parseClassifierModelReference(value: unknown): ClassifierModelReference | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const candidate = value as Partial<ClassifierModelReference>;
+	if (typeof candidate.provider !== "string" || typeof candidate.id !== "string") return undefined;
+	const provider = candidate.provider.trim();
+	const id = candidate.id.trim();
+	if (!provider || !id) return undefined;
+	return { provider, id };
+}
+
+function canonicalClassifierModelId(reference: ClassifierModelReference): string {
+	return `${reference.provider}/${reference.id}`;
+}
+
+function classifierModelDisplayId(reference: ClassifierModelReference | null): string {
+	return reference ? canonicalClassifierModelId(reference) : "unavailable classifier model";
+}
+
+function findAvailableClassifierModel(
+	availableModels: readonly AvailableClassifierModel[],
+	reference: ClassifierModelReference | null,
+): AvailableClassifierModel | undefined {
+	return reference ? availableModels.find((model) => model.canonicalId === canonicalClassifierModelId(reference)) : undefined;
+}
+
+function isClassifierThinkingLevel(value: string): value is ClassifierThinkingLevel {
+	return (CLASSIFIER_THINKING_LEVELS as readonly string[]).includes(value);
+}
+
+function getSupportedClassifierThinkingLevels(model: RegistryModel): ClassifierThinkingLevel[] {
+	if (model.reasoning !== true) return ["off"];
+	return CLASSIFIER_THINKING_LEVELS.filter((level) => {
+		const mapped = model.thinkingLevelMap?.[level];
+		if (mapped === null) return false;
+		if (level === "xhigh" || level === "max") return mapped !== undefined;
+		return true;
+	});
+}
+
+function clampClassifierThinkingLevel(model: RegistryModel, configured: ClassifierThinkingLevel): ClassifierThinkingLevel {
+	const availableLevels = getSupportedClassifierThinkingLevels(model);
+	if (availableLevels.includes(configured)) return configured;
+
+	const requestedIndex = CLASSIFIER_THINKING_LEVELS.indexOf(configured);
+	for (let index = requestedIndex; index < CLASSIFIER_THINKING_LEVELS.length; index += 1) {
+		const candidate = CLASSIFIER_THINKING_LEVELS[index];
+		if (availableLevels.includes(candidate)) return candidate;
+	}
+	for (let index = requestedIndex - 1; index >= 0; index -= 1) {
+		const candidate = CLASSIFIER_THINKING_LEVELS[index];
+		if (availableLevels.includes(candidate)) return candidate;
+	}
+	return availableLevels[0] ?? "off";
+}
+
+function effectiveClassifierThinkingLevel(
+	model: RegistryModel | undefined,
+	configured: ClassifierThinkingLevel,
+): ClassifierThinkingLevel | "unavailable" {
+	return model ? clampClassifierThinkingLevel(model, configured) : "unavailable";
+}
+
+function formatClassifierThinkingLevel(
+	configured: ClassifierThinkingLevel,
+	model: RegistryModel | undefined,
+): string {
+	const effective = effectiveClassifierThinkingLevel(model, configured);
+	return configured === effective ? `thinking ${configured}` : `thinking ${configured} -> ${effective}`;
+}
+
+function filterTextModels(models: readonly unknown[]): RegistryModel[] {
+	const uniqueModels = new Map<string, RegistryModel>();
+	for (const candidate of models) {
+		if (!candidate || typeof candidate !== "object") continue;
+		const model = candidate as RegistryModel;
+		if (
+			typeof model.provider !== "string" ||
+			model.provider === "" ||
+			typeof model.id !== "string" ||
+			model.id === "" ||
+			!Array.isArray(model.input) ||
+			!model.input.includes("text")
+		) {
+			continue;
+		}
+		const canonicalId = canonicalClassifierModelId(model);
+		if (!uniqueModels.has(canonicalId)) uniqueModels.set(canonicalId, model);
+	}
+
+	return [...uniqueModels.values()].sort((left, right) => {
+		const leftId = canonicalClassifierModelId(left);
+		const rightId = canonicalClassifierModelId(right);
+		return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
+	});
+}
+
+function getAvailableClassifierModels(ctx: { modelRegistry: { getAvailable: () => readonly unknown[] } }): RegistryModel[] {
+	try {
+		return filterTextModels(ctx.modelRegistry.getAvailable());
+	} catch {
+		return [];
+	}
+}
+
+function cacheAvailableClassifierModels(
+	ctx: {
+		modelRegistry: {
+			getAvailable: () => readonly unknown[];
+			getProviderDisplayName: (provider: string) => string;
+		};
+	},
+): AvailableClassifierModel[] {
+	return filterTextModels(ctx.modelRegistry.getAvailable()).map((model) => ({
+		model,
+		canonicalId: canonicalClassifierModelId(model),
+		providerDisplayName: ctx.modelRegistry.getProviderDisplayName(model.provider),
+		modelName: model.name || model.id,
+	}));
+}
+
+function formatClassifierModelLabel(
+	reference: ClassifierModelReference | null,
+	availableModel: AvailableClassifierModel | undefined,
+	configuredThinkingLevel: ClassifierThinkingLevel,
+): string {
+	return `${classifierModelDisplayId(reference)} (${formatClassifierThinkingLevel(configuredThinkingLevel, availableModel?.model)})`;
+}
+
+function getModelDescription(model: AvailableClassifierModel): string {
+	return `${model.providerDisplayName} - ${model.modelName}`;
+}
+
+function getClassifierThinkingChoices(
+	model: RegistryModel | undefined,
+	configured: ClassifierThinkingLevel,
+): string[] {
+	const supportedLevels = model ? getSupportedClassifierThinkingLevels(model) : [];
+	const levels = model
+		? [...supportedLevels, ...CLASSIFIER_THINKING_LEVELS.filter((level) => !supportedLevels.includes(level))]
+		: [...CLASSIFIER_THINKING_LEVELS];
+
+	const choices = levels.map((level) => {
+		const details = model
+			? supportedLevels.includes(level)
+				? `supported${level === configured ? "; current" : ""}`
+				: `unsupported; effective ${clampClassifierThinkingLevel(model, level)}${level === configured ? "; current" : ""}`
+			: `model unavailable${level === configured ? "; current" : ""}`;
+		return `${level} - ${details}`;
+	});
+	choices.push("reset - Restore high (default)");
+	return choices;
+}
+
+type CommandCompletion = { value: string; label: string; description?: string };
+
+function getClassifierThinkingCompletions(argumentPrefix: string): CommandCompletion[] | null {
+	const prefix = argumentPrefix.trimStart();
+	const tokens = prefix.split(/\s+/).filter(Boolean);
+	const trailingSpace = /\s$/.test(argumentPrefix);
+	if (tokens.length > 1) return null;
+
+	const query = tokens[0]?.toLowerCase() ?? "";
+	const thinkingItems = CLASSIFIER_THINKING_LEVELS.map((level) => ({
+		value: level,
+		label: level,
+		description: `Classifier thinking level: ${level}`,
+	}));
+	const resetItem = { value: "reset", label: "reset", description: "Restore the default classifier thinking level" };
+	if (isClassifierThinkingLevel(query) || query === "reset") return null;
+	if (tokens.length === 0 || trailingSpace) return [...thinkingItems, resetItem];
+	return [
+		...thinkingItems.filter((item) => item.value.startsWith(query)),
+		...(resetItem.value.startsWith(query) ? [resetItem] : []),
+	];
+}
+
+function getClassifierModelArgumentCompletions(
+	argumentPrefix: string,
+	availableModels: readonly AvailableClassifierModel[],
+): CommandCompletion[] | null {
+	const prefix = argumentPrefix.trimStart();
+	const tokens = prefix.split(/\s+/).filter(Boolean);
+	const trailingSpace = /\s$/.test(argumentPrefix);
+	if (tokens.length > 1) return null;
+
+	const query = tokens[0] ?? "";
+	const lowerQuery = query.toLowerCase();
+	const resetItem = { value: "reset", label: "reset", description: "Restore the default classifier model" };
+	const completedModel = availableModels.some((model) => model.canonicalId === query);
+	if (completedModel || lowerQuery === "reset") return null;
+
+	const modelItems = availableModels
+		.filter((model) => model.canonicalId.toLowerCase().startsWith(lowerQuery))
+		.map((model) => ({
+			value: model.canonicalId,
+			label: model.canonicalId,
+			description: getModelDescription(model),
+		}));
+	if (tokens.length === 0 || trailingSpace) return [resetItem, ...modelItems];
+	return [
+		...(resetItem.value.startsWith(lowerQuery) ? [resetItem] : []),
+		...modelItems,
+	];
+}
+
+function getClassifierModelCompletions(
+	argumentPrefix: string,
+	availableModels: readonly AvailableClassifierModel[],
+): CommandCompletion[] | null {
+	const prefix = argumentPrefix.trimStart();
+	const tokens = prefix.split(/\s+/).filter(Boolean);
+	const trailingSpace = /\s$/.test(argumentPrefix);
+	const subcommands = [
+		{ value: "on", label: "on", description: "Enable auto mode" },
+		{ value: "off", label: "off", description: "Disable auto mode" },
+		{ value: "status", label: "status", description: "Show auto mode and classifier status" },
+		{ value: "model", label: "model", description: "Choose the auto-mode classifier model" },
+		{ value: "thinking", label: "thinking", description: "Configure classifier thinking level" },
+		{ value: "web", label: "web", description: "Toggle web verification" },
+	];
+
+	if (tokens.length === 0 || (tokens.length === 1 && !trailingSpace)) {
+		const query = tokens[0]?.toLowerCase() ?? "";
+		return subcommands.filter((item) => item.value.startsWith(query));
+	}
+
+	const action = tokens[0]?.toLowerCase();
+	if (action === "thinking") {
+		if (tokens.length > 2) return null;
+		const thinkingPrefix = tokens.length === 1 ? "" : `${tokens[1]}${trailingSpace ? " " : ""}`;
+		return getClassifierThinkingCompletions(thinkingPrefix);
+	}
+	if (action === "web") {
+		const query = tokens[1]?.toLowerCase() ?? "";
+		return [
+			{ value: "on", label: "on", description: "Enable web verification" },
+			{ value: "off", label: "off", description: "Disable web verification" },
+		].filter((item) => item.value.startsWith(query));
+	}
+	if (action !== "model") return null;
+	if (tokens.length > 2) return null;
+
+	const modelPrefix = tokens.length === 1 ? "" : `${tokens[1]}${trailingSpace ? " " : ""}`;
+	return getClassifierModelArgumentCompletions(modelPrefix, availableModels);
 }
 
 export function matchedReasons(command: string, rules: CommandRuleConfig = DEFAULT_COMMAND_RULE_CONFIG, cwd?: string): string[] {
@@ -797,20 +1094,22 @@ function createProviderComplete(provider: unknown): ClassifierComplete {
 			throw new Error("The configured classifier provider is not available.");
 		}
 
-		const stream = (provider as {
-			stream?: (
+		const streamSimple = (provider as {
+			streamSimple?: (
 				model: unknown,
 				context: unknown,
 				options: unknown,
 			) => { result: () => Promise<ClassifierResponse> };
-		}).stream;
-		if (typeof stream !== "function") throw new Error("The configured classifier provider cannot stream responses.");
-		return stream.call(provider, model, context, options).result();
+		}).streamSimple;
+		if (typeof streamSimple !== "function") {
+			throw new Error("The configured classifier provider cannot stream simple responses.");
+		}
+		return streamSimple.call(provider, model, context, options).result();
 	};
 }
 
 type ClassifierAuth = {
-	apiKey: string;
+	apiKey?: string;
 	headers?: Record<string, string | null>;
 	env?: Record<string, string>;
 	baseUrl?: string;
@@ -818,8 +1117,9 @@ type ClassifierAuth = {
 
 async function requestClassifierDecision(
 	complete: ClassifierComplete,
-	model: unknown,
+	model: RegistryModel,
 	auth: ClassifierAuth,
+	effectiveThinkingLevel: ClassifierThinkingLevel,
 	command: string,
 	reasons: string[],
 	ctx: { cwd: string; signal?: AbortSignal; sessionManager: { getBranch: () => unknown[] } },
@@ -839,10 +1139,10 @@ async function requestClassifierDecision(
 			],
 		},
 		{
-			apiKey: auth.apiKey,
-			headers: auth.headers,
-			env: auth.env,
-			reasoningEffort: AUTO_MODE_REASONING,
+			...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
+			...(auth.headers ? { headers: auth.headers } : {}),
+			...(auth.env ? { env: auth.env } : {}),
+			...(effectiveThinkingLevel !== "off" ? { reasoning: effectiveThinkingLevel } : {}),
 			maxTokens: 2048,
 			timeoutMs: CLASSIFIER_TIMEOUT_MS,
 			signal: ctx.signal,
@@ -860,6 +1160,8 @@ async function classifyWithModel(
 	reasons: string[],
 	ctx: ClassifierContext,
 	dependencies: PermissionGateDependencies,
+	classifierModel: ClassifierModelReference,
+	classifierThinkingLevel: ClassifierThinkingLevel,
 	webVerificationEnabled: boolean,
 ): Promise<{
 	decision: "allow" | "deny";
@@ -868,56 +1170,85 @@ async function classifyWithModel(
 	webQuery?: string;
 	webEvidence?: string;
 }> {
-	const model = ctx.modelRegistry.find(AUTO_MODE_MODEL_PROVIDER, AUTO_MODE_MODEL_ID);
-	const modelLabel = `${AUTO_MODE_MODEL_PROVIDER}/${AUTO_MODE_MODEL_ID} (${AUTO_MODE_REASONING})`;
-	if (!model) {
+	const registry = ctx.modelRegistry;
+	const availableModels = getAvailableClassifierModels(ctx);
+	const model = classifierModel
+		? availableModels.find(
+				(candidate) => candidate.provider === classifierModel.provider && candidate.id === classifierModel.id,
+			)
+		: undefined;
+	const modelLabel = model
+		? `${classifierModelDisplayId(classifierModel)} (${formatClassifierThinkingLevel(classifierThinkingLevel, model)})`
+		: formatClassifierModelLabel(classifierModel, undefined, classifierThinkingLevel);
+	if (!classifierModel || !model) {
 		return {
 			decision: "deny",
-			rationale: `Auto mode model ${modelLabel} is not available.`,
+			rationale: `Auto mode classifier model ${modelLabel} is not available.`,
+			model: modelLabel,
+		};
+	}
+	const effectiveThinkingLevel = clampClassifierThinkingLevel(model, classifierThinkingLevel);
+
+	const provider = registry.getProvider(classifierModel.provider);
+	if (!dependencies.complete && !provider) {
+		return {
+			decision: "deny",
+			rationale: `Auto mode classifier provider ${classifierModel.provider} is not available.`,
 			model: modelLabel,
 		};
 	}
 
 	let auth: ClassifierAuth;
-	let effectiveModel = model;
 	try {
-		const resolved = await ctx.modelRegistry.getProviderAuth(model.provider);
-		if (!resolved?.auth.apiKey) {
+		// The public registry API exposes provider auth and request auth separately, so merge both resolutions here.
+		const providerAuth = await registry.getProviderAuth(classifierModel.provider);
+		if (!providerAuth) {
 			return {
 				decision: "deny",
-				rationale: `No API key or OAuth token is available for ${modelLabel}.`,
+				rationale: `Classifier authentication for ${modelLabel} is unavailable.`,
 				model: modelLabel,
 			};
 		}
-		auth = {
-			apiKey: resolved.auth.apiKey,
-			headers: resolved.auth.headers,
-			env: resolved.env,
-			baseUrl: resolved.auth.baseUrl,
-		};
-		const modelRequestAuth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-		if (modelRequestAuth.ok) {
-			auth = {
-				...auth,
-				apiKey: modelRequestAuth.apiKey ?? auth.apiKey,
-				headers: { ...auth.headers, ...modelRequestAuth.headers },
-				env: { ...auth.env, ...modelRequestAuth.env },
+
+		const modelRequestAuth = await registry.getApiKeyAndHeaders(model);
+		if (!modelRequestAuth.ok) {
+			return {
+				decision: "deny",
+				rationale: `Classifier authentication for ${modelLabel} is unavailable.`,
+				model: modelLabel,
 			};
 		}
-		if (auth.baseUrl) effectiveModel = { ...model, baseUrl: auth.baseUrl };
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
+
+		const headers = { ...(providerAuth.auth.headers ?? {}), ...(modelRequestAuth.headers ?? {}) };
+		const env = { ...(providerAuth.env ?? {}), ...(modelRequestAuth.env ?? {}) };
+		auth = {
+			...(providerAuth.auth.apiKey || modelRequestAuth.apiKey
+				? { apiKey: modelRequestAuth.apiKey ?? providerAuth.auth.apiKey }
+				: {}),
+			...(Object.keys(headers).length > 0 ? { headers } : {}),
+			...(Object.keys(env).length > 0 ? { env } : {}),
+			...(providerAuth.auth.baseUrl ? { baseUrl: providerAuth.auth.baseUrl } : {}),
+		};
+	} catch {
 		return {
 			decision: "deny",
-			rationale: `Auto mode authentication failed: ${truncate(message, 300)}`,
+			rationale: `Classifier authentication for ${modelLabel} is unavailable.`,
 			model: modelLabel,
 		};
 	}
 
 	try {
-		const complete = dependencies.complete
-			?? createProviderComplete(ctx.modelRegistry.getProvider(model.provider));
-		const initial = await requestClassifierDecision(complete, effectiveModel, auth, command, reasons, ctx);
+		const complete = dependencies.complete ?? createProviderComplete(provider);
+		const effectiveModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
+		const initial = await requestClassifierDecision(
+			complete,
+			effectiveModel,
+			auth,
+			effectiveThinkingLevel,
+			command,
+			reasons,
+			ctx,
+		);
 		if (!initial) {
 			return {
 				decision: "deny",
@@ -974,7 +1305,16 @@ async function classifyWithModel(
 			};
 		}
 
-		const final = await requestClassifierDecision(complete, effectiveModel, auth, command, reasons, ctx, webEvidence);
+		const final = await requestClassifierDecision(
+			complete,
+			effectiveModel,
+			auth,
+			effectiveThinkingLevel,
+			command,
+			reasons,
+			ctx,
+			webEvidence,
+		);
 		if (!final || final.needsWebSearch) {
 			return {
 				decision: "deny",
@@ -996,6 +1336,65 @@ async function classifyWithModel(
 	}
 }
 
+const SUBAGENT_APPROVAL_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * Ask the parent process for a manual approval when this gate runs inside a
+ * subagent child. Uses the coordinator socket protocol of the subagent
+ * extension: a single JSON line request, a single JSON line reply.
+ *
+ * Fails closed: a missing socket, a timeout, or any socket error denies.
+ */
+function requestParentApproval(
+	socketPath: string,
+	command: string,
+	reasons: string[],
+	signal?: AbortSignal,
+): Promise<boolean> {
+	return new Promise((resolve) => {
+		const socket = connect(socketPath);
+		let buffer = "";
+		let settled = false;
+		const finish = (allow: boolean) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			socket.destroy();
+			resolve(allow);
+		};
+		const onAbort = () => finish(false);
+		const timer = setTimeout(() => finish(false), SUBAGENT_APPROVAL_TIMEOUT_MS);
+
+		signal?.addEventListener("abort", onAbort, { once: true });
+		socket.on("connect", () => {
+			socket.write(
+				`${JSON.stringify({
+					type: "approval",
+					id: randomUUID(),
+					agent: process.env.PI_SUBAGENT_NAME ?? "subagent",
+					toolName: "bash",
+					input: { command },
+					reasons,
+				})}\n`,
+			);
+		});
+		socket.on("data", (data) => {
+			buffer += data.toString();
+			const newline = buffer.indexOf("\n");
+			if (newline === -1) return;
+			try {
+				const reply = JSON.parse(buffer.slice(0, newline)) as { allow?: boolean };
+				finish(reply.allow === true);
+			} catch {
+				finish(false);
+			}
+		});
+		socket.on("error", () => finish(false));
+		socket.on("close", () => finish(false));
+	});
+}
+
 function recordDecision(pi: ExtensionAPI, entry: DecisionEntry): void {
 	try {
 		pi.appendEntry(DECISION_ENTRY_TYPE, entry);
@@ -1015,9 +1414,21 @@ function parseModeState(value: unknown): ModeState | undefined {
 	if (typeof candidate.autoModeEnabled !== "boolean" || typeof candidate.webVerificationEnabled !== "boolean") {
 		return undefined;
 	}
+	const classifierModel =
+		candidate.classifierModel === undefined
+			? cloneClassifierModelReference(DEFAULT_CLASSIFIER_MODEL)
+			: parseClassifierModelReference(candidate.classifierModel) ?? null;
+	const classifierThinkingLevel =
+		candidate.classifierThinkingLevel === undefined
+			? DEFAULT_CLASSIFIER_THINKING_LEVEL
+			: typeof candidate.classifierThinkingLevel === "string" && isClassifierThinkingLevel(candidate.classifierThinkingLevel)
+				? candidate.classifierThinkingLevel
+				: DEFAULT_CLASSIFIER_THINKING_LEVEL;
 	return {
 		autoModeEnabled: candidate.autoModeEnabled,
 		webVerificationEnabled: candidate.webVerificationEnabled,
+		classifierModel,
+		classifierThinkingLevel,
 	};
 }
 
@@ -1235,11 +1646,18 @@ function setAutoModeStatus(
 	ctx: { hasUI: boolean; ui: { setStatus: (id: string, text: string | undefined) => void } },
 	enabled: boolean,
 	webVerificationEnabled: boolean,
+	classifierModel: ClassifierModelReference,
+	classifierThinkingLevel: ClassifierThinkingLevel,
+	availableModels: readonly AvailableClassifierModel[],
 ): void {
 	if (!ctx.hasUI) return;
+	const selectedModel = findAvailableClassifierModel(availableModels, classifierModel);
+	const thinking = formatClassifierThinkingLevel(classifierThinkingLevel, selectedModel?.model);
 	ctx.ui.setStatus(
 		STATUS_ID,
-		enabled ? `auto mode: ON (${AUTO_MODE_MODEL_ID}, high, web ${webVerificationEnabled ? "on" : "off"})` : undefined,
+		enabled
+			? `auto mode: ON (${classifierModelDisplayId(classifierModel)}, ${thinking}, web ${webVerificationEnabled ? "on" : "off"})`
+			: undefined,
 	);
 }
 
@@ -1256,13 +1674,21 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 	// value conservative and load the globally persisted preference at startup.
 	let autoModeEnabled = false;
 	let webVerificationEnabled = DEFAULT_MODE_STATE.webVerificationEnabled;
+	let classifierModel = cloneClassifierModelReference(DEFAULT_CLASSIFIER_MODEL);
+	let classifierThinkingLevel = DEFAULT_CLASSIFIER_THINKING_LEVEL;
+	let availableClassifierModels: AvailableClassifierModel[] = [];
 	let ruleConfig = cloneDefaultCommandRuleConfig();
 	let ruleScope: "global" | "project" | "session" = "global";
 	const persistMode = async (ctx: {
 		hasUI: boolean;
 		ui: { notify: (message: string, level: "info" | "warning" | "error") => void };
 	}) => {
-		const state = { autoModeEnabled, webVerificationEnabled };
+		const state: ModeState = {
+			autoModeEnabled,
+			webVerificationEnabled,
+			classifierModel: cloneClassifierModelReference(classifierModel),
+			classifierThinkingLevel,
+		};
 		persistModeState(pi, state);
 		if (!(await persistGlobalModeState(dependencies, state))) {
 			notify(ctx, "Permission gate mode could not be persisted globally.", "warning");
@@ -1275,7 +1701,14 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 
 		const approved = data.status === "approved";
 		const title = approved ? "Permission Gate: APPROVED" : "Permission Gate: BLOCKED";
-		const source = data.source === "auto-model" ? "auto model" : data.source === "user-rule" ? "user rule" : "hard deny";
+		const source =
+			data.source === "auto-model"
+				? "auto model"
+				: data.source === "user-rule"
+					? "user rule"
+					: data.source === "parent-approval"
+						? "parent approval"
+						: "hard deny";
 		const color = approved ? "success" : "error";
 		const lines = [
 			`${theme.fg(color, theme.bold(title))} ${theme.fg("dim", `via ${source}`)}`,
@@ -1290,13 +1723,200 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		return new Text(lines.join("\n"), 0, 0);
 	});
 
+	const syncAvailableClassifierModels = (ctx: { modelRegistry: { getAvailable: () => readonly unknown[]; getProviderDisplayName: (provider: string) => string } }): void => {
+		try {
+			availableClassifierModels = cacheAvailableClassifierModels(ctx);
+		} catch {
+			availableClassifierModels = [];
+		}
+	};
+	const refreshAvailableClassifierModels = async (ctx: {
+		modelRegistry: {
+			refresh: () => Promise<void>;
+			getAvailable: () => readonly unknown[];
+			getProviderDisplayName: (provider: string) => string;
+		};
+	}): Promise<AvailableClassifierModel[]> => {
+		await ctx.modelRegistry.refresh();
+		availableClassifierModels = cacheAvailableClassifierModels(ctx);
+		return availableClassifierModels;
+	};
+
+	const canPromptForSelection = (ctx: Pick<ExtensionContext, "hasUI" | "mode">): boolean =>
+		ctx.hasUI && (ctx.mode === "tui" || ctx.mode === "rpc");
+
+	const handleClassifierModelCommand = async (args: string, ctx: ExtensionContext, commandLabel: string): Promise<void> => {
+		const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
+		if (parts.length === 0) {
+			if (!canPromptForSelection(ctx)) {
+				notify(ctx, `Choosing a classifier model requires interactive mode. Use /${commandLabel} provider/model-id instead.`, "warning");
+				return;
+			}
+
+			let models: AvailableClassifierModel[];
+			try {
+				models = await refreshAvailableClassifierModels(ctx);
+			} catch {
+				notify(ctx, "Permission gate could not discover classifier models after refreshing Pi's model registry.", "error");
+				return;
+			}
+			if (models.length === 0) {
+				notify(ctx, "Permission gate found no available authenticated text-capable classifier models.", "warning");
+				return;
+			}
+
+			const choices = models.map((model) => `${model.canonicalId} - ${getModelDescription(model)}`);
+			const choice = await ctx.ui.select("Select the auto-mode classifier model:", choices);
+			if (!choice) return;
+			const selectedIndex = choices.indexOf(choice);
+			const selected = selectedIndex >= 0 ? models[selectedIndex] : models.find((model) => model.canonicalId === choice);
+			if (!selected) {
+				notify(ctx, "Permission gate: the selected classifier model is no longer available.", "warning");
+				return;
+			}
+			classifierModel = { provider: selected.model.provider, id: selected.model.id };
+			await persistMode(ctx);
+			setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
+			notify(
+			ctx,
+			`Permission gate classifier model set to ${formatClassifierModelLabel(classifierModel, selected, classifierThinkingLevel)}.`,
+			"info",
+		);
+			return;
+		}
+
+		if (parts.length !== 1) {
+			notify(ctx, `Usage: /${commandLabel} [provider/model-id|reset]`, "warning");
+			return;
+		}
+
+		const modelArgument = parts[0];
+		if (modelArgument.toLowerCase() === "reset") {
+			classifierModel = cloneClassifierModelReference(DEFAULT_CLASSIFIER_MODEL);
+			syncAvailableClassifierModels(ctx);
+			await persistMode(ctx);
+			setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
+			notify(
+				ctx,
+				`Permission gate classifier model reset to ${formatClassifierModelLabel(classifierModel, findAvailableClassifierModel(availableClassifierModels, classifierModel), classifierThinkingLevel)}.`,
+				"info",
+			);
+			return;
+		}
+
+		let models: AvailableClassifierModel[];
+		try {
+			models = await refreshAvailableClassifierModels(ctx);
+		} catch {
+			notify(ctx, "Permission gate could not discover classifier models after refreshing Pi's model registry.", "error");
+			return;
+		}
+		const selected = models.find((model) => model.canonicalId === modelArgument);
+		if (!selected) {
+			notify(ctx, `Permission gate classifier model ${modelArgument} is not an available authenticated text-capable model.`, "warning");
+			return;
+		}
+		classifierModel = { provider: selected.model.provider, id: selected.model.id };
+		await persistMode(ctx);
+		setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
+		notify(
+			ctx,
+			`Permission gate classifier model set to ${formatClassifierModelLabel(classifierModel, selected, classifierThinkingLevel)}.`,
+			"info",
+		);
+	};
+
+	const handleClassifierThinkingCommand = async (
+		args: string,
+		ctx: ExtensionContext,
+		commandLabel: string,
+		openSelector: boolean,
+	): Promise<void> => {
+		const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
+		if (parts.length === 0 && openSelector && !canPromptForSelection(ctx)) {
+			notify(ctx, `Choosing a classifier thinking level requires interactive mode. Use /${commandLabel} <level> instead.`, "warning");
+			return;
+		}
+
+		syncAvailableClassifierModels(ctx);
+		const selected = findAvailableClassifierModel(availableClassifierModels, classifierModel);
+		if (parts.length === 0) {
+			if (!openSelector) {
+				const effective = effectiveClassifierThinkingLevel(selected?.model, classifierThinkingLevel);
+				notify(
+					ctx,
+					`Permission gate classifier thinking is configured as ${classifierThinkingLevel} and effective as ${effective} for ${classifierModelDisplayId(classifierModel)}.`,
+					"info",
+				);
+				return;
+			}
+
+			const choices = getClassifierThinkingChoices(selected?.model, classifierThinkingLevel);
+			const choice = await ctx.ui.select("Select the auto-mode classifier thinking level:", choices);
+			if (!choice) return;
+			const requestedThinkingLevel = choice.split(" - ", 1)[0]?.trim().toLowerCase();
+			const nextThinkingLevel =
+			requestedThinkingLevel === "reset"
+				? DEFAULT_CLASSIFIER_THINKING_LEVEL
+				: requestedThinkingLevel && isClassifierThinkingLevel(requestedThinkingLevel)
+					? requestedThinkingLevel
+					: undefined;
+			if (!nextThinkingLevel) {
+				notify(ctx, "Permission gate: the selected thinking level is no longer available.", "warning");
+				return;
+			}
+			classifierThinkingLevel = nextThinkingLevel;
+		} else {
+			if (parts.length !== 1) {
+				notify(ctx, `Usage: /${commandLabel} [off|minimal|low|medium|high|xhigh|max|reset]`, "warning");
+				return;
+			}
+
+			const requestedThinkingLevel = parts[0].toLowerCase();
+			const nextThinkingLevel =
+				requestedThinkingLevel === "reset"
+					? DEFAULT_CLASSIFIER_THINKING_LEVEL
+					: isClassifierThinkingLevel(requestedThinkingLevel)
+						? requestedThinkingLevel
+						: undefined;
+			if (!nextThinkingLevel) {
+				notify(ctx, `Usage: /${commandLabel} [off|minimal|low|medium|high|xhigh|max|reset]`, "warning");
+				return;
+			}
+			classifierThinkingLevel = nextThinkingLevel;
+		}
+
+		syncAvailableClassifierModels(ctx);
+		await persistMode(ctx);
+		setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
+		notify(
+			ctx,
+			`Permission gate classifier for ${classifierModelDisplayId(classifierModel)} is ${formatClassifierThinkingLevel(classifierThinkingLevel, findAvailableClassifierModel(availableClassifierModels, classifierModel)?.model)}.`,
+			"info",
+		);
+	};
+
 	pi.registerCommand(AUTO_MODE_COMMAND, {
 		description: "Toggle automatic safety decisions for dangerous bash commands",
+		argumentHint: "[on|off|status|model [provider/model-id|reset]|thinking [off|minimal|low|medium|high|xhigh|max|reset]|web [on|off]]",
+		getArgumentCompletions: (argumentPrefix) =>
+			getClassifierModelCompletions(argumentPrefix, availableClassifierModels),
 		handler: async (args, ctx) => {
-			const value = String(args ?? "").trim().toLowerCase();
-			const [first, second] = value.split(/\s+/).filter(Boolean);
+			const rawValue = String(args ?? "").trim();
+			const parts = rawValue.split(/\s+/).filter(Boolean);
+			const first = parts[0]?.toLowerCase() ?? "";
+
+			if (first === "model") {
+				await handleClassifierModelCommand(parts.slice(1).join(" "), ctx, "automode model");
+				return;
+			}
+			if (first === "thinking") {
+				await handleClassifierThinkingCommand(parts.slice(1).join(" "), ctx, "automode thinking", false);
+				return;
+			}
 
 			if (first === "web") {
+				const second = parts[1]?.toLowerCase();
 				if (second === "on" || second === "enable" || second === "enabled") {
 					webVerificationEnabled = true;
 				} else if (second === "off" || second === "disable" || second === "disabled") {
@@ -1308,45 +1928,66 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 					return;
 				}
 
+				syncAvailableClassifierModels(ctx);
 				await persistMode(ctx);
-				setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled);
+				setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
 				notify(
 					ctx,
-					`Permission gate web verification ${webVerificationEnabled ? "enabled" : "disabled"}.`,
+					`Permission gate web verification ${webVerificationEnabled ? "enabled" : "disabled"}. Classifier: ${formatClassifierModelLabel(classifierModel, findAvailableClassifierModel(availableClassifierModels, classifierModel), classifierThinkingLevel)}.`,
 					"info",
 				);
 				return;
 			}
 
+			const value = rawValue.toLowerCase();
 			if (value === "on" || value === "enable" || value === "enabled") {
 				autoModeEnabled = true;
 			} else if (value === "off" || value === "disable" || value === "disabled") {
 				autoModeEnabled = false;
 			} else if (value === "status") {
+				syncAvailableClassifierModels(ctx);
+				const selected = findAvailableClassifierModel(availableClassifierModels, classifierModel);
 				notify(
 					ctx,
-					`Permission gate auto mode is ${autoModeEnabled ? "ON" : "OFF"}; web verification is ${webVerificationEnabled ? "ON" : "OFF"}.`,
+					`Permission gate auto mode is ${autoModeEnabled ? "ON" : "OFF"}; web verification is ${webVerificationEnabled ? "ON" : "OFF"}; classifier model is ${formatClassifierModelLabel(classifierModel, selected, classifierThinkingLevel)}.`,
 					"info",
 				);
-				setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled);
+				setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
 				return;
 			} else if (value === "") {
 				autoModeEnabled = !autoModeEnabled;
 			} else {
-				notify(ctx, "Usage: /automode [on|off|status] or /automode web [on|off]", "warning");
+				notify(ctx, "Usage: /automode [on|off|status|model [provider/model-id|reset]|thinking [level|reset]|web [on|off]]", "warning");
 				return;
 			}
 
+			syncAvailableClassifierModels(ctx);
 			await persistMode(ctx);
-			setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled);
+			setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
 			notify(
 				ctx,
 				autoModeEnabled
-					? `Permission gate auto mode enabled globally. ${AUTO_MODE_MODEL_PROVIDER}/${AUTO_MODE_MODEL_ID} will decide soft-deny commands at high reasoning. Web verification is ${webVerificationEnabled ? "on" : "off"}.`
-					: "Permission gate auto mode disabled globally. Dangerous commands require manual confirmation.",
+					? `Permission gate auto mode enabled globally. Classifier ${formatClassifierModelLabel(classifierModel, findAvailableClassifierModel(availableClassifierModels, classifierModel), classifierThinkingLevel)} will decide soft-deny commands. Web verification is ${webVerificationEnabled ? "on" : "off"}.`
+					: `Permission gate auto mode disabled globally. Classifier is ${formatClassifierModelLabel(classifierModel, findAvailableClassifierModel(availableClassifierModels, classifierModel), classifierThinkingLevel)}. Dangerous commands require manual confirmation.`,
 				"info",
 			);
 		},
+	});
+
+	pi.registerCommand(AUTO_MODE_MODEL_COMMAND, {
+		description: "Choose the auto-mode classifier model",
+		argumentHint: "[provider/model-id|reset]",
+		getArgumentCompletions: (argumentPrefix) =>
+			getClassifierModelArgumentCompletions(argumentPrefix, availableClassifierModels),
+		handler: async (args, ctx) => handleClassifierModelCommand(String(args ?? ""), ctx, AUTO_MODE_MODEL_COMMAND),
+	});
+
+	pi.registerCommand(AUTO_MODE_THINKING_COMMAND, {
+		description: "Configure the auto-mode classifier thinking level",
+		argumentHint: "[off|minimal|low|medium|high|xhigh|max|reset]",
+		getArgumentCompletions: (argumentPrefix) => getClassifierThinkingCompletions(argumentPrefix),
+		handler: async (args, ctx) =>
+			handleClassifierThinkingCommand(String(args ?? ""), ctx, AUTO_MODE_THINKING_COMMAND, true),
 	});
 
 	pi.registerCommand(RULES_COMMAND, {
@@ -1451,15 +2092,19 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		]);
 		autoModeEnabled = restored.autoModeEnabled;
 		webVerificationEnabled = restored.webVerificationEnabled;
+		classifierModel = cloneClassifierModelReference(restored.classifierModel);
+		classifierThinkingLevel = restored.classifierThinkingLevel;
 		ruleConfig = loadedRules.config;
 		ruleScope = loadedRules.scope;
-		setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled);
+		syncAvailableClassifierModels(ctx);
+		setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
 		// Mode is a global preference, so navigating a conversation branch must not
 		// silently turn auto mode off or restore an obsolete branch-local value.
-		setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled);
+		syncAvailableClassifierModels(ctx);
+		setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
@@ -1499,7 +2144,16 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		if (userRule?.decision === "allow" || reasons.length === 0) return undefined;
 
 		if (autoModeEnabled) {
-			const result = await classifyWithModel(pi, command, reasons, ctx, dependencies, webVerificationEnabled);
+			const result = await classifyWithModel(
+				pi,
+				command,
+				reasons,
+				ctx,
+				dependencies,
+				classifierModel,
+				classifierThinkingLevel,
+				webVerificationEnabled,
+			);
 			const approved = result.decision === "allow" && !ctx.signal?.aborted;
 			const rationale = approved
 				? result.rationale
@@ -1526,6 +2180,28 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		}
 
 		const reason = `Potentially dangerous command blocked/needs confirmation: ${reasons.join(", ")}`;
+
+		// Inside a subagent child there is no local UI, so a manual confirmation is
+		// proxied to the parent process, which prompts the user on our behalf.
+		if (process.env.PI_SUBAGENT) {
+			const socketPath = process.env.PI_SUBAGENT_COORDINATOR_SOCKET;
+			if (!socketPath) {
+				return { block: true, reason: `${reason} (no approval channel to the parent process)` };
+			}
+			const allowed = await requestParentApproval(socketPath, command, reasons, ctx.signal);
+			recordDecision(pi, {
+				command: preview(command),
+				reasons,
+				status: allowed ? "approved" : "blocked",
+				source: "parent-approval",
+				rationale: allowed
+					? "The user approved the command in the parent process."
+					: "The parent process denied the command or the approval channel failed.",
+				timestamp: Date.now(),
+			});
+			if (allowed) return undefined;
+			return { block: true, reason: "Blocked by user via the parent permission gate" };
+		}
 
 		if (!ctx.hasUI) {
 			return { block: true, reason: `${reason} (no UI for confirmation)` };

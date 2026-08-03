@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs/promises";
+import * as net from "node:net";
+import * as os from "node:os";
+import * as path from "node:path";
 import test from "node:test";
 
 import {
@@ -10,10 +14,27 @@ import {
 
 function createHarness({
   hasUI = false,
+  mode = "tui",
+  activeModel = { provider: "active-provider", id: "active-model" },
   choice,
+  modelChoice,
   classifierText = '{"decision":"deny","rationale":"The command is not sufficiently scoped."}',
   classifierTexts,
   classifierError,
+  useComplete = true,
+  models = [
+    {
+      provider: "github-copilot",
+      id: "gpt-5.6-luna",
+      name: "GPT-5.6 Luna",
+      input: ["text"],
+      reasoning: true,
+    },
+  ],
+  providerDisplayNames = {},
+  providerAuth,
+  requestAuth,
+  refreshError,
   webSearchAvailable = false,
   webSearchRegistered = webSearchAvailable,
   webSearchExtensionPath = webSearchAvailable ? "test-web-search.ts" : undefined,
@@ -31,8 +52,36 @@ function createHarness({
   const notifications = [];
   const statuses = new Map();
   const classifierCalls = [];
+  const providerCalls = [];
   const execCalls = [];
   let classifierCallIndex = 0;
+  let refreshCalls = 0;
+  const registryEvents = [];
+
+  const nextClassifierResponse = () => {
+    if (classifierError) throw classifierError;
+    const text = classifierTexts?.[classifierCallIndex++] ?? classifierText;
+    return {
+      content: [{ type: "text", text }],
+      stopReason: "stop",
+    };
+  };
+
+  const providers = new Map();
+  for (const model of models) {
+    if (providers.has(model.provider)) continue;
+    providers.set(model.provider, {
+      id: model.provider,
+      name: providerDisplayNames[model.provider] ?? model.provider,
+      streamSimple(selectedModel, request, options) {
+        providerCalls.push({ model: selectedModel, request, options });
+        return { result: async () => nextClassifierResponse() };
+      },
+    });
+  }
+
+  const defaultProviderAuth = (provider) => providerAuth?.[provider] ?? { auth: { apiKey: "test-token", headers: {} }, env: {} };
+  const defaultRequestAuth = (model) => requestAuth?.[model.provider] ?? { ok: true, apiKey: "test-token", headers: {}, env: {} };
 
   const pi = {
     on(eventName, handler) {
@@ -83,31 +132,47 @@ function createHarness({
 
   const context = {
     cwd: "/tmp/project",
-    mode: "tui",
+    mode,
+    model: activeModel,
     hasUI,
     signal: undefined,
     sessionManager: {
       getBranch: () => branch,
     },
     modelRegistry: {
+      refresh() {
+        refreshCalls += 1;
+        registryEvents.push("refresh");
+        if (refreshError) return Promise.reject(refreshError);
+        return Promise.resolve();
+      },
+      getAvailable() {
+        registryEvents.push("getAvailable");
+        return models;
+      },
+      getProvider(provider) {
+        return providers.get(provider);
+      },
+      getProviderDisplayName(provider) {
+        return providerDisplayNames[provider] ?? provider;
+      },
       find(provider, modelId) {
-        assert.equal(provider, "github-copilot");
-        assert.equal(modelId, "gpt-5.6-luna");
-        return { provider, id: modelId };
+        return models.find((model) => model.provider === provider && model.id === modelId);
       },
-      async getApiKeyAndHeaders() {
-        return { ok: true, apiKey: "test-token", headers: {}, env: {} };
+      async getApiKeyAndHeaders(model) {
+        return defaultRequestAuth(model);
       },
-      async getProviderAuth() {
-        return { auth: { apiKey: "test-token", headers: {} }, env: {} };
+      async getProviderAuth(provider) {
+        return defaultProviderAuth(provider);
       },
     },
     isProjectTrusted() {
       return false;
     },
     ui: {
-      async select(title) {
+      async select(title, options) {
         if (title === "Save permission gate rules:") return ruleSaveChoice;
+        if (title === "Select the auto-mode classifier model:") return modelChoice ?? options[0];
         return choice;
       },
       async editor() {
@@ -124,16 +189,11 @@ function createHarness({
 
   const complete = async (model, request, options) => {
     classifierCalls.push({ model, request, options });
-    if (classifierError) throw classifierError;
-    const text = classifierTexts?.[classifierCallIndex++] ?? classifierText;
-    return {
-      content: [{ type: "text", text }],
-      stopReason: "stop",
-    };
+    return nextClassifierResponse();
   };
 
   createPermissionGate(pi, {
-    complete,
+    ...(useComplete ? { complete } : {}),
     webSearchExtensionPath,
     loadGlobalModeState: async () => globalModeState.current,
     saveGlobalModeState: async (state) => {
@@ -156,7 +216,12 @@ function createHarness({
     notifications,
     statuses,
     classifierCalls,
+    providerCalls,
     execCalls,
+    get refreshCalls() {
+      return refreshCalls;
+    },
+    registryEvents,
     context,
     decisionEntries() {
       return entries.filter((entry) => entry.type === "permission-gate-decision");
@@ -364,11 +429,11 @@ test("auto mode approves a soft-deny command with the configured model", async (
   assert.equal(result, undefined);
   assert.equal(harness.classifierCalls.length, 1);
   assert.equal(harness.classifierCalls[0].model.id, "gpt-5.6-luna");
-  assert.equal(harness.classifierCalls[0].options.reasoningEffort, "high");
+  assert.equal(harness.classifierCalls[0].options.reasoning, "high");
   assert.equal(harness.decisionEntries()[0].data.status, "approved");
   assert.equal(harness.decisionEntries()[0].data.source, "auto-model");
-  assert.match(harness.decisionEntries()[0].data.model, /github-copilot\/gpt-5\.6-luna \(high\)/);
-  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (gpt-5.6-luna, high, web on)");
+  assert.match(harness.decisionEntries()[0].data.model, /github-copilot\/gpt-5\.6-luna \(thinking high\)/);
+  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high, web on)");
 });
 
 test("auto mode can request web verification before the final decision", async () => {
@@ -451,11 +516,12 @@ test("auto mode fails closed when classification fails", async () => {
   assert.equal(harness.decisionEntries()[0].data.status, "blocked");
 });
 
-test("loads globally persisted auto-mode state on session start", async () => {
+test("loads legacy globally persisted auto-mode state and uses the default classifier", async () => {
+  const globalModeState = { current: { autoModeEnabled: true, webVerificationEnabled: false } };
   const harness = createHarness({
     hasUI: true,
     classifierText: '{"decision":"allow","rationale":"The explicit test command is safe."}',
-    globalModeState: { current: { autoModeEnabled: true, webVerificationEnabled: false } },
+    globalModeState,
   });
 
   await harness.startSession();
@@ -465,7 +531,42 @@ test("loads globally persisted auto-mode state on session start", async () => {
   });
 
   assert.equal(result, undefined);
-  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (gpt-5.6-luna, high, web off)");
+  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high, web off)");
+  assert.deepEqual(globalModeState.current, { autoModeEnabled: true, webVerificationEnabled: false });
+});
+
+test("preserves booleans and exposes malformed classifier state without default substitution", async () => {
+  const globalModeState = {
+    current: {
+      autoModeEnabled: false,
+      webVerificationEnabled: false,
+      classifierModel: { provider: "", id: "" },
+      classifierThinkingLevel: "not-a-level",
+    },
+  };
+  const harness = createHarness({ hasUI: true, globalModeState });
+
+  await harness.startSession();
+  assert.equal(harness.statuses.get("permission-gate"), undefined);
+  await harness.commands.get("automode").handler("status", harness.context);
+  assert.match(harness.notifications.at(-1).message, /auto mode is OFF/);
+  assert.match(harness.notifications.at(-1).message, /web verification is OFF/);
+  assert.match(harness.notifications.at(-1).message, /unavailable classifier model/);
+  assert.doesNotMatch(harness.notifications.at(-1).message, /github-copilot\/gpt-5\.6-luna/);
+  assert.deepEqual(globalModeState.current, {
+    autoModeEnabled: false,
+    webVerificationEnabled: false,
+    classifierModel: { provider: "", id: "" },
+    classifierThinkingLevel: "not-a-level",
+  });
+
+  await harness.commands.get("automode").handler("on", harness.context);
+  assert.equal(globalModeState.current.classifierModel, null);
+  assert.equal(globalModeState.current.classifierThinkingLevel, "high");
+  const result = await harness.invoke({ toolName: "bash", input: { command: "sudo -n true" } });
+  assert.equal(result.block, true);
+  assert.match(result.reason, /unavailable classifier model/);
+  assert.equal(harness.classifierCalls.length, 0);
 });
 
 test("keeps the global auto-mode state across new sessions, forks, reloads, and tree navigation", async () => {
@@ -473,16 +574,16 @@ test("keeps the global auto-mode state across new sessions, forks, reloads, and 
   const firstSession = createHarness({ hasUI: true, globalModeState });
 
   await firstSession.startSession({ type: "session_start", reason: "startup" });
-  assert.equal(firstSession.statuses.get("permission-gate"), "auto mode: ON (gpt-5.6-luna, high, web on)");
+  assert.equal(firstSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high, web on)");
   await firstSession.commands.get("automode").handler("web off", firstSession.context);
 
   const nextSession = createHarness({ hasUI: true, globalModeState });
   await nextSession.startSession({ type: "session_start", reason: "fork" });
-  assert.equal(nextSession.statuses.get("permission-gate"), "auto mode: ON (gpt-5.6-luna, high, web off)");
+  assert.equal(nextSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high, web off)");
 
   await nextSession.startSession({ type: "session_start", reason: "reload" });
   nextSession.handlers.get("session_tree")({}, nextSession.context);
-  assert.equal(nextSession.statuses.get("permission-gate"), "auto mode: ON (gpt-5.6-luna, high, web off)");
+  assert.equal(nextSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high, web off)");
 
   await nextSession.commands.get("automode").handler("off", nextSession.context);
   const resumedSession = createHarness({ hasUI: true, globalModeState });
@@ -496,11 +597,16 @@ test("automode toggles and reports its state", async () => {
 
   await command.handler("on", harness.context);
   assert.equal(harness.notifications.at(-1).message.includes("enabled"), true);
-  assert.deepEqual(harness.modeEntries()[0].data, { autoModeEnabled: true, webVerificationEnabled: true });
+  assert.deepEqual(harness.modeEntries()[0].data, {
+    autoModeEnabled: true,
+    webVerificationEnabled: true,
+    classifierModel: { provider: "github-copilot", id: "gpt-5.6-luna" },
+    classifierThinkingLevel: "high",
+  });
 
   await command.handler("web off", harness.context);
   assert.match(harness.notifications.at(-1).message, /web verification disabled/);
-  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (gpt-5.6-luna, high, web off)");
+  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high, web off)");
 
   await command.handler("status", harness.context);
   assert.match(harness.notifications.at(-1).message, /is ON/);
@@ -509,4 +615,587 @@ test("automode toggles and reports its state", async () => {
   await command.handler("off", harness.context);
   assert.match(harness.notifications.at(-1).message, /disabled/);
   assert.equal(harness.statuses.get("permission-gate"), undefined);
+});
+
+test("discovers text models for picker and autocomplete, supports slash-containing IDs, and resets", async () => {
+  const models = [
+    {
+      provider: "vertex",
+      id: "gemini/flash-2",
+      name: "Gemini Flash 2",
+      input: ["text"],
+      reasoning: false,
+    },
+    {
+      provider: "github-copilot",
+      id: "gpt-5.6-luna",
+      name: "GPT-5.6 Luna",
+      input: ["text"],
+      reasoning: true,
+    },
+    {
+      provider: "image-provider",
+      id: "image-model",
+      name: "Image Model",
+      input: ["image"],
+      reasoning: false,
+    },
+  ];
+  const globalModeState = { current: undefined };
+  const harness = createHarness({
+    hasUI: true,
+    models,
+    providerDisplayNames: { vertex: "Google Vertex" },
+    modelChoice: "vertex/gemini/flash-2 - Google Vertex - Gemini Flash 2",
+    globalModeState,
+  });
+
+  await harness.startSession();
+  const command = harness.commands.get("automode");
+  const completions = command.getArgumentCompletions("model ");
+  assert.deepEqual(completions.slice(0, 2).map((item) => item.value), ["reset", "github-copilot/gpt-5.6-luna"]);
+  assert.ok(completions.some((item) => item.value === "vertex/gemini/flash-2"));
+  assert.equal(completions.some((item) => item.value === "image-provider/image-model"), false);
+  assert.match(completions.find((item) => item.value === "vertex/gemini/flash-2").description, /Google Vertex/);
+  assert.equal(harness.refreshCalls, 0);
+
+  await command.handler("model", harness.context);
+  assert.equal(harness.refreshCalls, 1);
+  assert.deepEqual(harness.registryEvents.slice(-2), ["refresh", "getAvailable"]);
+  assert.deepEqual(globalModeState.current.classifierModel, { provider: "vertex", id: "gemini/flash-2" });
+  assert.match(harness.notifications.at(-1).message, /vertex\/gemini\/flash-2 \(thinking high -> off\)/);
+
+  await command.handler("model vertex/gemini/flash-2", harness.context);
+  assert.equal(harness.refreshCalls, 2);
+  assert.deepEqual(globalModeState.current.classifierModel, { provider: "vertex", id: "gemini/flash-2" });
+
+  await command.handler("model reset", harness.context);
+  assert.deepEqual(globalModeState.current, {
+    autoModeEnabled: true,
+    webVerificationEnabled: true,
+    classifierModel: { provider: "github-copilot", id: "gpt-5.6-luna" },
+    classifierThinkingLevel: "high",
+  });
+});
+
+test("configures, reports, validates, persists, and resets classifier thinking", async () => {
+  const globalModeState = { current: undefined };
+  const harness = createHarness({
+    hasUI: true,
+    globalModeState,
+    classifierText: '{"decision":"allow","rationale":"The configured classifier level was applied."}',
+  });
+  const command = harness.commands.get("automode");
+  harness.context.thinkingLevel = "medium";
+
+  await harness.startSession();
+  await command.handler("thinking max", harness.context);
+  assert.equal(harness.context.thinkingLevel, "medium");
+  assert.equal(globalModeState.current.classifierThinkingLevel, "max");
+  assert.equal(harness.modeEntries().at(-1).data.classifierThinkingLevel, "max");
+  assert.match(harness.notifications.at(-1).message, /thinking max -> high/);
+  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking max -> high, web on)");
+
+  const persistedAfterSet = { ...globalModeState.current };
+  await command.handler("thinking", harness.context);
+  assert.match(harness.notifications.at(-1).message, /configured as max and effective as high/);
+  assert.deepEqual(globalModeState.current, persistedAfterSet);
+
+  await command.handler("thinking invalid", harness.context);
+  assert.match(harness.notifications.at(-1).message, /Usage: \/automode thinking/);
+  assert.deepEqual(globalModeState.current, persistedAfterSet);
+  await command.handler("thinking low extra", harness.context);
+  assert.match(harness.notifications.at(-1).message, /Usage: \/automode thinking/);
+  assert.deepEqual(globalModeState.current, persistedAfterSet);
+
+  await command.handler("thinking reset", harness.context);
+  assert.equal(globalModeState.current.classifierThinkingLevel, "high");
+  assert.equal(harness.modeEntries().at(-1).data.classifierThinkingLevel, "high");
+  assert.match(harness.notifications.at(-1).message, /thinking high/);
+});
+
+test("clamps classifier thinking using Pi's supported-level ordering", async () => {
+  const classify = async (model, configuredLevel) => {
+    const globalModeState = {
+      current: {
+        autoModeEnabled: true,
+        webVerificationEnabled: false,
+        classifierModel: { provider: model.provider, id: model.id },
+        classifierThinkingLevel: configuredLevel,
+      },
+    };
+    const harness = createHarness({
+      hasUI: false,
+      models: [model],
+      globalModeState,
+      classifierText: '{"decision":"allow","rationale":"The clamped level was accepted."}',
+    });
+    await harness.startSession();
+    const result = await harness.invoke({ toolName: "bash", input: { command: "sudo -n true" } });
+    assert.equal(result, undefined);
+    return { options: harness.classifierCalls[0].options, label: harness.decisionEntries()[0].data.model };
+  };
+
+  const standard = await classify(
+    { provider: "standard", id: "model", name: "Standard", input: ["text"], reasoning: true },
+    "max",
+  );
+  assert.equal(standard.options.reasoning, "high");
+  assert.match(standard.label, /thinking max -> high/);
+
+  const xhigh = await classify(
+    {
+      provider: "xhigh-provider",
+      id: "model",
+      name: "XHigh",
+      input: ["text"],
+      reasoning: true,
+      thinkingLevelMap: { xhigh: "xhigh" },
+    },
+    "max",
+  );
+  assert.equal(xhigh.options.reasoning, "xhigh");
+
+  const remappedHigh = await classify(
+    {
+      provider: "remapped-provider",
+      id: "model",
+      name: "Remapped High",
+      input: ["text"],
+      reasoning: true,
+      thinkingLevelMap: { high: null, xhigh: "xhigh" },
+    },
+    "high",
+  );
+  assert.equal(remappedHigh.options.reasoning, "xhigh");
+
+  const max = await classify(
+    {
+      provider: "max-provider",
+      id: "model",
+      name: "Max",
+      input: ["text"],
+      reasoning: true,
+      thinkingLevelMap: { max: "max" },
+    },
+    "max",
+  );
+  assert.equal(max.options.reasoning, "max");
+
+  const nonReasoning = await classify(
+    { provider: "plain", id: "model", name: "Plain", input: ["text"], reasoning: false },
+    "xhigh",
+  );
+  assert.equal(nonReasoning.options.reasoning, undefined);
+  assert.match(nonReasoning.label, /thinking xhigh -> off/);
+});
+
+test("persists classifier thinking across sessions", async () => {
+  const globalModeState = { current: undefined };
+  const models = [
+    { provider: "github-copilot", id: "gpt-5.6-luna", name: "GPT-5.6 Luna", input: ["text"], reasoning: true },
+    { provider: "vertex", id: "gemini/flash", name: "Gemini Flash", input: ["text"], reasoning: true },
+  ];
+  const first = createHarness({ hasUI: true, models, globalModeState });
+  await first.startSession();
+  await first.commands.get("automode").handler("thinking medium", first.context);
+  assert.equal(globalModeState.current.classifierThinkingLevel, "medium");
+
+  const next = createHarness({
+    hasUI: true,
+    models,
+    globalModeState,
+    classifierText: '{"decision":"allow","rationale":"The persisted level was used."}',
+  });
+  await next.startSession();
+  assert.equal(next.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking medium, web on)");
+  await next.invoke({ toolName: "bash", input: { command: "sudo -n true" } });
+  assert.equal(next.classifierCalls[0].options.reasoning, "medium");
+});
+
+test("opens the model picker in RPC mode when UI is available", async () => {
+  const globalModeState = { current: undefined };
+  const harness = createHarness({
+    hasUI: true,
+    mode: "rpc",
+    models: [
+      { provider: "github-copilot", id: "gpt-5.6-luna", name: "GPT-5.6 Luna", input: ["text"], reasoning: true },
+      { provider: "vertex", id: "gemini/flash", name: "Gemini Flash", input: ["text"], reasoning: false },
+    ],
+    modelChoice: "vertex/gemini/flash - vertex - Gemini Flash",
+    globalModeState,
+  });
+
+  await harness.commands.get("automode").handler("model", harness.context);
+  assert.equal(harness.refreshCalls, 1);
+  assert.deepEqual(globalModeState.current.classifierModel, { provider: "vertex", id: "gemini/flash" });
+});
+
+test("autocomplete only suggests valid next classifier-model arguments", async () => {
+  const harness = createHarness({
+    hasUI: true,
+    models: [
+      { provider: "github-copilot", id: "gpt-5.6-luna", name: "GPT-5.6 Luna", input: ["text"], reasoning: true },
+      { provider: "vertex", id: "gemini/flash", name: "Gemini Flash", input: ["text"], reasoning: false },
+    ],
+  });
+  await harness.startSession();
+  const completions = harness.commands.get("automode").getArgumentCompletions;
+
+  assert.deepEqual(completions("model re").map((item) => item.value), ["reset"]);
+  assert.equal(completions("model reset"), null);
+  assert.equal(completions("model reset "), null);
+  assert.equal(completions("model github-copilot/gpt-5.6-luna"), null);
+  assert.equal(completions("model github-copilot/gpt-5.6-luna "), null);
+  assert.equal(completions("model github-copilot/gpt-5.6-luna extra"), null);
+  assert.equal(completions("model re extra"), null);
+  assert.deepEqual(completions("thinking ").map((item) => item.value), [
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "reset",
+  ]);
+  assert.deepEqual(completions("thinking ma").map((item) => item.value), ["max"]);
+  assert.deepEqual(completions("thinking re").map((item) => item.value), ["reset"]);
+  assert.equal(completions("thinking max"), null);
+  assert.equal(completions("thinking max extra"), null);
+});
+
+test("rejects a picker in noninteractive mode without changing state", async () => {
+  const globalModeState = { current: { autoModeEnabled: true, webVerificationEnabled: true } };
+  const harness = createHarness({
+    hasUI: false,
+    mode: "json",
+    globalModeState,
+    models: [{ provider: "vertex", id: "gemini/flash", name: "Gemini Flash", input: ["text"], reasoning: false }],
+  });
+
+  await harness.commands.get("automode").handler("model", harness.context);
+  assert.equal(harness.refreshCalls, 0);
+  assert.deepEqual(globalModeState.current, { autoModeEnabled: true, webVerificationEnabled: true });
+});
+
+test("selects a direct model without changing Pi's active model and persists across sessions", async () => {
+  const activeModel = { provider: "active", id: "active-model" };
+  const models = [
+    { provider: "vertex", id: "gemini/flash", name: "Gemini Flash", input: ["text"], reasoning: false },
+    { provider: "github-copilot", id: "gpt-5.6-luna", name: "GPT-5.6 Luna", input: ["text"], reasoning: true },
+  ];
+  const globalModeState = { current: undefined };
+  const first = createHarness({
+    hasUI: false,
+    models,
+    activeModel,
+    classifierText: '{"decision":"allow","rationale":"The selected classifier approved the scoped command."}',
+    globalModeState,
+  });
+
+  await first.startSession();
+  await first.commands.get("automode").handler("model vertex/gemini/flash", first.context);
+  assert.equal(first.refreshCalls, 1);
+  assert.deepEqual(first.registryEvents.slice(-2), ["refresh", "getAvailable"]);
+  assert.deepEqual(globalModeState.current.classifierModel, { provider: "vertex", id: "gemini/flash" });
+  assert.equal(first.context.model, activeModel);
+
+  const result = await first.invoke({ toolName: "bash", input: { command: "sudo -n true" } });
+  assert.equal(result, undefined);
+  assert.equal(first.classifierCalls[0].model.provider, "vertex");
+  assert.equal(first.classifierCalls[0].model.id, "gemini/flash");
+  assert.equal(first.classifierCalls[0].options.reasoning, undefined);
+  assert.equal(Object.hasOwn(first.classifierCalls[0].options, "reasoningEffort"), false);
+  assert.equal(first.context.model, activeModel);
+
+  const next = createHarness({ hasUI: true, models, activeModel, globalModeState });
+  await next.startSession();
+  assert.equal(next.statuses.get("permission-gate"), "auto mode: ON (vertex/gemini/flash, thinking high -> off, web on)");
+  await next.invoke({ toolName: "bash", input: { command: "sudo -n true" } });
+  assert.equal(next.classifierCalls[0].model.provider, "vertex");
+  assert.equal(next.classifierCalls[0].model.id, "gemini/flash");
+});
+
+test("trims persisted model references before exact canonical matching", async () => {
+  const harness = createHarness({
+    hasUI: false,
+    classifierText: '{"decision":"allow","rationale":"The trimmed model reference resolved exactly."}',
+    globalModeState: {
+      current: {
+        autoModeEnabled: true,
+        webVerificationEnabled: true,
+        classifierModel: { provider: "  vertex  ", id: "  gemini/flash  " },
+      },
+    },
+    models: [{ provider: "vertex", id: "gemini/flash", name: "Gemini Flash", input: ["text"], reasoning: false }],
+  });
+
+  await harness.startSession();
+  const result = await harness.invoke({ toolName: "bash", input: { command: "sudo -n true" } });
+  assert.equal(result, undefined);
+  assert.equal(harness.classifierCalls[0].model.provider, "vertex");
+  assert.equal(harness.classifierCalls[0].model.id, "gemini/flash");
+});
+
+test("fails closed for a stale selected model without falling back", async () => {
+  const harness = createHarness({
+    hasUI: false,
+    globalModeState: {
+      current: {
+        autoModeEnabled: true,
+        webVerificationEnabled: true,
+        classifierModel: { provider: "vertex", id: "removed/model" },
+      },
+    },
+    models: [{ provider: "github-copilot", id: "gpt-5.6-luna", name: "GPT-5.6 Luna", input: ["text"], reasoning: true }],
+  });
+
+  await harness.startSession();
+  const result = await harness.invoke({ toolName: "bash", input: { command: "sudo -n true" } });
+  assert.equal(result.block, true);
+  assert.match(result.reason, /vertex\/removed\/model \(thinking high -> unavailable\)/);
+  assert.equal(harness.classifierCalls.length, 0);
+});
+
+test("uses provider.streamSimple with generic options and keyless ambient auth", async () => {
+  const selectedModel = {
+    provider: "amazon-bedrock",
+    id: "claude/ambient",
+    name: "Ambient Claude",
+    input: ["text"],
+    reasoning: true,
+    thinkingLevelMap: { xhigh: "xhigh" },
+  };
+  const activeModel = { provider: "active", id: "active-model" };
+  const harness = createHarness({
+    hasUI: false,
+    useComplete: false,
+    activeModel,
+    models: [selectedModel],
+    globalModeState: {
+      current: {
+        autoModeEnabled: true,
+        webVerificationEnabled: false,
+        classifierModel: { provider: "amazon-bedrock", id: "claude/ambient" },
+        classifierThinkingLevel: "xhigh",
+      },
+    },
+    providerAuth: {
+      "amazon-bedrock": {
+        auth: { headers: { "x-ambient": "true" }, baseUrl: "https://bedrock.example.test" },
+        env: { AWS_PROFILE: "test" },
+      },
+    },
+    requestAuth: {
+      "amazon-bedrock": { ok: true, headers: { "x-request": "true" }, env: { AWS_REGION: "test-region" } },
+    },
+    classifierText: '{"decision":"allow","rationale":"Ambient credentials are valid for this test."}',
+  });
+
+  await harness.startSession();
+  const result = await harness.invoke({ toolName: "bash", input: { command: "sudo -n true" } });
+  assert.equal(result, undefined);
+  assert.equal(harness.providerCalls.length, 1);
+  assert.equal(harness.providerCalls[0].model.provider, selectedModel.provider);
+  assert.equal(harness.providerCalls[0].model.id, selectedModel.id);
+  assert.equal(harness.providerCalls[0].model.baseUrl, "https://bedrock.example.test");
+  assert.equal(harness.providerCalls[0].options.apiKey, undefined);
+  assert.equal(harness.providerCalls[0].options.reasoning, "xhigh");
+  assert.equal(Object.hasOwn(harness.providerCalls[0].options, "reasoningEffort"), false);
+  assert.deepEqual(harness.providerCalls[0].options.headers, { "x-ambient": "true", "x-request": "true" });
+  assert.deepEqual(harness.providerCalls[0].options.env, { AWS_PROFILE: "test", AWS_REGION: "test-region" });
+  assert.equal(harness.context.model, activeModel);
+});
+
+test("fails closed on an unsuccessful request-auth resolution", async () => {
+  const harness = createHarness({
+    hasUI: false,
+    models: [{ provider: "vertex", id: "gemini/flash", name: "Gemini Flash", input: ["text"], reasoning: false }],
+    globalModeState: {
+      current: {
+        autoModeEnabled: true,
+        webVerificationEnabled: true,
+        classifierModel: { provider: "vertex", id: "gemini/flash" },
+      },
+    },
+    requestAuth: { vertex: { ok: false, error: "secret-token-must-not-be-shown" } },
+  });
+
+  await harness.startSession();
+  const result = await harness.invoke({ toolName: "bash", input: { command: "sudo -n true" } });
+  assert.equal(result.block, true);
+  assert.match(result.reason, /authentication.*unavailable/i);
+  assert.doesNotMatch(result.reason, /secret-token/);
+  assert.equal(harness.classifierCalls.length, 0);
+});
+
+test("uses the selected classifier for both calls around fixed web verification", async () => {
+  const models = [
+    { provider: "vertex", id: "gemini/flash", name: "Gemini Flash", input: ["text"], reasoning: true },
+    { provider: "github-copilot", id: "gpt-5.6-luna", name: "GPT-5.6 Luna", input: ["text"], reasoning: true },
+  ];
+  const harness = createHarness({
+    hasUI: true,
+    models,
+    webSearchAvailable: true,
+    globalModeState: {
+      current: {
+        autoModeEnabled: true,
+        webVerificationEnabled: true,
+        classifierModel: { provider: "vertex", id: "gemini/flash" },
+        classifierThinkingLevel: "max",
+      },
+    },
+    classifierTexts: [
+      '{"decision":"deny","needs_web_search":true,"search_query":"package safety","rationale":"The package identity needs verification."}',
+      '{"decision":"allow","rationale":"The web evidence supports this bounded operation."}',
+    ],
+  });
+
+  await harness.startSession();
+  const result = await harness.invoke({ toolName: "bash", input: { command: "npx example-package --help" } });
+  assert.equal(result, undefined);
+  assert.equal(harness.classifierCalls.length, 2);
+  assert.deepEqual(harness.classifierCalls.map((call) => `${call.model.provider}/${call.model.id}`), [
+    "vertex/gemini/flash",
+    "vertex/gemini/flash",
+  ]);
+  assert.equal(harness.classifierCalls[0].options.reasoning, "high");
+  assert.equal(harness.classifierCalls[1].options.reasoning, "high");
+  assert.match(harness.decisionEntries()[0].data.model, /thinking max -> high/);
+  assert.equal(harness.execCalls[0].args[harness.execCalls[0].args.indexOf("--model") + 1], "github-copilot/gpt-5.6-luna");
+  assert.equal(harness.execCalls[0].args[harness.execCalls[0].args.indexOf("--thinking") + 1], "high");
+});
+
+const manualModeState = {
+  autoModeEnabled: false,
+  webVerificationEnabled: false,
+  classifierModel: { provider: "github-copilot", id: "gpt-5.6-luna" },
+  classifierThinkingLevel: "high",
+};
+
+async function withCoordinator(handler, run) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "permission-gate-coordinator-"));
+  const socketPath = path.join(dir, "coordinator.sock");
+  const requests = [];
+  const server = net.createServer((connection) => {
+    let buffer = "";
+    connection.on("data", (data) => {
+      buffer += data.toString();
+      const newline = buffer.indexOf("\n");
+      if (newline === -1) return;
+      const request = JSON.parse(buffer.slice(0, newline));
+      requests.push(request);
+      const allow = handler(request);
+      if (allow === undefined) return; // simulate a parent that never answers
+      connection.write(`${JSON.stringify({ id: request.id, allow })}\n`);
+      connection.end();
+    });
+    connection.on("error", () => {});
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  try {
+    return await run(socketPath, requests);
+  } finally {
+    server.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+function withSubagentEnv(socketPath, run) {
+  const previous = {
+    subagent: process.env.PI_SUBAGENT,
+    socket: process.env.PI_SUBAGENT_COORDINATOR_SOCKET,
+    name: process.env.PI_SUBAGENT_NAME,
+  };
+  process.env.PI_SUBAGENT = "1";
+  process.env.PI_SUBAGENT_NAME = "reviewer";
+  if (socketPath) process.env.PI_SUBAGENT_COORDINATOR_SOCKET = socketPath;
+  else delete process.env.PI_SUBAGENT_COORDINATOR_SOCKET;
+  const restore = () => {
+    for (const [key, value] of [
+      ["PI_SUBAGENT", previous.subagent],
+      ["PI_SUBAGENT_COORDINATOR_SOCKET", previous.socket],
+      ["PI_SUBAGENT_NAME", previous.name],
+    ]) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+  return Promise.resolve().then(run).finally(restore);
+}
+
+test("proxies a subagent confirmation to the parent process and runs on approval", async () => {
+  await withCoordinator(
+    () => true,
+    async (socketPath, requests) => {
+      await withSubagentEnv(socketPath, async () => {
+        const harness = createHarness({ globalModeState: { current: manualModeState } });
+        await harness.startSession();
+        const result = await harness.invoke({ toolName: "bash", input: { command: "sudo systemctl restart nginx" } });
+        assert.equal(result, undefined);
+        assert.equal(requests.length, 1);
+        assert.deepEqual(requests[0].reasons, ["sudo"]);
+        assert.equal(requests[0].agent, "reviewer");
+        assert.equal(requests[0].toolName, "bash");
+        assert.equal(requests[0].input.command, "sudo systemctl restart nginx");
+        const entry = harness.decisionEntries()[0].data;
+        assert.equal(entry.status, "approved");
+        assert.equal(entry.source, "parent-approval");
+      });
+    },
+  );
+});
+
+test("blocks a subagent command when the parent denies it", async () => {
+  await withCoordinator(
+    () => false,
+    async (socketPath) => {
+      await withSubagentEnv(socketPath, async () => {
+        const harness = createHarness({ globalModeState: { current: manualModeState } });
+        await harness.startSession();
+        const result = await harness.invoke({ toolName: "bash", input: { command: "sudo systemctl restart nginx" } });
+        assert.equal(result.block, true);
+        assert.match(result.reason, /parent permission gate/);
+        assert.equal(harness.decisionEntries()[0].data.status, "blocked");
+      });
+    },
+  );
+});
+
+test("blocks a subagent command when no approval channel exists", async () => {
+  await withSubagentEnv(undefined, async () => {
+    const harness = createHarness({ globalModeState: { current: manualModeState } });
+    await harness.startSession();
+    const result = await harness.invoke({ toolName: "bash", input: { command: "sudo systemctl restart nginx" } });
+    assert.equal(result.block, true);
+    assert.match(result.reason, /no approval channel/);
+  });
+});
+
+test("keeps auto mode local in a subagent instead of prompting the parent", async () => {
+  await withCoordinator(
+    () => true,
+    async (socketPath, requests) => {
+      await withSubagentEnv(socketPath, async () => {
+        const harness = createHarness({
+          classifierText: '{"decision":"allow","rationale":"Bounded restart of a local service."}',
+          globalModeState: {
+            current: {
+              autoModeEnabled: true,
+              webVerificationEnabled: false,
+              classifierModel: { provider: "github-copilot", id: "gpt-5.6-luna" },
+              classifierThinkingLevel: "high",
+            },
+          },
+        });
+        await harness.startSession();
+        const result = await harness.invoke({ toolName: "bash", input: { command: "sudo systemctl restart nginx" } });
+        assert.equal(result, undefined);
+        assert.equal(requests.length, 0);
+        assert.equal(harness.decisionEntries()[0].data.source, "auto-model");
+      });
+    },
+  );
 });
