@@ -1,8 +1,4 @@
 import assert from "node:assert/strict";
-import * as fs from "node:fs/promises";
-import * as net from "node:net";
-import * as os from "node:os";
-import * as path from "node:path";
 import test from "node:test";
 
 import {
@@ -18,6 +14,7 @@ function createHarness({
   activeModel = { provider: "active-provider", id: "active-model" },
   choice,
   modelChoice,
+  thinkingChoice,
   classifierText = '{"decision":"deny","rationale":"The command is not sufficiently scoped."}',
   classifierTexts,
   classifierError,
@@ -31,6 +28,7 @@ function createHarness({
       reasoning: true,
     },
   ],
+  scopedModels = models.map((model) => ({ model })),
   providerDisplayNames = {},
   providerAuth,
   requestAuth,
@@ -51,6 +49,7 @@ function createHarness({
   const entries = [];
   const notifications = [];
   const statuses = new Map();
+  const selectCalls = [];
   const classifierCalls = [];
   const providerCalls = [];
   const execCalls = [];
@@ -135,6 +134,7 @@ function createHarness({
     mode,
     model: activeModel,
     hasUI,
+    scopedModels,
     signal: undefined,
     sessionManager: {
       getBranch: () => branch,
@@ -171,8 +171,10 @@ function createHarness({
     },
     ui: {
       async select(title, options) {
+        selectCalls.push({ title, options });
         if (title === "Save permission gate rules:") return ruleSaveChoice;
         if (title === "Select the auto-mode classifier model:") return modelChoice ?? options[0];
+        if (title === "Select the auto-mode classifier thinking level:") return thinkingChoice ?? options[0];
         return choice;
       },
       async editor() {
@@ -215,6 +217,7 @@ function createHarness({
     renderers,
     notifications,
     statuses,
+    selectCalls,
     classifierCalls,
     providerCalls,
     execCalls,
@@ -660,13 +663,12 @@ test("discovers text models for picker and autocomplete, supports slash-containi
   assert.equal(harness.refreshCalls, 0);
 
   await command.handler("model", harness.context);
-  assert.equal(harness.refreshCalls, 1);
-  assert.deepEqual(harness.registryEvents.slice(-2), ["refresh", "getAvailable"]);
+  assert.equal(harness.refreshCalls, 0);
   assert.deepEqual(globalModeState.current.classifierModel, { provider: "vertex", id: "gemini/flash-2" });
   assert.match(harness.notifications.at(-1).message, /vertex\/gemini\/flash-2 \(thinking high -> off\)/);
 
   await command.handler("model vertex/gemini/flash-2", harness.context);
-  assert.equal(harness.refreshCalls, 2);
+  assert.equal(harness.refreshCalls, 1);
   assert.deepEqual(globalModeState.current.classifierModel, { provider: "vertex", id: "gemini/flash-2" });
 
   await command.handler("model reset", harness.context);
@@ -678,6 +680,104 @@ test("discovers text models for picker and autocomplete, supports slash-containi
   });
 });
 
+test("model picker and completions only expose scoped text models", async () => {
+  const models = [
+    { provider: "scoped", id: "model", name: "Scoped Model", input: ["text"], reasoning: true },
+    { provider: "registry-only", id: "model", name: "Registry Only", input: ["text"], reasoning: true },
+  ];
+  const harness = createHarness({
+    hasUI: true,
+    models,
+    scopedModels: [{ model: models[0] }],
+    globalModeState: { current: undefined },
+  });
+
+  await harness.startSession();
+  const modelCommand = harness.commands.get("automode-model");
+  assert.deepEqual(modelCommand.getArgumentCompletions("").map((item) => item.value), ["reset", "scoped/model"]);
+  assert.equal(modelCommand.getArgumentCompletions("").some((item) => item.value.includes("registry-only")), false);
+
+  await modelCommand.handler("", harness.context);
+  assert.deepEqual(harness.selectCalls[0].options, ["scoped/model - scoped - Scoped Model"]);
+  assert.equal(harness.refreshCalls, 0);
+  assert.doesNotMatch(harness.notifications.at(-1).message, /registry-only/);
+});
+
+test("warns instead of opening the picker when the session has no scoped models", async () => {
+  const harness = createHarness({ hasUI: true, scopedModels: [] });
+
+  await harness.startSession();
+  await harness.commands.get("automode-model").handler("", harness.context);
+
+  assert.equal(harness.selectCalls.length, 0);
+  assert.match(harness.notifications.at(-1).message, /no scoped models/i);
+  assert.match(harness.notifications.at(-1).message, /--models/);
+});
+
+test("registers discoverable classifier selector commands and keeps aliases", async () => {
+  const globalModeState = { current: undefined };
+  const models = [
+    { provider: "github-copilot", id: "gpt-5.6-luna", name: "GPT-5.6 Luna", input: ["text"], reasoning: true },
+    { provider: "vertex", id: "gemini/flash", name: "Gemini Flash", input: ["text"], reasoning: true },
+  ];
+  const harness = createHarness({
+    hasUI: true,
+    models,
+    modelChoice: "vertex/gemini/flash - vertex - Gemini Flash",
+    thinkingChoice: "medium - supported",
+    globalModeState,
+  });
+
+  await harness.startSession();
+  const modelCommand = harness.commands.get("automode-model");
+  const thinkingCommand = harness.commands.get("automode-thinking");
+  assert.equal(modelCommand.description, "Choose the auto-mode classifier model");
+  assert.equal(thinkingCommand.description, "Configure the auto-mode classifier thinking level");
+  assert.deepEqual(modelCommand.getArgumentCompletions("re").map((item) => item.value), ["reset"]);
+  assert.deepEqual(thinkingCommand.getArgumentCompletions("ma").map((item) => item.value), ["max"]);
+
+  await modelCommand.handler("", harness.context);
+  assert.equal(harness.selectCalls[0].title, "Select the auto-mode classifier model:");
+  assert.deepEqual(globalModeState.current.classifierModel, { provider: "vertex", id: "gemini/flash" });
+
+  await thinkingCommand.handler("", harness.context);
+  assert.equal(harness.selectCalls[1].title, "Select the auto-mode classifier thinking level:");
+  assert.equal(globalModeState.current.classifierThinkingLevel, "medium");
+
+  const alias = createHarness({
+    hasUI: true,
+    models,
+    modelChoice: "vertex/gemini/flash - vertex - Gemini Flash",
+    thinkingChoice: "low - supported",
+    globalModeState: { current: undefined },
+  });
+  await alias.startSession();
+  await alias.commands.get("automode").handler("model", alias.context);
+  await alias.commands.get("automode").handler("thinking low", alias.context);
+  assert.deepEqual(alias.selectCalls.map((call) => call.title), ["Select the auto-mode classifier model:"]);
+  assert.equal(alias.modeEntries().at(-1).data.classifierThinkingLevel, "low");
+});
+
+test("dedicated classifier selector commands support direct noninteractive forms", async () => {
+  const globalModeState = { current: undefined };
+  const models = [
+    { provider: "vertex", id: "gemini/flash", name: "Gemini Flash", input: ["text"], reasoning: true },
+  ];
+  const harness = createHarness({ hasUI: false, mode: "json", models, globalModeState });
+  await harness.startSession();
+
+  await harness.commands.get("automode-model").handler("vertex/gemini/flash", harness.context);
+  await harness.commands.get("automode-thinking").handler("medium", harness.context);
+  assert.deepEqual(globalModeState.current.classifierModel, { provider: "vertex", id: "gemini/flash" });
+  assert.equal(globalModeState.current.classifierThinkingLevel, "medium");
+  assert.equal(harness.selectCalls.length, 0);
+
+  const savedState = { ...globalModeState.current };
+  await harness.commands.get("automode-model").handler("", harness.context);
+  await harness.commands.get("automode-thinking").handler("", harness.context);
+  assert.equal(harness.selectCalls.length, 0);
+  assert.deepEqual(globalModeState.current, savedState);
+});
 test("configures, reports, validates, persists, and resets classifier thinking", async () => {
   const globalModeState = { current: undefined };
   const harness = createHarness({
@@ -820,15 +920,22 @@ test("opens the model picker in RPC mode when UI is available", async () => {
     mode: "rpc",
     models: [
       { provider: "github-copilot", id: "gpt-5.6-luna", name: "GPT-5.6 Luna", input: ["text"], reasoning: true },
-      { provider: "vertex", id: "gemini/flash", name: "Gemini Flash", input: ["text"], reasoning: false },
+      { provider: "vertex", id: "gemini/flash", name: "Gemini Flash", input: ["text"], reasoning: true },
     ],
     modelChoice: "vertex/gemini/flash - vertex - Gemini Flash",
+    thinkingChoice: "high - supported",
     globalModeState,
   });
 
-  await harness.commands.get("automode").handler("model", harness.context);
-  assert.equal(harness.refreshCalls, 1);
+  await harness.commands.get("automode-model").handler("", harness.context);
+  assert.equal(harness.refreshCalls, 0);
   assert.deepEqual(globalModeState.current.classifierModel, { provider: "vertex", id: "gemini/flash" });
+  await harness.commands.get("automode-thinking").handler("", harness.context);
+  assert.equal(globalModeState.current.classifierThinkingLevel, "high");
+  assert.deepEqual(harness.selectCalls.map((call) => call.title), [
+    "Select the auto-mode classifier model:",
+    "Select the auto-mode classifier thinking level:",
+  ]);
 });
 
 test("autocomplete only suggests valid next classifier-model arguments", async () => {
@@ -1066,136 +1173,4 @@ test("uses the selected classifier for both calls around fixed web verification"
   assert.match(harness.decisionEntries()[0].data.model, /thinking max -> high/);
   assert.equal(harness.execCalls[0].args[harness.execCalls[0].args.indexOf("--model") + 1], "github-copilot/gpt-5.6-luna");
   assert.equal(harness.execCalls[0].args[harness.execCalls[0].args.indexOf("--thinking") + 1], "high");
-});
-
-const manualModeState = {
-  autoModeEnabled: false,
-  webVerificationEnabled: false,
-  classifierModel: { provider: "github-copilot", id: "gpt-5.6-luna" },
-  classifierThinkingLevel: "high",
-};
-
-async function withCoordinator(handler, run) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "permission-gate-coordinator-"));
-  const socketPath = path.join(dir, "coordinator.sock");
-  const requests = [];
-  const server = net.createServer((connection) => {
-    let buffer = "";
-    connection.on("data", (data) => {
-      buffer += data.toString();
-      const newline = buffer.indexOf("\n");
-      if (newline === -1) return;
-      const request = JSON.parse(buffer.slice(0, newline));
-      requests.push(request);
-      const allow = handler(request);
-      if (allow === undefined) return; // simulate a parent that never answers
-      connection.write(`${JSON.stringify({ id: request.id, allow })}\n`);
-      connection.end();
-    });
-    connection.on("error", () => {});
-  });
-  await new Promise((resolve) => server.listen(socketPath, resolve));
-  try {
-    return await run(socketPath, requests);
-  } finally {
-    server.close();
-    await fs.rm(dir, { recursive: true, force: true });
-  }
-}
-
-function withSubagentEnv(socketPath, run) {
-  const previous = {
-    subagent: process.env.PI_SUBAGENT,
-    socket: process.env.PI_SUBAGENT_COORDINATOR_SOCKET,
-    name: process.env.PI_SUBAGENT_NAME,
-  };
-  process.env.PI_SUBAGENT = "1";
-  process.env.PI_SUBAGENT_NAME = "reviewer";
-  if (socketPath) process.env.PI_SUBAGENT_COORDINATOR_SOCKET = socketPath;
-  else delete process.env.PI_SUBAGENT_COORDINATOR_SOCKET;
-  const restore = () => {
-    for (const [key, value] of [
-      ["PI_SUBAGENT", previous.subagent],
-      ["PI_SUBAGENT_COORDINATOR_SOCKET", previous.socket],
-      ["PI_SUBAGENT_NAME", previous.name],
-    ]) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  };
-  return Promise.resolve().then(run).finally(restore);
-}
-
-test("proxies a subagent confirmation to the parent process and runs on approval", async () => {
-  await withCoordinator(
-    () => true,
-    async (socketPath, requests) => {
-      await withSubagentEnv(socketPath, async () => {
-        const harness = createHarness({ globalModeState: { current: manualModeState } });
-        await harness.startSession();
-        const result = await harness.invoke({ toolName: "bash", input: { command: "sudo systemctl restart nginx" } });
-        assert.equal(result, undefined);
-        assert.equal(requests.length, 1);
-        assert.deepEqual(requests[0].reasons, ["sudo"]);
-        assert.equal(requests[0].agent, "reviewer");
-        assert.equal(requests[0].toolName, "bash");
-        assert.equal(requests[0].input.command, "sudo systemctl restart nginx");
-        const entry = harness.decisionEntries()[0].data;
-        assert.equal(entry.status, "approved");
-        assert.equal(entry.source, "parent-approval");
-      });
-    },
-  );
-});
-
-test("blocks a subagent command when the parent denies it", async () => {
-  await withCoordinator(
-    () => false,
-    async (socketPath) => {
-      await withSubagentEnv(socketPath, async () => {
-        const harness = createHarness({ globalModeState: { current: manualModeState } });
-        await harness.startSession();
-        const result = await harness.invoke({ toolName: "bash", input: { command: "sudo systemctl restart nginx" } });
-        assert.equal(result.block, true);
-        assert.match(result.reason, /parent permission gate/);
-        assert.equal(harness.decisionEntries()[0].data.status, "blocked");
-      });
-    },
-  );
-});
-
-test("blocks a subagent command when no approval channel exists", async () => {
-  await withSubagentEnv(undefined, async () => {
-    const harness = createHarness({ globalModeState: { current: manualModeState } });
-    await harness.startSession();
-    const result = await harness.invoke({ toolName: "bash", input: { command: "sudo systemctl restart nginx" } });
-    assert.equal(result.block, true);
-    assert.match(result.reason, /no approval channel/);
-  });
-});
-
-test("keeps auto mode local in a subagent instead of prompting the parent", async () => {
-  await withCoordinator(
-    () => true,
-    async (socketPath, requests) => {
-      await withSubagentEnv(socketPath, async () => {
-        const harness = createHarness({
-          classifierText: '{"decision":"allow","rationale":"Bounded restart of a local service."}',
-          globalModeState: {
-            current: {
-              autoModeEnabled: true,
-              webVerificationEnabled: false,
-              classifierModel: { provider: "github-copilot", id: "gpt-5.6-luna" },
-              classifierThinkingLevel: "high",
-            },
-          },
-        });
-        await harness.startSession();
-        const result = await harness.invoke({ toolName: "bash", input: { command: "sudo systemctl restart nginx" } });
-        assert.equal(result, undefined);
-        assert.equal(requests.length, 0);
-        assert.equal(harness.decisionEntries()[0].data.source, "auto-model");
-      });
-    },
-  );
 });

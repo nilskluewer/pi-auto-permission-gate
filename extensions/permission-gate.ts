@@ -6,18 +6,9 @@
  *
  * Auto mode can delegate soft-deny decisions to a dedicated Pi model:
  * `github-copilot/gpt-5.6-luna` with high reasoning effort.
- *
- * The same extension also loads inside subagent child processes (global
- * extension discovery applies to children too). There it is the single source
- * of dangerous-command policy: hard-deny rules and user rules apply as usual,
- * auto mode classifies without a UI, and a remaining manual confirmation is
- * proxied to the parent process over the subagent coordinator socket
- * (`PI_SUBAGENT_COORDINATOR_SOCKET`). Without that socket the call is blocked,
- * so the gate always fails closed.
  */
 
 import { randomUUID } from "node:crypto";
-import { connect } from "node:net";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
@@ -117,7 +108,7 @@ export type ParsedAutoDecision = {
 	searchQuery?: string;
 };
 
-type DecisionSource = "hard-deny" | "auto-model" | "user-rule" | "parent-approval";
+type DecisionSource = "hard-deny" | "auto-model" | "user-rule";
 type DecisionStatus = "approved" | "blocked";
 type ClassifierContext = Pick<ExtensionContext, "cwd" | "signal" | "modelRegistry" | "sessionManager">;
 
@@ -145,6 +136,8 @@ const DEFAULT_CLASSIFIER_MODEL: ClassifierModelReference = {
 	provider: AUTO_MODE_MODEL_PROVIDER,
 	id: AUTO_MODE_MODEL_ID,
 };
+const NO_SCOPED_CLASSIFIER_MODELS_WARNING =
+	"This session has no scoped models. Configure a session model scope with Pi's --models option or the enabledModels setting before using the model picker.";
 const STATUS_ID = "permission-gate";
 const MODE_ENTRY_TYPE = "permission-gate-mode";
 const DECISION_ENTRY_TYPE = "permission-gate-decision";
@@ -535,6 +528,18 @@ function getAvailableClassifierModels(ctx: { modelRegistry: { getAvailable: () =
 	}
 }
 
+function describeClassifierModels(
+	models: readonly unknown[],
+	getProviderDisplayName: (provider: string) => string,
+): AvailableClassifierModel[] {
+	return filterTextModels(models).map((model) => ({
+		model,
+		canonicalId: canonicalClassifierModelId(model),
+		providerDisplayName: getProviderDisplayName(model.provider),
+		modelName: model.name || model.id,
+	}));
+}
+
 function cacheAvailableClassifierModels(
 	ctx: {
 		modelRegistry: {
@@ -543,12 +548,22 @@ function cacheAvailableClassifierModels(
 		};
 	},
 ): AvailableClassifierModel[] {
-	return filterTextModels(ctx.modelRegistry.getAvailable()).map((model) => ({
-		model,
-		canonicalId: canonicalClassifierModelId(model),
-		providerDisplayName: ctx.modelRegistry.getProviderDisplayName(model.provider),
-		modelName: model.name || model.id,
-	}));
+	return describeClassifierModels(
+		ctx.modelRegistry.getAvailable(),
+		(provider) => ctx.modelRegistry.getProviderDisplayName(provider),
+	);
+}
+
+function cacheScopedClassifierModels(
+	ctx: {
+		scopedModels: readonly { model: unknown }[];
+		modelRegistry: { getProviderDisplayName: (provider: string) => string };
+	},
+): AvailableClassifierModel[] {
+	return describeClassifierModels(
+		ctx.scopedModels.map((scoped) => scoped.model),
+		(provider) => ctx.modelRegistry.getProviderDisplayName(provider),
+	);
 }
 
 function formatClassifierModelLabel(
@@ -1336,65 +1351,6 @@ async function classifyWithModel(
 	}
 }
 
-const SUBAGENT_APPROVAL_TIMEOUT_MS = 5 * 60 * 1000;
-
-/**
- * Ask the parent process for a manual approval when this gate runs inside a
- * subagent child. Uses the coordinator socket protocol of the subagent
- * extension: a single JSON line request, a single JSON line reply.
- *
- * Fails closed: a missing socket, a timeout, or any socket error denies.
- */
-function requestParentApproval(
-	socketPath: string,
-	command: string,
-	reasons: string[],
-	signal?: AbortSignal,
-): Promise<boolean> {
-	return new Promise((resolve) => {
-		const socket = connect(socketPath);
-		let buffer = "";
-		let settled = false;
-		const finish = (allow: boolean) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			signal?.removeEventListener("abort", onAbort);
-			socket.destroy();
-			resolve(allow);
-		};
-		const onAbort = () => finish(false);
-		const timer = setTimeout(() => finish(false), SUBAGENT_APPROVAL_TIMEOUT_MS);
-
-		signal?.addEventListener("abort", onAbort, { once: true });
-		socket.on("connect", () => {
-			socket.write(
-				`${JSON.stringify({
-					type: "approval",
-					id: randomUUID(),
-					agent: process.env.PI_SUBAGENT_NAME ?? "subagent",
-					toolName: "bash",
-					input: { command },
-					reasons,
-				})}\n`,
-			);
-		});
-		socket.on("data", (data) => {
-			buffer += data.toString();
-			const newline = buffer.indexOf("\n");
-			if (newline === -1) return;
-			try {
-				const reply = JSON.parse(buffer.slice(0, newline)) as { allow?: boolean };
-				finish(reply.allow === true);
-			} catch {
-				finish(false);
-			}
-		});
-		socket.on("error", () => finish(false));
-		socket.on("close", () => finish(false));
-	});
-}
-
 function recordDecision(pi: ExtensionAPI, entry: DecisionEntry): void {
 	try {
 		pi.appendEntry(DECISION_ENTRY_TYPE, entry);
@@ -1677,6 +1633,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 	let classifierModel = cloneClassifierModelReference(DEFAULT_CLASSIFIER_MODEL);
 	let classifierThinkingLevel = DEFAULT_CLASSIFIER_THINKING_LEVEL;
 	let availableClassifierModels: AvailableClassifierModel[] = [];
+	let scopedClassifierModels: AvailableClassifierModel[] = [];
 	let ruleConfig = cloneDefaultCommandRuleConfig();
 	let ruleScope: "global" | "project" | "session" = "global";
 	const persistMode = async (ctx: {
@@ -1701,14 +1658,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 
 		const approved = data.status === "approved";
 		const title = approved ? "Permission Gate: APPROVED" : "Permission Gate: BLOCKED";
-		const source =
-			data.source === "auto-model"
-				? "auto model"
-				: data.source === "user-rule"
-					? "user rule"
-					: data.source === "parent-approval"
-						? "parent approval"
-						: "hard deny";
+		const source = data.source === "auto-model" ? "auto model" : data.source === "user-rule" ? "user rule" : "hard deny";
 		const color = approved ? "success" : "error";
 		const lines = [
 			`${theme.fg(color, theme.bold(title))} ${theme.fg("dim", `via ${source}`)}`,
@@ -1728,6 +1678,16 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			availableClassifierModels = cacheAvailableClassifierModels(ctx);
 		} catch {
 			availableClassifierModels = [];
+		}
+	};
+	const syncScopedClassifierModels = (ctx: {
+		scopedModels: readonly { model: unknown }[];
+		modelRegistry: { getProviderDisplayName: (provider: string) => string };
+	}): void => {
+		try {
+			scopedClassifierModels = cacheScopedClassifierModels(ctx);
+		} catch {
+			scopedClassifierModels = [];
 		}
 	};
 	const refreshAvailableClassifierModels = async (ctx: {
@@ -1753,15 +1713,10 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				return;
 			}
 
-			let models: AvailableClassifierModel[];
-			try {
-				models = await refreshAvailableClassifierModels(ctx);
-			} catch {
-				notify(ctx, "Permission gate could not discover classifier models after refreshing Pi's model registry.", "error");
-				return;
-			}
+			syncScopedClassifierModels(ctx);
+			const models = scopedClassifierModels;
 			if (models.length === 0) {
-				notify(ctx, "Permission gate found no available authenticated text-capable classifier models.", "warning");
+				notify(ctx, NO_SCOPED_CLASSIFIER_MODELS_WARNING, "warning");
 				return;
 			}
 
@@ -1856,11 +1811,11 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			if (!choice) return;
 			const requestedThinkingLevel = choice.split(" - ", 1)[0]?.trim().toLowerCase();
 			const nextThinkingLevel =
-			requestedThinkingLevel === "reset"
-				? DEFAULT_CLASSIFIER_THINKING_LEVEL
-				: requestedThinkingLevel && isClassifierThinkingLevel(requestedThinkingLevel)
-					? requestedThinkingLevel
-					: undefined;
+				requestedThinkingLevel === "reset"
+					? DEFAULT_CLASSIFIER_THINKING_LEVEL
+					: requestedThinkingLevel && isClassifierThinkingLevel(requestedThinkingLevel)
+						? requestedThinkingLevel
+						: undefined;
 			if (!nextThinkingLevel) {
 				notify(ctx, "Permission gate: the selected thinking level is no longer available.", "warning");
 				return;
@@ -1900,7 +1855,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		description: "Toggle automatic safety decisions for dangerous bash commands",
 		argumentHint: "[on|off|status|model [provider/model-id|reset]|thinking [off|minimal|low|medium|high|xhigh|max|reset]|web [on|off]]",
 		getArgumentCompletions: (argumentPrefix) =>
-			getClassifierModelCompletions(argumentPrefix, availableClassifierModels),
+			getClassifierModelCompletions(argumentPrefix, scopedClassifierModels),
 		handler: async (args, ctx) => {
 			const rawValue = String(args ?? "").trim();
 			const parts = rawValue.split(/\s+/).filter(Boolean);
@@ -1978,7 +1933,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		description: "Choose the auto-mode classifier model",
 		argumentHint: "[provider/model-id|reset]",
 		getArgumentCompletions: (argumentPrefix) =>
-			getClassifierModelArgumentCompletions(argumentPrefix, availableClassifierModels),
+			getClassifierModelArgumentCompletions(argumentPrefix, scopedClassifierModels),
 		handler: async (args, ctx) => handleClassifierModelCommand(String(args ?? ""), ctx, AUTO_MODE_MODEL_COMMAND),
 	});
 
@@ -2097,6 +2052,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		ruleConfig = loadedRules.config;
 		ruleScope = loadedRules.scope;
 		syncAvailableClassifierModels(ctx);
+		syncScopedClassifierModels(ctx);
 		setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
 	});
 
@@ -2104,6 +2060,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		// Mode is a global preference, so navigating a conversation branch must not
 		// silently turn auto mode off or restore an obsolete branch-local value.
 		syncAvailableClassifierModels(ctx);
+		syncScopedClassifierModels(ctx);
 		setAutoModeStatus(ctx, autoModeEnabled, webVerificationEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
 	});
 
@@ -2180,28 +2137,6 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		}
 
 		const reason = `Potentially dangerous command blocked/needs confirmation: ${reasons.join(", ")}`;
-
-		// Inside a subagent child there is no local UI, so a manual confirmation is
-		// proxied to the parent process, which prompts the user on our behalf.
-		if (process.env.PI_SUBAGENT) {
-			const socketPath = process.env.PI_SUBAGENT_COORDINATOR_SOCKET;
-			if (!socketPath) {
-				return { block: true, reason: `${reason} (no approval channel to the parent process)` };
-			}
-			const allowed = await requestParentApproval(socketPath, command, reasons, ctx.signal);
-			recordDecision(pi, {
-				command: preview(command),
-				reasons,
-				status: allowed ? "approved" : "blocked",
-				source: "parent-approval",
-				rationale: allowed
-					? "The user approved the command in the parent process."
-					: "The parent process denied the command or the approval channel failed.",
-				timestamp: Date.now(),
-			});
-			if (allowed) return undefined;
-			return { block: true, reason: "Blocked by user via the parent permission gate" };
-		}
 
 		if (!ctx.hasUI) {
 			return { block: true, reason: `${reason} (no UI for confirmation)` };

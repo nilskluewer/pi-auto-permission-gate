@@ -18,7 +18,7 @@ It does not intercept Pi's direct `!` or `!!` shell commands, and it does not in
 | 3 | User `disallowedCommands` pattern | Block immediately |
 | 4 | User `allowedCommands` pattern | Run, unless a hard-deny rule matched |
 | 5 | Built-in soft rule with auto mode on | Ask the classifier |
-| 6 | Built-in soft rule with auto mode off | Ask the user in a UI, ask the parent process inside a subagent, or block when neither exists |
+| 6 | Built-in soft rule with auto mode off | Ask the user in a UI, or block when no UI exists |
 
 ### Command coverage
 
@@ -83,23 +83,6 @@ In non-interactive, JSON, and print modes, matching commands are blocked because
 Safe commands and non-bash tool calls pass through unchanged.
 Approvals are not persisted, so every matching tool call is reviewed independently.
 
-## Subagents
-
-The extension also loads inside subagent child processes spawned by
-[`@nilskluewer/pi-subagent`](https://github.com/nilskluewer/pi-subagent), so it is the single
-source of dangerous-command policy for the whole agent tree.
-
-| Situation in a subagent child | Result |
-| --- | --- |
-| Hard-deny rule, user rule, or auto-mode decision | Same as in the main agent, decided locally without a prompt |
-| Manual confirmation needed, coordinator socket available | The parent process prompts the user, labeled with the subagent's name |
-| Manual confirmation needed, no coordinator socket | Blocked |
-| Approval timeout, socket error, or abort | Blocked |
-
-The child detects this mode through `PI_SUBAGENT` and sends one JSON line to
-`PI_SUBAGENT_COORDINATOR_SOCKET`, which the parent answers after prompting.
-Install the extension globally so children inherit it through Pi's extension discovery.
-
 ## User-editable command rules
 
 Use `/permission-rules` or `/permission-rules edit` to edit the command rule list in Pi.
@@ -138,36 +121,44 @@ Use `/automode on`, `/automode off`, or `/automode status` for explicit control.
 Web verification is enabled by default and can be controlled with `/automode web on` or `/automode web off`.
 The bare `/automode` command still toggles the current global setting.
 
-Choose the classifier with these commands:
+Choose the classifier with these discoverable commands:
 
 ```text
-/automode model
-/automode model provider/model-id
-/automode model reset
+/automode-model
+/automode-model provider/model-id
+/automode-model reset
 ```
 
-`/automode model` opens an interactive picker.
-`/automode model provider/model-id` selects the exact provider and model ID and also works in noninteractive modes.
+`/automode-model` opens a model selector in TUI and RPC modes.
+`/automode-model provider/model-id` selects the exact provider and model ID and also works in noninteractive modes.
 The provider is the text before the first slash, so model IDs containing additional slashes are supported.
-`/automode model reset` restores `github-copilot/gpt-5.6-luna`.
-The command autocomplete lists the cached available text-capable models without exposing authentication details.
+`/automode-model reset` restores `github-copilot/gpt-5.6-luna`.
+The older `/automode model` forms remain supported as aliases.
+The picker and model argument completions use only scoped text-capable models from the current Pi session.
+Configure a session model scope with Pi's `--models` option or the `enabledModels` setting before using the picker.
+Explicit `provider/model-id` arguments still resolve exact current models from Pi's model registry.
+The command autocomplete does not expose authentication details.
 
 Configure classifier thinking independently from Pi's active conversation thinking level:
 
 ```text
-/automode thinking
-/automode thinking <off|minimal|low|medium|high|xhigh|max>
-/automode thinking reset
+/automode-thinking
+/automode-thinking <off|minimal|low|medium|high|xhigh|max>
+/automode-thinking reset
 ```
 
-`/automode thinking` reports the configured and effective level without changing it.
+`/automode-thinking` opens a thinking-level selector in TUI and RPC modes.
+The selector marks levels supported by the selected classifier and shows the effective clamped level when a level is unsupported.
+The older `/automode thinking` forms remain supported as aliases.
+`/automode-thinking` with no UI does not prompt; use an explicit level in noninteractive modes.
+The legacy `/automode thinking` form without an argument reports the configured and effective level instead of opening a selector.
 The default and reset level is `high`.
 Invalid levels and extra arguments are rejected without mutating the global setting.
-A picker is rejected in JSON, print, and no-UI modes and does not change the configured model.
+A picker is rejected in JSON, print, and no-UI modes and does not change the configured model or thinking level.
 
-Models are discovered from Pi's model registry after a refresh whenever the picker or an explicit provider/model selection runs.
+Explicit provider/model selections are resolved from Pi's model registry after a refresh.
 The extension does not maintain a provider allowlist.
-Only models whose registry metadata accepts text input are shown or selectable, and provider/model IDs are sorted deterministically.
+Only models whose registry metadata accepts text input are shown in the picker or autocomplete, and provider/model IDs are sorted deterministically.
 Provider display names and model names are used only as picker and autocomplete descriptions.
 
 The classifier model and configured/effective thinking level are shown by `/automode status`, the footer status, notifications, and expanded decision entries.
