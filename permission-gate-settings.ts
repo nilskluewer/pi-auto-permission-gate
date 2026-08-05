@@ -17,11 +17,7 @@ export type PermissionSettingsAction =
 	| { type: "preferences"; value: "edit" | "add" | "list" | "clear" }
 	| { type: "prompt" };
 
-export interface PermissionSettingsOption {
-	value: string;
-	label: string;
-	description?: string;
-}
+export type PermissionSettingsOption = SelectItem;
 
 export interface PermissionSettingsView {
 	autoModeEnabled: boolean;
@@ -33,13 +29,11 @@ export interface PermissionSettingsView {
 	allowedCommands: readonly string[];
 	disallowedCommands: readonly string[];
 	preferences: string;
-	canSaveProjectRules: boolean;
 }
 
 type Tui = { requestRender: () => void };
 
 const MAX_VISIBLE_SETTINGS = 12;
-const CANCEL_VALUE = "__cancel__";
 
 export async function openPermissionSettings(
 	ctx: Pick<ExtensionContext, "mode" | "hasUI" | "ui">,
@@ -77,7 +71,7 @@ function createSettingsComponent(
 			description: "Choose the authenticated text model used for automatic safety decisions.",
 			currentValue: state.classifierModel,
 			submenu: (_currentValue, submenuDone) =>
-				createPickerComponent(
+				createSelectComponent(
 					tui,
 					theme,
 					"Select the auto-mode classifier model",
@@ -92,7 +86,7 @@ function createSettingsComponent(
 			description: "Configure reasoning effort independently from Pi's active conversation model.",
 			currentValue: state.classifierThinking,
 			submenu: (_currentValue, submenuDone) =>
-				createPickerComponent(
+				createSelectComponent(
 					tui,
 					theme,
 					"Select the auto-mode classifier thinking level",
@@ -184,28 +178,26 @@ function createSettingsComponent(
 	};
 }
 
-function createPickerComponent(
+function createSelectComponent(
 	tui: Tui,
 	theme: Theme,
 	title: string,
-	options: readonly PermissionSettingsOption[],
+	items: readonly SelectItem[],
 	onSelect: (value: string) => void,
 	onCancel: () => void,
 ): Component {
-	const items: SelectItem[] = options.length > 0 ? options.map((option) => ({ ...option })) : [{ value: CANCEL_VALUE, label: "No options available" }];
+	const selectItems = items.map((item) => ({ ...item }));
 	const container = new Container();
 	container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
 
-	const selectList = new SelectList(items, Math.min(Math.max(items.length, 1), MAX_VISIBLE_SETTINGS), {
+	const selectList = new SelectList(selectItems, Math.min(Math.max(selectItems.length, 1), MAX_VISIBLE_SETTINGS), {
 		selectedPrefix: (text) => theme.fg("accent", text),
 		selectedText: (text) => theme.fg("accent", text),
 		description: (text) => theme.fg("muted", text),
 		scrollInfo: (text) => theme.fg("dim", text),
 		noMatch: (text) => theme.fg("warning", text),
 	});
-	selectList.onSelect = (item) => {
-		if (item.value !== CANCEL_VALUE) onSelect(item.value);
-	};
+	selectList.onSelect = (item) => onSelect(item.value);
 	selectList.onCancel = onCancel;
 	container.addChild(selectList);
 	container.addChild(new Text(theme.fg("dim", "↑/↓ navigate · enter select · esc back"), 1, 0));
@@ -234,14 +226,14 @@ function createRulesComponent(
 	const items: SelectItem[] = [];
 	for (const pattern of state.allowedCommands) {
 		items.push({
-			value: "pattern:allowed",
+			value: "edit",
 			label: `Allowed  ${pattern}`,
 			description: "User-defined allow pattern. Select to edit all command rules.",
 		});
 	}
 	for (const pattern of state.disallowedCommands) {
 		items.push({
-			value: "pattern:disallowed",
+			value: "edit",
 			label: `Denied   ${pattern}`,
 			description: "User-defined deny pattern. Select to edit all command rules.",
 		});
@@ -271,15 +263,13 @@ function createRulesComponent(
 		},
 	);
 
-	return createActionListComponent(
+	return createSelectComponent(
 		tui,
 		theme,
 		`Command rules (${state.ruleScope})`,
 		items,
 		(value) => {
-			if (value === "edit" || value === "list" || value === "reset" || value.startsWith("pattern:")) {
-				onSelect(value.startsWith("pattern:") ? "edit" : value);
-			}
+			if (value === "edit" || value === "list" || value === "reset") onSelect(value);
 		},
 		onCancel,
 	);
@@ -299,7 +289,7 @@ function createPreferencesComponent(
 		.filter(Boolean);
 	for (const note of notes) {
 		items.push({
-			value: "note",
+			value: "edit",
 			label: note,
 			description: "User-authored classifier policy note. Select to edit all preference notes.",
 		});
@@ -334,54 +324,16 @@ function createPreferencesComponent(
 		},
 	);
 
-	return createActionListComponent(
+	return createSelectComponent(
 		tui,
 		theme,
 		`Classifier preferences (${formatPreferenceCount(state.preferences)})`,
 		items,
 		(value) => {
-			if (value === "edit" || value === "add" || value === "list" || value === "clear" || value === "note") {
-				onSelect(value === "note" ? "edit" : value);
-			}
+			if (value === "edit" || value === "add" || value === "list" || value === "clear") onSelect(value);
 		},
 		onCancel,
 	);
-}
-
-function createActionListComponent(
-	tui: Tui,
-	theme: Theme,
-	title: string,
-	items: readonly SelectItem[],
-	onSelect: (value: string) => void,
-	onCancel: () => void,
-): Component {
-	const container = new Container();
-	container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
-	const selectList = new SelectList([...items], Math.min(Math.max(items.length, 1), MAX_VISIBLE_SETTINGS), {
-		selectedPrefix: (text) => theme.fg("accent", text),
-		selectedText: (text) => theme.fg("accent", text),
-		description: (text) => theme.fg("muted", text),
-		scrollInfo: (text) => theme.fg("dim", text),
-		noMatch: (text) => theme.fg("warning", text),
-	});
-	selectList.onSelect = (item) => onSelect(item.value);
-	selectList.onCancel = onCancel;
-	container.addChild(selectList);
-	container.addChild(new Text(theme.fg("dim", "↑/↓ navigate · enter select · esc back"), 1, 0));
-
-	return {
-		render(width: number): string[] {
-			return container.render(width);
-		},
-		handleInput(data: string): void {
-			selectList.handleInput(data);
-			tui.requestRender();
-		},
-		invalidate(): void {
-			container.invalidate();
-		},
-	};
 }
 
 async function openPermissionSettingsWithDialogs(

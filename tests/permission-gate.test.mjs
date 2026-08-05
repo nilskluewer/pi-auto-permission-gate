@@ -17,7 +17,6 @@ function createHarness({
   modelChoice,
   thinkingChoice,
   classifierText = '{"decision":"deny","rationale":"The command is not sufficiently scoped."}',
-  classifierTexts,
   classifierError,
   useComplete = true,
   models = [
@@ -55,13 +54,12 @@ function createHarness({
   const editorCalls = [];
   const classifierCalls = [];
   const providerCalls = [];
-  let classifierCallIndex = 0;
   let refreshCalls = 0;
   const registryEvents = [];
 
   const nextClassifierResponse = () => {
     if (classifierError) throw classifierError;
-    const text = classifierTexts?.[classifierCallIndex++] ?? classifierText;
+    const text = classifierText;
     return {
       content: [{ type: "text", text }],
       stopReason: "stop",
@@ -129,9 +127,6 @@ function createHarness({
       },
       getProviderDisplayName(provider) {
         return providerDisplayNames[provider] ?? provider;
-      },
-      find(provider, modelId) {
-        return models.find((model) => model.provider === provider && model.id === modelId);
       },
       async getApiKeyAndHeaders(model) {
         return defaultRequestAuth(model);
@@ -516,7 +511,7 @@ test("auto mode fails closed when classification fails", async () => {
   assert.equal(harness.decisionEntries()[0].data.status, "blocked");
 });
 
-test("loads legacy globally persisted auto-mode state and uses the default classifier", async () => {
+test("loads persisted auto-mode state with default classifier settings", async () => {
   const globalModeState = { current: { autoModeEnabled: true } };
   const harness = createHarness({
     hasUI: true,
@@ -666,12 +661,9 @@ test("discovers text models for picker and autocomplete, supports slash-containi
   });
 });
 
-test("exposes one auto-mode settings command", () => {
+test("registers only the current auto-mode settings command", () => {
   const harness = createHarness();
-  assert.equal(harness.commands.has("automode-settings"), true);
-  for (const alias of ["automode", "automode-model", "automode-thinking", "automode-prompt", "automode-preferences"]) {
-    assert.equal(harness.commands.has(alias), false, alias);
-  }
+  assert.deepEqual([...harness.commands.keys()], ["automode-settings"]);
 });
 
 test("central auto-mode settings command groups configuration", async () => {
@@ -741,6 +733,95 @@ test("opens the unified settings entry point and exposes active command patterns
   assert.ok(harness.selectCalls[1].options.includes("Allowed - npm test*"));
   assert.ok(harness.selectCalls[1].options.includes("Denied - npm publish*"));
   assert.match(harness.notifications.at(-1).message, /session only/);
+});
+
+test("toggles auto mode from the unified settings page", async () => {
+  const globalModeState = { current: { autoModeEnabled: false } };
+  const harness = createHarness({
+    hasUI: true,
+    mode: "rpc",
+    globalModeState,
+    selectResponses: [
+      "Automatic safety decisions - off",
+      "on",
+      "Cancel",
+    ],
+  });
+
+  await harness.startSession();
+  await harness.commands.get("automode-settings").handler("", harness.context);
+
+  assert.equal(globalModeState.current.autoModeEnabled, true);
+  assert.deepEqual(harness.selectCalls.map((call) => call.title), [
+    "Permission Gate Settings",
+    "Automatic safety decisions",
+    "Permission Gate Settings",
+  ]);
+  assert.match(harness.notifications.at(-1).message, /auto mode enabled/);
+});
+
+test("opens the classifier prompt from the unified settings page", async () => {
+  const globalPreferences = { current: "- Keep the prompt route covered." };
+  const harness = createHarness({
+    hasUI: true,
+    mode: "rpc",
+    globalPreferences,
+    selectResponses: [
+      "View classifier prompt",
+      "Cancel",
+    ],
+  });
+
+  await harness.startSession();
+  await harness.commands.get("automode-settings").handler("", harness.context);
+
+  assert.equal(harness.editorCalls.at(-1).title, "Auto-mode classifier prompt (close without saving)");
+  assert.match(harness.editorCalls.at(-1).initialValue, /Keep the prompt route covered/);
+});
+
+test("reports and resets command rules from the unified settings page", async () => {
+  const globalRules = {
+    current: {
+      allowedCommands: ["npm test*"],
+      disallowedCommands: ["npm publish*"],
+    },
+  };
+  const harness = createHarness({
+    hasUI: true,
+    mode: "rpc",
+    globalRules,
+    selectResponses: [
+      "Command rules - 1 allowed / 1 denied",
+      "Show full rule report",
+      "Cancel",
+      "Command rules - 1 allowed / 1 denied",
+      "Reset current rules",
+      "Cancel",
+    ],
+  });
+
+  await harness.startSession();
+  const command = harness.commands.get("automode-settings");
+  await command.handler("", harness.context);
+
+  const report = harness.notifications.find(({ message }) => message.includes("Permission gate command rules (global)"));
+  assert.ok(report);
+  assert.match(report.message, /npm test\*/);
+  assert.match(report.message, /Hard-deny categories/);
+
+  await command.handler("", harness.context);
+  assert.deepEqual(globalRules.current, {
+    allowedCommands: [
+      "uv run pytest*",
+      "rtk uv run pytest*",
+      "uv run ruff check*",
+      "rtk uv run ruff check*",
+      "uv run mypy*",
+      "rtk uv run mypy*",
+    ],
+    disallowedCommands: [],
+  });
+  assert.match(harness.notifications.at(-1).message, /global command rules reset/);
 });
 
 test("model picker and completions only expose scoped text models", async () => {

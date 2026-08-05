@@ -4,8 +4,7 @@
  * Prompts for confirmation before running potentially dangerous bash commands.
  * In non-interactive mode, matching commands are blocked by default.
  *
- * Auto mode can delegate soft-deny decisions to a dedicated Pi model:
- * `github-copilot/gpt-5.6-luna` with high reasoning effort.
+ * Auto mode can delegate soft-deny decisions to the configured text-capable Pi model.
  */
 
 import { randomUUID } from "node:crypto";
@@ -13,7 +12,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, type AutocompleteItem } from "@earendil-works/pi-tui";
 import {
 	openPermissionSettings,
 	type PermissionSettingsAction,
@@ -584,10 +583,11 @@ function cacheScopedClassifierModels(
 
 function formatClassifierModelLabel(
 	reference: ClassifierModelReference | null,
-	availableModel: AvailableClassifierModel | undefined,
+	availableModel: AvailableClassifierModel | RegistryModel | undefined,
 	configuredThinkingLevel: ClassifierThinkingLevel,
 ): string {
-	return `${classifierModelDisplayId(reference)} (${formatClassifierThinkingLevel(configuredThinkingLevel, availableModel?.model)})`;
+	const model = availableModel && "model" in availableModel ? availableModel.model : availableModel;
+	return `${classifierModelDisplayId(reference)} (${formatClassifierThinkingLevel(configuredThinkingLevel, model)})`;
 }
 
 function getModelDescription(model: AvailableClassifierModel): string {
@@ -615,7 +615,7 @@ function getClassifierThinkingChoices(
 	return choices;
 }
 
-type CommandCompletion = { value: string; label: string; description?: string };
+type CommandCompletion = AutocompleteItem;
 
 function getClassifierThinkingCompletions(argumentPrefix: string): CommandCompletion[] | null {
 	const prefix = argumentPrefix.trimStart();
@@ -894,7 +894,7 @@ async function classifyWithModel(
 	reasons: string[],
 	ctx: ClassifierContext,
 	dependencies: PermissionGateDependencies,
-	classifierModel: ClassifierModelReference,
+	classifierModel: ClassifierModelReference | null,
 	classifierThinkingLevel: ClassifierThinkingLevel,
 	preferences: string,
 ): Promise<{
@@ -909,9 +909,7 @@ async function classifyWithModel(
 				(candidate) => candidate.provider === classifierModel.provider && candidate.id === classifierModel.id,
 			)
 		: undefined;
-	const modelLabel = model
-		? `${classifierModelDisplayId(classifierModel)} (${formatClassifierThinkingLevel(classifierThinkingLevel, model)})`
-		: formatClassifierModelLabel(classifierModel, undefined, classifierThinkingLevel);
+	const modelLabel = formatClassifierModelLabel(classifierModel, model, classifierThinkingLevel);
 	if (!classifierModel || !model) {
 		return {
 			decision: "deny",
@@ -942,7 +940,9 @@ async function classifyWithModel(
 			};
 		}
 
-		const modelRequestAuth = await registry.getApiKeyAndHeaders(model);
+		const modelRequestAuth = await registry.getApiKeyAndHeaders(
+			model as Parameters<typeof registry.getApiKeyAndHeaders>[0],
+		);
 		if (!modelRequestAuth.ok) {
 			return {
 				decision: "deny",
@@ -1008,9 +1008,12 @@ function recordDecision(pi: ExtensionAPI, entry: DecisionEntry): void {
 	}
 }
 
+function getAgentConfigDirectory(): string {
+	return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+}
+
 function getGlobalModeStatePath(): string {
-	const configDirectory = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
-	return join(configDirectory, GLOBAL_MODE_STATE_FILENAME);
+	return join(getAgentConfigDirectory(), GLOBAL_MODE_STATE_FILENAME);
 }
 
 function parseModeState(value: unknown): ModeState | undefined {
@@ -1082,8 +1085,7 @@ async function persistGlobalModeState(dependencies: PermissionGateDependencies, 
 }
 
 function getAutoModePreferencesPath(): string {
-	const configDirectory = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
-	return join(configDirectory, AUTO_MODE_PREFERENCES_FILE_NAME);
+	return join(getAgentConfigDirectory(), AUTO_MODE_PREFERENCES_FILE_NAME);
 }
 
 async function loadAutoModePreferencesFromDisk(): Promise<string | undefined> {
@@ -1175,8 +1177,7 @@ async function initializeModeState(
 }
 
 function getGlobalRulesPath(): string {
-	const configDirectory = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
-	return join(configDirectory, RULES_FILE_NAME);
+	return join(getAgentConfigDirectory(), RULES_FILE_NAME);
 }
 
 function getProjectRulesPath(cwd: string): string {
@@ -1319,7 +1320,7 @@ function persistModeState(pi: ExtensionAPI, state: ModeState): void {
 function setAutoModeStatus(
 	ctx: { hasUI: boolean; ui: { setStatus: (id: string, text: string | undefined) => void } },
 	enabled: boolean,
-	classifierModel: ClassifierModelReference,
+	classifierModel: ClassifierModelReference | null,
 	classifierThinkingLevel: ClassifierThinkingLevel,
 	availableModels: readonly AvailableClassifierModel[],
 ): void {
@@ -1448,11 +1449,11 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 	const canPromptForSelection = (ctx: Pick<ExtensionContext, "hasUI" | "mode">): boolean =>
 		ctx.hasUI && (ctx.mode === "tui" || ctx.mode === "rpc");
 
-	const handleClassifierModelCommand = async (args: string, ctx: ExtensionContext, commandLabel: string): Promise<void> => {
+	const handleClassifierModelCommand = async (args: string, ctx: ExtensionContext): Promise<void> => {
 		const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
 		if (parts.length === 0) {
 			if (!canPromptForSelection(ctx)) {
-				notify(ctx, `Choosing a classifier model requires interactive mode. Use /${commandLabel} provider/model-id instead.`, "warning");
+				notify(ctx, `Choosing a classifier model requires interactive mode. Use /${AUTO_MODE_SETTINGS_COMMAND} model provider/model-id instead.`, "warning");
 				return;
 			}
 
@@ -1484,7 +1485,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		}
 
 		if (parts.length !== 1) {
-			notify(ctx, `Usage: /${commandLabel} [provider/model-id|reset]`, "warning");
+			notify(ctx, `Usage: /${AUTO_MODE_SETTINGS_COMMAND} model [provider/model-id|reset]`, "warning");
 			return;
 		}
 
@@ -1524,31 +1525,16 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		);
 	};
 
-	const handleClassifierThinkingCommand = async (
-		args: string,
-		ctx: ExtensionContext,
-		commandLabel: string,
-		openSelector: boolean,
-	): Promise<void> => {
+	const handleClassifierThinkingCommand = async (args: string, ctx: ExtensionContext): Promise<void> => {
 		const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
-		if (parts.length === 0 && openSelector && !canPromptForSelection(ctx)) {
-			notify(ctx, `Choosing a classifier thinking level requires interactive mode. Use /${commandLabel} <level> instead.`, "warning");
+		if (parts.length === 0 && !canPromptForSelection(ctx)) {
+			notify(ctx, `Choosing a classifier thinking level requires interactive mode. Use /${AUTO_MODE_SETTINGS_COMMAND} thinking <level> instead.`, "warning");
 			return;
 		}
 
 		syncAvailableClassifierModels(ctx);
 		const selected = findAvailableClassifierModel(availableClassifierModels, classifierModel);
 		if (parts.length === 0) {
-			if (!openSelector) {
-				const effective = effectiveClassifierThinkingLevel(selected?.model, classifierThinkingLevel);
-				notify(
-					ctx,
-					`Permission gate classifier thinking is configured as ${classifierThinkingLevel} and effective as ${effective} for ${classifierModelDisplayId(classifierModel)}.`,
-					"info",
-				);
-				return;
-			}
-
 			const choices = getClassifierThinkingChoices(selected?.model, classifierThinkingLevel);
 			const choice = await ctx.ui.select("Select the auto-mode classifier thinking level:", choices);
 			if (!choice) return;
@@ -1566,7 +1552,11 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			classifierThinkingLevel = nextThinkingLevel;
 		} else {
 			if (parts.length !== 1) {
-				notify(ctx, `Usage: /${commandLabel} [off|minimal|low|medium|high|xhigh|max|reset]`, "warning");
+				notify(
+					ctx,
+					`Usage: /${AUTO_MODE_SETTINGS_COMMAND} thinking [off|minimal|low|medium|high|xhigh|max|reset]`,
+					"warning",
+				);
 				return;
 			}
 
@@ -1578,7 +1568,11 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 						? requestedThinkingLevel
 						: undefined;
 			if (!nextThinkingLevel) {
-				notify(ctx, `Usage: /${commandLabel} [off|minimal|low|medium|high|xhigh|max|reset]`, "warning");
+				notify(
+					ctx,
+					`Usage: /${AUTO_MODE_SETTINGS_COMMAND} thinking [off|minimal|low|medium|high|xhigh|max|reset]`,
+					"warning",
+				);
 				return;
 			}
 			classifierThinkingLevel = nextThinkingLevel;
@@ -1604,18 +1598,14 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		notify(ctx, prompt, "info");
 	};
 
-	const handleAutoModePreferencesCommand = async (
-		args: string,
-		ctx: ExtensionContext,
-		commandLabel: string,
-	): Promise<void> => {
+	const handleAutoModePreferencesCommand = async (args: string, ctx: ExtensionContext): Promise<void> => {
 		await refreshAutoModePreferences(ctx);
 		const rawValue = String(args ?? "").trim();
 		if (!rawValue) {
 			if (!ctx.hasUI) {
 				notify(
 					ctx,
-					`/${commandLabel} needs an interactive UI without text. Use /${AUTO_MODE_SETTINGS_COMMAND} preferences <text> or edit ${getAutoModePreferencesPath()} directly.`,
+					`/${AUTO_MODE_SETTINGS_COMMAND} preferences needs an interactive UI without text. Use /${AUTO_MODE_SETTINGS_COMMAND} preferences <text> or edit ${getAutoModePreferencesPath()} directly.`,
 					"warning",
 				);
 				return;
@@ -1642,7 +1632,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			else notify(ctx, prompt, "info");
 			return;
 		}
-		if (lowered === "reset" || lowered === "clear") {
+		if (lowered === "clear") {
 			if (!(await persistAutoModePreferences(ctx, ""))) return;
 			notify(ctx, "Auto-mode classifier preferences cleared.", "info");
 			return;
@@ -1659,16 +1649,11 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		const first = parts[0]?.toLowerCase() ?? "";
 
 		if (first === "model") {
-			await handleClassifierModelCommand(parts.slice(1).join(" "), ctx, `${AUTO_MODE_SETTINGS_COMMAND} model`);
+			await handleClassifierModelCommand(parts.slice(1).join(" "), ctx);
 			return;
 		}
 		if (first === "thinking") {
-			await handleClassifierThinkingCommand(
-				parts.slice(1).join(" "),
-				ctx,
-				`${AUTO_MODE_SETTINGS_COMMAND} thinking`,
-				true,
-			);
+			await handleClassifierThinkingCommand(parts.slice(1).join(" "), ctx);
 			return;
 		}
 		if (first === "prompt") {
@@ -1680,7 +1665,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			return;
 		}
 		if (first === "preferences") {
-			await handleAutoModePreferencesCommand(parts.slice(1).join(" "), ctx, `${AUTO_MODE_SETTINGS_COMMAND} preferences`);
+			await handleAutoModePreferencesCommand(parts.slice(1).join(" "), ctx);
 			return;
 		}
 
@@ -1720,41 +1705,37 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		);
 	};
 
-	const handlePermissionRulesCommand = async (args: string, ctx: ExtensionContext): Promise<void> => {
-		const parts = String(args ?? "").trim().toLowerCase().split(/\s+/).filter(Boolean);
-		const action = parts[0] ?? "edit";
-
+	type PermissionRulesAction = "edit" | "list" | "reset";
+	const handlePermissionRulesCommand = async (action: PermissionRulesAction, ctx: ExtensionContext): Promise<void> => {
 		if (action === "list") {
 			notify(ctx, formatCommandRules(ruleConfig, ruleScope), "info");
 			return;
 		}
 
 		if (action === "reset") {
-			const requestedScope = parts[1] ?? (ruleScope === "project" ? "project" : "global");
-			if (requestedScope !== "global" && requestedScope !== "project") {
-				notify(ctx, "Usage: Command rules: edit, list, or reset [global|project].", "warning");
+			if (ruleScope === "session") {
+				ruleConfig = cloneDefaultCommandRuleConfig();
+				notify(ctx, "Permission gate session command rules reset.", "info");
 				return;
 			}
-			if (requestedScope === "project" && !ctx.isProjectTrusted()) {
+
+			const scope = ruleScope;
+			if (scope === "project" && !ctx.isProjectTrusted()) {
 				notify(ctx, "Permission gate: project rules require a trusted project.", "error");
 				return;
 			}
 			const resetConfig = cloneDefaultCommandRuleConfig();
 			try {
-				await saveCommandRules(dependencies, requestedScope, ctx.cwd, resetConfig);
+				await saveCommandRules(dependencies, scope, ctx.cwd, resetConfig);
 			} catch (error) {
-				notify(ctx, `Permission gate: could not reset ${requestedScope} rules: ${error instanceof Error ? error.message : String(error)}`, "error");
+				notify(ctx, `Permission gate: could not reset ${scope} rules: ${error instanceof Error ? error.message : String(error)}`, "error");
 				return;
 			}
-			if (ruleScope === requestedScope) ruleConfig = resetConfig;
-			notify(ctx, `Permission gate ${requestedScope} command rules reset.`, "info");
+			ruleConfig = resetConfig;
+			notify(ctx, `Permission gate ${scope} command rules reset.`, "info");
 			return;
 		}
 
-		if (action !== "edit") {
-			notify(ctx, "Usage: Command rules: edit, list, or reset [global|project].", "warning");
-			return;
-		}
 		if (!ctx.hasUI) {
 			notify(ctx, "/automode-settings needs an interactive UI to edit command rules.", "error");
 			return;
@@ -1867,20 +1848,19 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			allowedCommands: ruleConfig.allowedCommands,
 			disallowedCommands: ruleConfig.disallowedCommands,
 			preferences: autoModePreferences,
-			canSaveProjectRules: ctx.isProjectTrusted(),
 		};
 	};
 
 	const handlePermissionSettingsAction = async (action: PermissionSettingsAction, ctx: ExtensionContext): Promise<void> => {
 		switch (action.type) {
 			case "auto-mode":
-				await handleAutoModeSettingsCommand(action.value, ctx, AUTO_MODE_SETTINGS_COMMAND, false);
+				await handleAutoModeSettingsCommand(action.value, ctx);
 				return;
 			case "classifier-model":
-				await handleClassifierModelCommand(action.value, ctx, `${AUTO_MODE_SETTINGS_COMMAND} model`);
+				await handleClassifierModelCommand(action.value, ctx);
 				return;
 			case "classifier-thinking":
-				await handleClassifierThinkingCommand(action.value, ctx, `${AUTO_MODE_SETTINGS_COMMAND} thinking`, false);
+				await handleClassifierThinkingCommand(action.value, ctx);
 				return;
 			case "command-rules":
 				await handlePermissionRulesCommand(action.value, ctx);
@@ -1888,18 +1868,18 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			case "preferences":
 				if (action.value === "add") {
 					const note = await ctx.ui.input("Add an auto-mode classifier preference note:", "");
-					if (note?.trim()) await handleAutoModePreferencesCommand(note, ctx, `${AUTO_MODE_SETTINGS_COMMAND} preferences`);
+					if (note?.trim()) await handleAutoModePreferencesCommand(note, ctx);
 					return;
 				}
 				if (action.value === "edit") {
-					await handleAutoModePreferencesCommand("", ctx, `${AUTO_MODE_SETTINGS_COMMAND} preferences`);
+					await handleAutoModePreferencesCommand("", ctx);
 					return;
 				}
 				if (action.value === "clear") {
 					const confirmed = await ctx.ui.confirm("Clear classifier preferences?", "All user-authored auto-mode preference notes will be removed.");
 					if (!confirmed) return;
 				}
-				await handleAutoModePreferencesCommand(action.value, ctx, `${AUTO_MODE_SETTINGS_COMMAND} preferences`);
+				await handleAutoModePreferencesCommand(action.value, ctx);
 				return;
 			case "prompt":
 				await handleAutoModePromptCommand(ctx);
@@ -1923,7 +1903,6 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 
 	pi.registerCommand(AUTO_MODE_SETTINGS_COMMAND, {
 		description: "Open permission-gate settings or configure them directly",
-		argumentHint: "[on|off|status|model|thinking|prompt|preferences]",
 		getArgumentCompletions: (argumentPrefix) =>
 			getClassifierModelCompletions(argumentPrefix, scopedClassifierModels),
 		handler: async (args, ctx) => {
