@@ -1,6 +1,6 @@
 {
   "name": "@nilskluewer/pi-auto-permission-gate",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "description": "Confirm or block dangerous bash commands before the Pi coding agent executes them.",
   "type": "module",
   "keywords": [
