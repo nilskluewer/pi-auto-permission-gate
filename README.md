@@ -36,7 +36,9 @@ It does not intercept Pi's direct `!` or `!!` shell commands, and it does not in
 | Downloaded scripts | `curl ... \| sh`, `wget ... \| bash` | Checked |
 | Other bash commands | `git status`, `printf`, ordinary project commands | Allowed unless a user rule matches |
 
-Edit the user-controlled lists with `/permission-rules`.
+Open `/automode-settings` without arguments for the interactive Permission Gate Settings page.
+It provides one navigable entry point for auto mode, classifier model and thinking, classifier preferences, and command rules.
+The command-rules subpage lists the active allowed and disallowed patterns before opening the editor, so user-defined commands are visible instead of being hidden in a separate command.
 Hard-deny rules cannot be overridden by an allow pattern.
 
 ## What it protects
@@ -85,7 +87,7 @@ Approvals are not persisted, so every matching tool call is reviewed independent
 
 ## User-editable command rules
 
-Use `/permission-rules` or `/permission-rules edit` to edit the command rule list in Pi.
+Use the command-rules page in `/automode-settings` to edit the command rule list in Pi.
 The editor accepts shell-style `*` and `?` patterns matched against the complete command.
 The editor starts with the built-in local verification allowlist, and saving replaces the two lists with the edited values.
 
@@ -108,7 +110,7 @@ The save menu supports the current session, a global default, or a trusted-proje
 Global rules are stored in `~/.pi/agent/permission-gate-rules.json`.
 Project rules are stored in `.pi/permission-gate-rules.json` and override the global rules for that project.
 
-Use `/permission-rules list` to inspect the active rules or `/permission-rules reset [global|project]` to restore the built-in allowlist.
+Use the command-rules page in `/automode-settings` to inspect or reset the active rules.
 
 ## Auto mode
 
@@ -117,23 +119,38 @@ Auto mode adds a model-backed decision layer for matching commands that are not 
 Auto mode is enabled by default.
 The first session after installation initializes the global setting as enabled.
 
-Use `/automode on`, `/automode off`, or `/automode status` for explicit control.
-Web verification is enabled by default and can be controlled with `/automode web on` or `/automode web off`.
-The bare `/automode` command still toggles the current global setting.
+Use `/automode-settings` as the central settings command.
+With no arguments it opens the interactive settings page.
+In RPC mode it uses nested selection dialogs, while JSON and print modes retain the non-interactive status behavior.
 
-Choose the classifier with these discoverable commands:
+The same command also supports direct forms:
 
 ```text
-/automode-model
-/automode-model provider/model-id
-/automode-model reset
+/automode-settings on|off|status
+/automode-settings model [provider/model-id|reset]
+/automode-settings thinking [level|reset]
+/automode-settings prompt
+/automode-settings preferences [text|list|clear]
 ```
 
-`/automode-model` opens a model selector in TUI and RPC modes.
-`/automode-model provider/model-id` selects the exact provider and model ID and also works in noninteractive modes.
+Auto-mode preferences are stored as a user-editable Markdown note file at `~/.pi/agent/automode-preferences.md`, or below `PI_CODING_AGENT_DIR` when that environment variable is set.
+Each non-empty note is injected into the classifier's system and user prompts as trusted user-authored policy.
+Preferences can refine soft-deny decisions, but they never override hard-deny rules or the classifier's requirement to deny ambiguous commands.
+Use `/automode-settings preferences <text>` to append a note, `/automode-settings preferences` to edit the complete note file in the interactive editor, `/automode-settings preferences list` to inspect the notes, or `/automode-settings preferences clear` to remove them.
+Use `/automode-settings prompt` to open the complete classifier prompt template, including the currently injected preferences.
+
+Choose the classifier with these central settings commands:
+
+```text
+/automode-settings model
+/automode-settings model provider/model-id
+/automode-settings model reset
+```
+
+`/automode-settings model` opens a model selector in TUI and RPC modes.
+`/automode-settings model provider/model-id` selects the exact provider and model ID and also works in noninteractive modes.
 The provider is the text before the first slash, so model IDs containing additional slashes are supported.
-`/automode-model reset` restores `github-copilot/gpt-5.6-luna`.
-The older `/automode model` forms remain supported as aliases.
+`/automode-settings model reset` restores `github-copilot/gpt-5.6-luna`.
 The picker and model argument completions use only scoped text-capable models from the current Pi session.
 Configure a session model scope with Pi's `--models` option or the `enabledModels` setting before using the picker.
 Explicit `provider/model-id` arguments still resolve exact current models from Pi's model registry.
@@ -142,16 +159,14 @@ The command autocomplete does not expose authentication details.
 Configure classifier thinking independently from Pi's active conversation thinking level:
 
 ```text
-/automode-thinking
-/automode-thinking <off|minimal|low|medium|high|xhigh|max>
-/automode-thinking reset
+/automode-settings thinking
+/automode-settings thinking <off|minimal|low|medium|high|xhigh|max>
+/automode-settings thinking reset
 ```
 
-`/automode-thinking` opens a thinking-level selector in TUI and RPC modes.
+`/automode-settings thinking` opens a thinking-level selector in TUI and RPC modes.
 The selector marks levels supported by the selected classifier and shows the effective clamped level when a level is unsupported.
-The older `/automode thinking` forms remain supported as aliases.
-`/automode-thinking` with no UI does not prompt; use an explicit level in noninteractive modes.
-The legacy `/automode thinking` form without an argument reports the configured and effective level instead of opening a selector.
+`/automode-settings thinking` with no UI does not prompt; use an explicit level in noninteractive modes.
 The default and reset level is `high`.
 Invalid levels and extra arguments are rejected without mutating the global setting.
 A picker is rejected in JSON, print, and no-UI modes and does not change the configured model or thinking level.
@@ -161,7 +176,7 @@ The extension does not maintain a provider allowlist.
 Only models whose registry metadata accepts text input are shown in the picker or autocomplete, and provider/model IDs are sorted deterministically.
 Provider display names and model names are used only as picker and autocomplete descriptions.
 
-The classifier model and configured/effective thinking level are shown by `/automode status`, the footer status, notifications, and expanded decision entries.
+The classifier model and configured/effective thinking level are shown by `/automode-settings status`, the footer status, notifications, and expanded decision entries.
 For example, a configured `max` level may be reported as `thinking max -> high` when the selected model supports standard levels but does not advertise `max`.
 Pi's model support metadata controls clamping: non-reasoning models use `off`, standard levels through `high` are available unless explicitly mapped to `null`, and `xhigh` and `max` require explicit non-null mappings.
 Clamping follows Pi's thinking-level ordering and the effective non-off level is passed to the classifier provider.
@@ -170,29 +185,14 @@ Selecting a classifier or classifier thinking level does not change Pi's active 
 When auto mode is enabled, each soft-deny command is evaluated by the selected classifier.
 The classifier receives the command, matched rules, working directory, and a bounded extract of recent user and assistant text.
 The classifier has no direct tools and must return a strict JSON decision with a short rationale.
-When command or package information is unclear, it can request a web verification query.
-The extension derives a bounded search query locally from command and package tokens rather than forwarding the recent conversation to the web provider.
-It runs that query through the active Pi `web_search` tool in an isolated Pi subprocess that loads only the trusted web-search extension and exposes no shell tool.
-Web verification remains a separate fixed verifier using `github-copilot/gpt-5.6-luna` with high reasoning.
-Its isolated subprocess only sees persisted, configured, and environment authentication.
-Runtime-only credentials from the parent process, such as a CLI `--api-key`, are not forwarded.
-If the subprocess cannot authenticate, web verification fails and the permission gate blocks the command.
-The selected classifier is used for the actual classification call before web evidence and the final classification call after web evidence.
-The bounded evidence is then sent back to the classifier for a final decision.
-The web query and evidence are treated as untrusted data and cannot execute commands.
-
-Web verification requires an active `web_search` tool, for example the companion package `@nilskluewer/pi-vertex-gemini-search`.
-The query is sent through the configured Pi web-search provider, so use `/automode web off` when commands or package names should not leave the local environment.
-
 The decision is recorded in the chat as a session entry showing the command, matched rules, model, outcome, and rationale.
 The decision entry is kept out of the model's normal conversation context so it does not create a feedback loop.
-Auto-mode and web-verification settings are persisted globally in `~/.pi/agent/permission-gate.json`, or under `PI_CODING_AGENT_DIR` when that environment variable is set.
+Auto-mode settings are persisted globally in `~/.pi/agent/permission-gate.json`, or under `PI_CODING_AGENT_DIR` when that environment variable is set.
 The persisted classifier configuration contains only a reference such as `{"provider":"vertex","id":"gemini/flash"}` under `classifierModel` and a `classifierThinkingLevel` such as `"high"`, never a full model or authentication object.
-Older files that contain only `autoModeEnabled` and `webVerificationEnabled` remain compatible and use the default classifier reference and `high` thinking.
 The model reset command persists the default reference and the thinking reset command persists `high`.
 The selected reference and configured thinking level are kept across new sessions, resumes, forks, reloads, and tree navigation.
 
-Auto mode fails closed if the selected model or provider is unavailable, the selected model becomes stale, authentication fails, the request is cancelled, the response is malformed, requested web verification is unavailable or fails, or the model is uncertain.
+Auto mode fails closed if the selected model or provider is unavailable, the selected model becomes stale, authentication fails, the request is cancelled, the response is malformed, or the model is uncertain.
 A stale user-selected model never silently falls back to the default classifier.
 Malformed persisted classifier references remain observable as unavailable and fail closed until the user selects a model or resets the classifier.
 
@@ -207,7 +207,7 @@ The following catastrophic operations are blocked without asking the model:
 - Forced pushes to protected branch names such as `main`, `master`, `production`, or `prod`.
 
 Package installation, update, and removal commands are not gated by default.
-Package execution, package runners, and publishing remain soft-deny matches and can trigger web verification.
+Package execution, package runners, and publishing remain soft-deny matches.
 
 This separation follows the useful part of Claude Code's auto-mode design: deterministic hard denies remain non-negotiable, while lower-confidence safety matches can be classified with context.
 

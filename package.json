@@ -14,7 +14,6 @@
     "bash",
     "security",
     "auto-mode",
-    "web-search",
     "command-approval"
   ],
   "author": {
@@ -32,6 +31,7 @@
   "homepage": "https://github.com/nilskluewer/pi-auto-permission-gate#readme",
   "files": [
     "extensions",
+    "permission-gate-settings.ts",
     "README.md",
     "LICENSE"
   ],

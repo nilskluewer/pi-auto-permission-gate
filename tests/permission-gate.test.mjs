@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildAutoModePrompt,
   createPermissionGate,
   hardDenyReasons,
   matchedReasons,
@@ -33,15 +34,16 @@ function createHarness({
   providerAuth,
   requestAuth,
   refreshError,
-  webSearchAvailable = false,
-  webSearchRegistered = webSearchAvailable,
-  webSearchExtensionPath = webSearchAvailable ? "test-web-search.ts" : undefined,
-  webEvidence = "web evidence: package documentation and security advisories",
   branch = [],
   globalModeState = { current: undefined },
   globalRules = { current: undefined },
+  globalPreferences = { current: undefined },
   editedRules,
+  editedPreferences,
   ruleSaveChoice = "Apply to this session only",
+  selectResponses = [],
+  inputValue,
+  confirmValue = true,
 } = {}) {
   const handlers = new Map();
   const commands = new Map();
@@ -50,9 +52,9 @@ function createHarness({
   const notifications = [];
   const statuses = new Map();
   const selectCalls = [];
+  const editorCalls = [];
   const classifierCalls = [];
   const providerCalls = [];
-  const execCalls = [];
   let classifierCallIndex = 0;
   let refreshCalls = 0;
   const registryEvents = [];
@@ -98,35 +100,7 @@ function createHarness({
         branch.push({ type: "custom", customType: type, data });
       }
     },
-    getActiveTools() {
-      return webSearchAvailable ? ["web_search"] : [];
-    },
-    getAllTools() {
-      return webSearchRegistered ? [{ name: "web_search", sourceInfo: { path: "test-web-search.ts" } }] : [];
-    },
-    async exec(command, args, options) {
-      execCalls.push({ command, args, options });
-      const stdout = [
-        JSON.stringify({ type: "tool_execution_start", toolName: "web_search", toolCallId: "test-web-call" }),
-        JSON.stringify({
-          type: "tool_execution_end",
-          toolName: "web_search",
-          toolCallId: "test-web-call",
-          isError: false,
-          result: {
-            content: [{ type: "text", text: webEvidence }],
-            details: {
-              model: "test-web",
-              depth: "short",
-              sourceCount: 1,
-              sources: [{ url: "https://example.test/source" }],
-            },
-            isError: false,
-          },
-        }),
-      ].join("\n");
-      return { stdout, stderr: "", code: 0, killed: false };
-    },
+
   };
 
   const context = {
@@ -175,9 +149,18 @@ function createHarness({
         if (title === "Save permission gate rules:") return ruleSaveChoice;
         if (title === "Select the auto-mode classifier model:") return modelChoice ?? options[0];
         if (title === "Select the auto-mode classifier thinking level:") return thinkingChoice ?? options[0];
+        if (selectResponses.length > 0) return selectResponses.shift();
         return choice;
       },
-      async editor() {
+      async input(title, placeholder) {
+        return inputValue;
+      },
+      async confirm() {
+        return confirmValue;
+      },
+      async editor(title, initialValue) {
+        editorCalls.push({ title, initialValue });
+        if (title.startsWith("Edit auto-mode classifier preference notes")) return editedPreferences;
         return editedRules;
       },
       notify(message, level) {
@@ -196,7 +179,6 @@ function createHarness({
 
   createPermissionGate(pi, {
     ...(useComplete ? { complete } : {}),
-    webSearchExtensionPath,
     loadGlobalModeState: async () => globalModeState.current,
     saveGlobalModeState: async (state) => {
       globalModeState.current = { ...state };
@@ -208,6 +190,10 @@ function createHarness({
         disallowedCommands: [...config.disallowedCommands],
       };
     },
+    loadAutoModePreferences: async () => globalPreferences.current,
+    saveAutoModePreferences: async (preferences) => {
+      globalPreferences.current = preferences;
+    },
   });
 
   return {
@@ -218,9 +204,9 @@ function createHarness({
     notifications,
     statuses,
     selectCalls,
+    editorCalls,
     classifierCalls,
     providerCalls,
-    execCalls,
     get refreshCalls() {
       return refreshCalls;
     },
@@ -268,32 +254,33 @@ test("parses strict and fenced auto-mode decisions", () => {
     decision: "allow",
     rationale: "Scoped temporary cleanup.",
   });
-  assert.deepEqual(parseAutoModeDecision('{"decision":"deny","needs_web_search":true,"search_query":"package safety","rationale":"Need current package information."}'), {
-    decision: "deny",
-    rationale: "Need current package information.",
-    needsWebSearch: true,
-    searchQuery: "package safety",
-  });
+  assert.equal(parseAutoModeDecision('{"decision":"deny","unexpected":"extra","rationale":"Reject unknown fields."}'), undefined);
   assert.equal(parseAutoModeDecision("```json\n{\"decision\":\"deny\",\"rationale\":\"Unclear target.\"}\n```"), undefined);
   assert.equal(parseAutoModeDecision('{"decision":"allow","rationale":"ok","extra":"reject this"}'), undefined);
   assert.equal(parseAutoModeDecision('{"decision":"allow"}'), undefined);
   assert.equal(parseAutoModeDecision("not JSON"), undefined);
 });
 
-test("edits allowed and disallowed command patterns through /permission-rules", async () => {
+test("edits allowed and disallowed command patterns from unified settings", async () => {
   const globalRules = { current: undefined };
   const harness = createHarness({
     hasUI: true,
+    mode: "rpc",
     globalRules,
     editedRules: JSON.stringify({
       allowedCommands: ["uv run python*", "rm -rf *"],
       disallowedCommands: ["npm install evil*"],
     }),
     ruleSaveChoice: "Save as global default",
+    selectResponses: [
+      "Command rules - 6 allowed / 0 denied",
+      "Edit command patterns",
+      "Cancel",
+    ],
   });
 
   await harness.startSession();
-  await harness.commands.get("permission-rules").handler("edit", harness.context);
+  await harness.commands.get("automode-settings").handler("", harness.context);
   assert.deepEqual(globalRules.current, {
     allowedCommands: ["uv run python*", "rm -rf *"],
     disallowedCommands: ["npm install evil*"],
@@ -417,13 +404,68 @@ test("hard-denies catastrophic commands without calling the model", async () => 
   assert.equal(harness.decisionEntries()[0].data.source, "hard-deny");
 });
 
+test("injects persisted auto-mode preference notes into classifier prompts", async () => {
+  const globalPreferences = { current: "- Keep operations inside the current project whenever possible." };
+  const harness = createHarness({
+    hasUI: false,
+    globalPreferences,
+    classifierText: '{"decision":"allow","rationale":"The user preference permits this bounded operation."}',
+  });
+
+  await harness.startSession();
+  const result = await harness.invoke({
+    toolName: "bash",
+    input: { command: "rm -rf /tmp/example" },
+  });
+
+  assert.equal(result, undefined);
+  assert.match(harness.classifierCalls[0].request.systemPrompt, /Keep operations inside the current project/);
+  assert.match(harness.classifierCalls[0].request.messages[0].content[0].text, /<auto_mode_preferences>/);
+  assert.match(harness.classifierCalls[0].request.messages[0].content[0].text, /Keep operations inside the current project/);
+});
+
+test("adds preference notes and edits the preference file through commands", async () => {
+  const globalPreferences = { current: "- Existing preference" };
+  const harness = createHarness({
+    hasUI: true,
+    globalPreferences,
+    editedPreferences: "- Edited preference",
+  });
+
+  await harness.startSession();
+  await harness.commands.get("automode-settings").handler("preferences Prefer read-only checks before mutations", harness.context);
+  assert.match(globalPreferences.current, /Existing preference/);
+  assert.match(globalPreferences.current, /Prefer read-only checks before mutations/);
+
+  await harness.commands.get("automode-settings").handler("preferences", harness.context);
+  assert.equal(globalPreferences.current, "- Edited preference");
+  assert.equal(harness.editorCalls.at(-1).title, "Edit auto-mode classifier preference notes");
+  assert.equal(harness.editorCalls.at(-1).initialValue.includes("Prefer read-only checks"), true);
+});
+
+test("shows the classifier prompt with injected preferences", async () => {
+  const globalPreferences = { current: "- Always deny production changes." };
+  const harness = createHarness({ hasUI: true, globalPreferences });
+
+  await harness.startSession();
+  await harness.commands.get("automode-settings").handler("prompt", harness.context);
+
+  const promptEditor = harness.editorCalls.at(-1);
+  assert.equal(promptEditor.title, "Auto-mode classifier prompt (close without saving)");
+  assert.match(promptEditor.initialValue, /SYSTEM PROMPT/);
+  assert.match(promptEditor.initialValue, /Always deny production changes/);
+  assert.match(promptEditor.initialValue, /USER PROMPT TEMPLATE/);
+  assert.match(promptEditor.initialValue, /<auto_mode_preferences>/);
+  assert.match(buildAutoModePrompt(globalPreferences.current), /Always deny production changes/);
+});
+
 test("auto mode approves a soft-deny command with the configured model", async () => {
   const harness = createHarness({
     hasUI: true,
     classifierText: '{"decision":"allow","rationale":"The target is a scoped temporary directory."}',
   });
 
-  await harness.commands.get("automode").handler("on", harness.context);
+  await harness.commands.get("automode-settings").handler("on", harness.context);
   const result = await harness.invoke({
     toolName: "bash",
     input: { command: "rm -rf /tmp/example" },
@@ -436,52 +478,7 @@ test("auto mode approves a soft-deny command with the configured model", async (
   assert.equal(harness.decisionEntries()[0].data.status, "approved");
   assert.equal(harness.decisionEntries()[0].data.source, "auto-model");
   assert.match(harness.decisionEntries()[0].data.model, /github-copilot\/gpt-5\.6-luna \(thinking high\)/);
-  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high, web on)");
-});
-
-test("auto mode can request web verification before the final decision", async () => {
-  const harness = createHarness({
-    hasUI: true,
-    webSearchAvailable: true,
-    classifierTexts: [
-      '{"decision":"deny","needs_web_search":true,"search_query":"is this package runner safe?","rationale":"The package identity needs verification."}',
-      '{"decision":"allow","rationale":"The web evidence confirms this is a scoped local package operation."}',
-    ],
-  });
-
-  await harness.commands.get("automode").handler("on", harness.context);
-  const result = await harness.invoke({
-    toolName: "bash",
-    input: { command: "npx example-package --token example-value-123 --help" },
-  });
-
-  assert.equal(result, undefined);
-  assert.equal(harness.classifierCalls.length, 2);
-  assert.equal(harness.execCalls.length, 1);
-  assert.deepEqual(harness.execCalls[0].args.slice(0, 4), ["--no-extensions", "--extension", "test-web-search.ts", "--no-session"]);
-  assert.match(harness.classifierCalls[1].request.messages[0].content[0].text, /web evidence: package documentation/);
-  assert.equal(harness.decisionEntries()[0].data.status, "approved");
-  assert.match(harness.decisionEntries()[0].data.webQuery, /example-package/);
-  assert.doesNotMatch(harness.decisionEntries()[0].data.webQuery, /example-value-123/);
-});
-
-test("auto mode blocks when requested web verification is registered but inactive", async () => {
-  const harness = createHarness({
-    hasUI: true,
-    webSearchAvailable: false,
-    webSearchRegistered: true,
-    classifierText: '{"decision":"allow","needs_web_search":true,"search_query":"unknown package","rationale":"The package identity needs verification."}',
-  });
-
-  await harness.commands.get("automode").handler("on", harness.context);
-  const result = await harness.invoke({
-    toolName: "bash",
-    input: { command: "npx unknown-package --help" },
-  });
-
-  assert.equal(result.block, true);
-  assert.match(result.reason, /web_search tool is not available/);
-  assert.equal(harness.execCalls.length, 0);
+  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high)");
 });
 
 test("auto mode blocks a denied soft-deny command and records the rationale", async () => {
@@ -490,7 +487,7 @@ test("auto mode blocks a denied soft-deny command and records the rationale", as
     classifierText: '{"decision":"deny","rationale":"Privilege escalation is not necessary for the stated task."}',
   });
 
-  await harness.commands.get("automode").handler("on", harness.context);
+  await harness.commands.get("automode-settings").handler("on", harness.context);
   const result = await harness.invoke({
     toolName: "bash",
     input: { command: "sudo -n true" },
@@ -508,7 +505,7 @@ test("auto mode fails closed when classification fails", async () => {
     classifierError: new Error("classifier unavailable"),
   });
 
-  await harness.commands.get("automode").handler("on", harness.context);
+  await harness.commands.get("automode-settings").handler("on", harness.context);
   const result = await harness.invoke({
     toolName: "bash",
     input: { command: "sudo -n true" },
@@ -520,7 +517,7 @@ test("auto mode fails closed when classification fails", async () => {
 });
 
 test("loads legacy globally persisted auto-mode state and uses the default classifier", async () => {
-  const globalModeState = { current: { autoModeEnabled: true, webVerificationEnabled: false } };
+  const globalModeState = { current: { autoModeEnabled: true } };
   const harness = createHarness({
     hasUI: true,
     classifierText: '{"decision":"allow","rationale":"The explicit test command is safe."}',
@@ -534,15 +531,14 @@ test("loads legacy globally persisted auto-mode state and uses the default class
   });
 
   assert.equal(result, undefined);
-  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high, web off)");
-  assert.deepEqual(globalModeState.current, { autoModeEnabled: true, webVerificationEnabled: false });
+  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high)");
+  assert.deepEqual(globalModeState.current, { autoModeEnabled: true });
 });
 
-test("preserves booleans and exposes malformed classifier state without default substitution", async () => {
+test("preserves malformed classifier state without default substitution", async () => {
   const globalModeState = {
     current: {
       autoModeEnabled: false,
-      webVerificationEnabled: false,
       classifierModel: { provider: "", id: "" },
       classifierThinkingLevel: "not-a-level",
     },
@@ -551,19 +547,17 @@ test("preserves booleans and exposes malformed classifier state without default 
 
   await harness.startSession();
   assert.equal(harness.statuses.get("permission-gate"), undefined);
-  await harness.commands.get("automode").handler("status", harness.context);
+  await harness.commands.get("automode-settings").handler("status", harness.context);
   assert.match(harness.notifications.at(-1).message, /auto mode is OFF/);
-  assert.match(harness.notifications.at(-1).message, /web verification is OFF/);
   assert.match(harness.notifications.at(-1).message, /unavailable classifier model/);
   assert.doesNotMatch(harness.notifications.at(-1).message, /github-copilot\/gpt-5\.6-luna/);
   assert.deepEqual(globalModeState.current, {
     autoModeEnabled: false,
-    webVerificationEnabled: false,
     classifierModel: { provider: "", id: "" },
     classifierThinkingLevel: "not-a-level",
   });
 
-  await harness.commands.get("automode").handler("on", harness.context);
+  await harness.commands.get("automode-settings").handler("on", harness.context);
   assert.equal(globalModeState.current.classifierModel, null);
   assert.equal(globalModeState.current.classifierThinkingLevel, "high");
   const result = await harness.invoke({ toolName: "bash", input: { command: "sudo -n true" } });
@@ -577,18 +571,17 @@ test("keeps the global auto-mode state across new sessions, forks, reloads, and 
   const firstSession = createHarness({ hasUI: true, globalModeState });
 
   await firstSession.startSession({ type: "session_start", reason: "startup" });
-  assert.equal(firstSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high, web on)");
-  await firstSession.commands.get("automode").handler("web off", firstSession.context);
+  assert.equal(firstSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high)");
 
   const nextSession = createHarness({ hasUI: true, globalModeState });
   await nextSession.startSession({ type: "session_start", reason: "fork" });
-  assert.equal(nextSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high, web off)");
+  assert.equal(nextSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high)");
 
   await nextSession.startSession({ type: "session_start", reason: "reload" });
   nextSession.handlers.get("session_tree")({}, nextSession.context);
-  assert.equal(nextSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high, web off)");
+  assert.equal(nextSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high)");
 
-  await nextSession.commands.get("automode").handler("off", nextSession.context);
+  await nextSession.commands.get("automode-settings").handler("off", nextSession.context);
   const resumedSession = createHarness({ hasUI: true, globalModeState });
   await resumedSession.startSession({ type: "session_start", reason: "resume" });
   assert.equal(resumedSession.statuses.get("permission-gate"), undefined);
@@ -596,24 +589,18 @@ test("keeps the global auto-mode state across new sessions, forks, reloads, and 
 
 test("automode toggles and reports its state", async () => {
   const harness = createHarness({ hasUI: true });
-  const command = harness.commands.get("automode");
+  const command = harness.commands.get("automode-settings");
 
   await command.handler("on", harness.context);
   assert.equal(harness.notifications.at(-1).message.includes("enabled"), true);
   assert.deepEqual(harness.modeEntries()[0].data, {
     autoModeEnabled: true,
-    webVerificationEnabled: true,
     classifierModel: { provider: "github-copilot", id: "gpt-5.6-luna" },
     classifierThinkingLevel: "high",
   });
 
-  await command.handler("web off", harness.context);
-  assert.match(harness.notifications.at(-1).message, /web verification disabled/);
-  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high, web off)");
-
   await command.handler("status", harness.context);
   assert.match(harness.notifications.at(-1).message, /is ON/);
-  assert.match(harness.notifications.at(-1).message, /web verification is OFF/);
 
   await command.handler("off", harness.context);
   assert.match(harness.notifications.at(-1).message, /disabled/);
@@ -654,7 +641,7 @@ test("discovers text models for picker and autocomplete, supports slash-containi
   });
 
   await harness.startSession();
-  const command = harness.commands.get("automode");
+  const command = harness.commands.get("automode-settings");
   const completions = command.getArgumentCompletions("model ");
   assert.deepEqual(completions.slice(0, 2).map((item) => item.value), ["reset", "github-copilot/gpt-5.6-luna"]);
   assert.ok(completions.some((item) => item.value === "vertex/gemini/flash-2"));
@@ -674,10 +661,86 @@ test("discovers text models for picker and autocomplete, supports slash-containi
   await command.handler("model reset", harness.context);
   assert.deepEqual(globalModeState.current, {
     autoModeEnabled: true,
-    webVerificationEnabled: true,
     classifierModel: { provider: "github-copilot", id: "gpt-5.6-luna" },
     classifierThinkingLevel: "high",
   });
+});
+
+test("exposes one auto-mode settings command", () => {
+  const harness = createHarness();
+  assert.equal(harness.commands.has("automode-settings"), true);
+  for (const alias of ["automode", "automode-model", "automode-thinking", "automode-prompt", "automode-preferences"]) {
+    assert.equal(harness.commands.has(alias), false, alias);
+  }
+});
+
+test("central auto-mode settings command groups configuration", async () => {
+  const harness = createHarness({ hasUI: true, editedPreferences: "- Prefer bounded changes" });
+  const command = harness.commands.get("automode-settings");
+
+  await harness.startSession();
+  await command.handler("status", harness.context);
+  assert.match(harness.notifications.at(-1).message, /auto mode is ON/);
+
+  await command.handler("preferences Prefer bounded changes", harness.context);
+  assert.match(harness.notifications.at(-1).message, /preference note/);
+  await command.handler("prompt", harness.context);
+  assert.equal(harness.editorCalls.at(-1).title, "Auto-mode classifier prompt (close without saving)");
+});
+
+test("edits preference notes from the unified settings page", async () => {
+  const globalPreferences = { current: "- Existing preference" };
+  const harness = createHarness({
+    hasUI: true,
+    mode: "rpc",
+    globalPreferences,
+    editedPreferences: "- Edited preference",
+    selectResponses: [
+      "Classifier preferences - 1 note",
+      "Edit preference notes",
+      "Cancel",
+    ],
+  });
+
+  await harness.startSession();
+  await harness.commands.get("automode-settings").handler("", harness.context);
+
+  assert.equal(globalPreferences.current, "- Edited preference");
+  assert.equal(harness.editorCalls.at(-1).title, "Edit auto-mode classifier preference notes");
+  assert.equal(harness.editorCalls.at(-1).initialValue, "- Existing preference");
+});
+
+test("opens the unified settings entry point and exposes active command patterns", async () => {
+  const harness = createHarness({
+    hasUI: true,
+    mode: "rpc",
+    globalRules: {
+      current: {
+        allowedCommands: ["npm test*"],
+        disallowedCommands: ["npm publish*"],
+      },
+    },
+    editedRules: JSON.stringify({
+      allowedCommands: ["npm test*", "uv run python*"],
+      disallowedCommands: ["npm publish*"],
+    }),
+    selectResponses: [
+      "Command rules - 1 allowed / 1 denied",
+      "Allowed - npm test*",
+      "Cancel",
+    ],
+    ruleSaveChoice: "Apply to this session only",
+  });
+
+  await harness.startSession();
+  await harness.commands.get("automode-settings").handler("", harness.context);
+
+  assert.equal(harness.selectCalls[0].title, "Permission Gate Settings");
+  assert.ok(harness.selectCalls[0].options.some((option) => option.startsWith("Command rules - 1 allowed / 1 denied")));
+  assert.equal(harness.selectCalls[1].title, "Command rules (global)");
+  assert.ok(harness.selectCalls[1].options.includes("Allowed - npm test*"));
+  assert.ok(harness.selectCalls[1].options.includes("Denied - npm publish*"));
+  assert.match(harness.notifications.at(-1).message, /session only/);
 });
 
 test("model picker and completions only expose scoped text models", async () => {
@@ -693,11 +756,11 @@ test("model picker and completions only expose scoped text models", async () => 
   });
 
   await harness.startSession();
-  const modelCommand = harness.commands.get("automode-model");
-  assert.deepEqual(modelCommand.getArgumentCompletions("").map((item) => item.value), ["reset", "scoped/model"]);
-  assert.equal(modelCommand.getArgumentCompletions("").some((item) => item.value.includes("registry-only")), false);
+  const modelCommand = harness.commands.get("automode-settings");
+  assert.deepEqual(modelCommand.getArgumentCompletions("model ").map((item) => item.value), ["reset", "scoped/model"]);
+  assert.equal(modelCommand.getArgumentCompletions("model ").some((item) => item.value.includes("registry-only")), false);
 
-  await modelCommand.handler("", harness.context);
+  await modelCommand.handler("model", harness.context);
   assert.deepEqual(harness.selectCalls[0].options, ["scoped/model - scoped - Scoped Model"]);
   assert.equal(harness.refreshCalls, 0);
   assert.doesNotMatch(harness.notifications.at(-1).message, /registry-only/);
@@ -707,14 +770,14 @@ test("warns instead of opening the picker when the session has no scoped models"
   const harness = createHarness({ hasUI: true, scopedModels: [] });
 
   await harness.startSession();
-  await harness.commands.get("automode-model").handler("", harness.context);
+  await harness.commands.get("automode-settings").handler("model", harness.context);
 
   assert.equal(harness.selectCalls.length, 0);
   assert.match(harness.notifications.at(-1).message, /no scoped models/i);
   assert.match(harness.notifications.at(-1).message, /--models/);
 });
 
-test("registers discoverable classifier selector commands and keeps aliases", async () => {
+test("central settings expose classifier selectors", async () => {
   const globalModeState = { current: undefined };
   const models = [
     { provider: "github-copilot", id: "gpt-5.6-luna", name: "GPT-5.6 Luna", input: ["text"], reasoning: true },
@@ -729,52 +792,38 @@ test("registers discoverable classifier selector commands and keeps aliases", as
   });
 
   await harness.startSession();
-  const modelCommand = harness.commands.get("automode-model");
-  const thinkingCommand = harness.commands.get("automode-thinking");
-  assert.equal(modelCommand.description, "Choose the auto-mode classifier model");
-  assert.equal(thinkingCommand.description, "Configure the auto-mode classifier thinking level");
-  assert.deepEqual(modelCommand.getArgumentCompletions("re").map((item) => item.value), ["reset"]);
-  assert.deepEqual(thinkingCommand.getArgumentCompletions("ma").map((item) => item.value), ["max"]);
+  const command = harness.commands.get("automode-settings");
+  assert.equal(command.description, "Open permission-gate settings or configure them directly");
+  assert.deepEqual(command.getArgumentCompletions("model re").map((item) => item.value), ["reset"]);
+  assert.deepEqual(command.getArgumentCompletions("thinking ma").map((item) => item.value), ["max"]);
 
-  await modelCommand.handler("", harness.context);
+  await command.handler("model", harness.context);
   assert.equal(harness.selectCalls[0].title, "Select the auto-mode classifier model:");
   assert.deepEqual(globalModeState.current.classifierModel, { provider: "vertex", id: "gemini/flash" });
 
-  await thinkingCommand.handler("", harness.context);
+  await command.handler("thinking", harness.context);
   assert.equal(harness.selectCalls[1].title, "Select the auto-mode classifier thinking level:");
   assert.equal(globalModeState.current.classifierThinkingLevel, "medium");
-
-  const alias = createHarness({
-    hasUI: true,
-    models,
-    modelChoice: "vertex/gemini/flash - vertex - Gemini Flash",
-    thinkingChoice: "low - supported",
-    globalModeState: { current: undefined },
-  });
-  await alias.startSession();
-  await alias.commands.get("automode").handler("model", alias.context);
-  await alias.commands.get("automode").handler("thinking low", alias.context);
-  assert.deepEqual(alias.selectCalls.map((call) => call.title), ["Select the auto-mode classifier model:"]);
-  assert.equal(alias.modeEntries().at(-1).data.classifierThinkingLevel, "low");
 });
 
-test("dedicated classifier selector commands support direct noninteractive forms", async () => {
+test("central settings support direct noninteractive model and thinking forms", async () => {
   const globalModeState = { current: undefined };
   const models = [
     { provider: "vertex", id: "gemini/flash", name: "Gemini Flash", input: ["text"], reasoning: true },
   ];
   const harness = createHarness({ hasUI: false, mode: "json", models, globalModeState });
   await harness.startSession();
+  const command = harness.commands.get("automode-settings");
 
-  await harness.commands.get("automode-model").handler("vertex/gemini/flash", harness.context);
-  await harness.commands.get("automode-thinking").handler("medium", harness.context);
+  await command.handler("model vertex/gemini/flash", harness.context);
+  await command.handler("thinking medium", harness.context);
   assert.deepEqual(globalModeState.current.classifierModel, { provider: "vertex", id: "gemini/flash" });
   assert.equal(globalModeState.current.classifierThinkingLevel, "medium");
   assert.equal(harness.selectCalls.length, 0);
 
   const savedState = { ...globalModeState.current };
-  await harness.commands.get("automode-model").handler("", harness.context);
-  await harness.commands.get("automode-thinking").handler("", harness.context);
+  await command.handler("model", harness.context);
+  await command.handler("thinking", harness.context);
   assert.equal(harness.selectCalls.length, 0);
   assert.deepEqual(globalModeState.current, savedState);
 });
@@ -785,7 +834,7 @@ test("configures, reports, validates, persists, and resets classifier thinking",
     globalModeState,
     classifierText: '{"decision":"allow","rationale":"The configured classifier level was applied."}',
   });
-  const command = harness.commands.get("automode");
+  const command = harness.commands.get("automode-settings");
   harness.context.thinkingLevel = "medium";
 
   await harness.startSession();
@@ -794,18 +843,18 @@ test("configures, reports, validates, persists, and resets classifier thinking",
   assert.equal(globalModeState.current.classifierThinkingLevel, "max");
   assert.equal(harness.modeEntries().at(-1).data.classifierThinkingLevel, "max");
   assert.match(harness.notifications.at(-1).message, /thinking max -> high/);
-  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking max -> high, web on)");
+  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking max -> high)");
 
   const persistedAfterSet = { ...globalModeState.current };
-  await command.handler("thinking", harness.context);
-  assert.match(harness.notifications.at(-1).message, /configured as max and effective as high/);
+  await command.handler("status", harness.context);
+  assert.match(harness.notifications.at(-1).message, /thinking max -> high/);
   assert.deepEqual(globalModeState.current, persistedAfterSet);
 
   await command.handler("thinking invalid", harness.context);
-  assert.match(harness.notifications.at(-1).message, /Usage: \/automode thinking/);
+  assert.match(harness.notifications.at(-1).message, /Usage: \/automode-settings thinking/);
   assert.deepEqual(globalModeState.current, persistedAfterSet);
   await command.handler("thinking low extra", harness.context);
-  assert.match(harness.notifications.at(-1).message, /Usage: \/automode thinking/);
+  assert.match(harness.notifications.at(-1).message, /Usage: \/automode-settings thinking/);
   assert.deepEqual(globalModeState.current, persistedAfterSet);
 
   await command.handler("thinking reset", harness.context);
@@ -819,7 +868,6 @@ test("clamps classifier thinking using Pi's supported-level ordering", async () 
     const globalModeState = {
       current: {
         autoModeEnabled: true,
-        webVerificationEnabled: false,
         classifierModel: { provider: model.provider, id: model.id },
         classifierThinkingLevel: configuredLevel,
       },
@@ -898,7 +946,7 @@ test("persists classifier thinking across sessions", async () => {
   ];
   const first = createHarness({ hasUI: true, models, globalModeState });
   await first.startSession();
-  await first.commands.get("automode").handler("thinking medium", first.context);
+  await first.commands.get("automode-settings").handler("thinking medium", first.context);
   assert.equal(globalModeState.current.classifierThinkingLevel, "medium");
 
   const next = createHarness({
@@ -908,7 +956,7 @@ test("persists classifier thinking across sessions", async () => {
     classifierText: '{"decision":"allow","rationale":"The persisted level was used."}',
   });
   await next.startSession();
-  assert.equal(next.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking medium, web on)");
+  assert.equal(next.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking medium)");
   await next.invoke({ toolName: "bash", input: { command: "sudo -n true" } });
   assert.equal(next.classifierCalls[0].options.reasoning, "medium");
 });
@@ -927,10 +975,10 @@ test("opens the model picker in RPC mode when UI is available", async () => {
     globalModeState,
   });
 
-  await harness.commands.get("automode-model").handler("", harness.context);
+  await harness.commands.get("automode-settings").handler("model", harness.context);
   assert.equal(harness.refreshCalls, 0);
   assert.deepEqual(globalModeState.current.classifierModel, { provider: "vertex", id: "gemini/flash" });
-  await harness.commands.get("automode-thinking").handler("", harness.context);
+  await harness.commands.get("automode-settings").handler("thinking", harness.context);
   assert.equal(globalModeState.current.classifierThinkingLevel, "high");
   assert.deepEqual(harness.selectCalls.map((call) => call.title), [
     "Select the auto-mode classifier model:",
@@ -947,7 +995,7 @@ test("autocomplete only suggests valid next classifier-model arguments", async (
     ],
   });
   await harness.startSession();
-  const completions = harness.commands.get("automode").getArgumentCompletions;
+  const completions = harness.commands.get("automode-settings").getArgumentCompletions;
 
   assert.deepEqual(completions("model re").map((item) => item.value), ["reset"]);
   assert.equal(completions("model reset"), null);
@@ -973,7 +1021,7 @@ test("autocomplete only suggests valid next classifier-model arguments", async (
 });
 
 test("rejects a picker in noninteractive mode without changing state", async () => {
-  const globalModeState = { current: { autoModeEnabled: true, webVerificationEnabled: true } };
+  const globalModeState = { current: { autoModeEnabled: true } };
   const harness = createHarness({
     hasUI: false,
     mode: "json",
@@ -981,9 +1029,9 @@ test("rejects a picker in noninteractive mode without changing state", async () 
     models: [{ provider: "vertex", id: "gemini/flash", name: "Gemini Flash", input: ["text"], reasoning: false }],
   });
 
-  await harness.commands.get("automode").handler("model", harness.context);
+  await harness.commands.get("automode-settings").handler("model", harness.context);
   assert.equal(harness.refreshCalls, 0);
-  assert.deepEqual(globalModeState.current, { autoModeEnabled: true, webVerificationEnabled: true });
+  assert.deepEqual(globalModeState.current, { autoModeEnabled: true });
 });
 
 test("selects a direct model without changing Pi's active model and persists across sessions", async () => {
@@ -1002,7 +1050,7 @@ test("selects a direct model without changing Pi's active model and persists acr
   });
 
   await first.startSession();
-  await first.commands.get("automode").handler("model vertex/gemini/flash", first.context);
+  await first.commands.get("automode-settings").handler("model vertex/gemini/flash", first.context);
   assert.equal(first.refreshCalls, 1);
   assert.deepEqual(first.registryEvents.slice(-2), ["refresh", "getAvailable"]);
   assert.deepEqual(globalModeState.current.classifierModel, { provider: "vertex", id: "gemini/flash" });
@@ -1018,7 +1066,7 @@ test("selects a direct model without changing Pi's active model and persists acr
 
   const next = createHarness({ hasUI: true, models, activeModel, globalModeState });
   await next.startSession();
-  assert.equal(next.statuses.get("permission-gate"), "auto mode: ON (vertex/gemini/flash, thinking high -> off, web on)");
+  assert.equal(next.statuses.get("permission-gate"), "auto mode: ON (vertex/gemini/flash, thinking high -> off)");
   await next.invoke({ toolName: "bash", input: { command: "sudo -n true" } });
   assert.equal(next.classifierCalls[0].model.provider, "vertex");
   assert.equal(next.classifierCalls[0].model.id, "gemini/flash");
@@ -1031,7 +1079,6 @@ test("trims persisted model references before exact canonical matching", async (
     globalModeState: {
       current: {
         autoModeEnabled: true,
-        webVerificationEnabled: true,
         classifierModel: { provider: "  vertex  ", id: "  gemini/flash  " },
       },
     },
@@ -1051,7 +1098,6 @@ test("fails closed for a stale selected model without falling back", async () =>
     globalModeState: {
       current: {
         autoModeEnabled: true,
-        webVerificationEnabled: true,
         classifierModel: { provider: "vertex", id: "removed/model" },
       },
     },
@@ -1083,7 +1129,6 @@ test("uses provider.streamSimple with generic options and keyless ambient auth",
     globalModeState: {
       current: {
         autoModeEnabled: true,
-        webVerificationEnabled: false,
         classifierModel: { provider: "amazon-bedrock", id: "claude/ambient" },
         classifierThinkingLevel: "xhigh",
       },
@@ -1122,7 +1167,6 @@ test("fails closed on an unsuccessful request-auth resolution", async () => {
     globalModeState: {
       current: {
         autoModeEnabled: true,
-        webVerificationEnabled: true,
         classifierModel: { provider: "vertex", id: "gemini/flash" },
       },
     },
@@ -1135,42 +1179,4 @@ test("fails closed on an unsuccessful request-auth resolution", async () => {
   assert.match(result.reason, /authentication.*unavailable/i);
   assert.doesNotMatch(result.reason, /secret-token/);
   assert.equal(harness.classifierCalls.length, 0);
-});
-
-test("uses the selected classifier for both calls around fixed web verification", async () => {
-  const models = [
-    { provider: "vertex", id: "gemini/flash", name: "Gemini Flash", input: ["text"], reasoning: true },
-    { provider: "github-copilot", id: "gpt-5.6-luna", name: "GPT-5.6 Luna", input: ["text"], reasoning: true },
-  ];
-  const harness = createHarness({
-    hasUI: true,
-    models,
-    webSearchAvailable: true,
-    globalModeState: {
-      current: {
-        autoModeEnabled: true,
-        webVerificationEnabled: true,
-        classifierModel: { provider: "vertex", id: "gemini/flash" },
-        classifierThinkingLevel: "max",
-      },
-    },
-    classifierTexts: [
-      '{"decision":"deny","needs_web_search":true,"search_query":"package safety","rationale":"The package identity needs verification."}',
-      '{"decision":"allow","rationale":"The web evidence supports this bounded operation."}',
-    ],
-  });
-
-  await harness.startSession();
-  const result = await harness.invoke({ toolName: "bash", input: { command: "npx example-package --help" } });
-  assert.equal(result, undefined);
-  assert.equal(harness.classifierCalls.length, 2);
-  assert.deepEqual(harness.classifierCalls.map((call) => `${call.model.provider}/${call.model.id}`), [
-    "vertex/gemini/flash",
-    "vertex/gemini/flash",
-  ]);
-  assert.equal(harness.classifierCalls[0].options.reasoning, "high");
-  assert.equal(harness.classifierCalls[1].options.reasoning, "high");
-  assert.match(harness.decisionEntries()[0].data.model, /thinking max -> high/);
-  assert.equal(harness.execCalls[0].args[harness.execCalls[0].args.indexOf("--model") + 1], "github-copilot/gpt-5.6-luna");
-  assert.equal(harness.execCalls[0].args[harness.execCalls[0].args.indexOf("--thinking") + 1], "high");
 });
