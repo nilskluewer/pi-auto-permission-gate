@@ -9,6 +9,12 @@ import {
   parseAutoModeDecision,
 } from "../extensions/permission-gate.ts";
 
+test("user command patterns match regex metacharacters literally", () => {
+  const rules = { allowedCommands: ["npx foo.bar+baz"], disallowedCommands: [] };
+  assert.deepEqual(matchedReasons("npx foo.bar+baz", rules), []);
+  assert.deepEqual(matchedReasons("npx fooXbar+baz", rules), ["package runner"]);
+});
+
 function createHarness({
   hasUI = false,
   mode = "tui",
@@ -22,8 +28,8 @@ function createHarness({
   models = [
     {
       provider: "github-copilot",
-      id: "gpt-5.6-luna",
-      name: "GPT-5.6 Luna",
+      id: "gpt-6-luna",
+      name: "GPT-6 Luna",
       input: ["text"],
       reasoning: true,
     },
@@ -230,12 +236,117 @@ test("recognizes soft and hard permission rules", () => {
   assert.deepEqual(matchedReasons("rtk uv run mypy"), []);
   assert.ok(matchedReasons("uv run python script.py").includes("package execution or publish"));
   assert.deepEqual(matchedReasons("npm install ruff"), []);
-  assert.deepEqual(matchedReasons("rm -rf build", undefined, "/tmp/project"), []);
+  assert.ok(matchedReasons("rm -rf build", undefined, "/tmp/project").includes("recursive/forced rm"));
   assert.deepEqual(matchedReasons("find build -type f -delete", undefined, "/tmp/project"), []);
   assert.ok(matchedReasons("rm -rf ../outside", undefined, "/tmp/project").includes("recursive/forced rm"));
   assert.ok(matchedReasons("find . -delete", undefined, "/tmp/project").includes("find delete"));
   assert.ok(matchedReasons("rtk uv run pytest && rm -rf /tmp/example").includes("recursive/forced rm"));
   assert.ok(hardDenyReasons("rm -rf /").includes("recursive delete of a system or home root"));
+});
+
+test("file deletions from the reported session are not hard-denied", async () => {
+  const project = "/Users/A200048/GitLab/AISE/skill-workspace";
+  const references = "skills/snowflake-query/references";
+  const python = "/Users/A200048/GitLab/AISE/lea-goldhamster/lea/.venv/bin/python";
+  const commands = [
+    `set -e
+cd ${project}
+test "$(git branch --show-current)" = feat/snowflake-query-skill
+test -z "$(git status --porcelain)"
+launchctl bootout gui/$(id -u)/com.a200048.skill-workspace.autocommit
+git rm ${references}/lea.md ${references}/root.md
+${python} /Users/A200048/.pi/agent/skills/snowflake-query/scripts/test_run_query.py
+${python.replace(/python$/, "ruff")} check --select E4,E7,E9,F,I skills/snowflake-query/scripts
+${python.replace(/python$/, "ruff")} format --check skills/snowflake-query/scripts
+if rg -n -i '\\b(lea|root|aise|a_user|databaseconnection)\\b' skills/snowflake-query --glob '*.md' --glob '*.py'; then
+  printf 'Unexpected repository-specific reference\\n'; exit 1
+fi
+git diff --cached --check
+git diff --cached --stat
+git commit -m 'refactor(skills): remove repository-specific Snowflake adapters'
+git push origin feat/snowflake-query-skill`,
+    `/bin/rm ${project}/${references}/lea.md ${project}/${references}/root.md`,
+  ];
+  const harness = createHarness({
+    classifierText: '{"decision":"allow","rationale":"Delete only the two requested files."}',
+  });
+  await harness.startSession();
+  for (const command of commands) {
+    assert.deepEqual(hardDenyReasons(command), [], command);
+    assert.equal(await harness.invoke({ toolName: "bash", input: { command } }), undefined, command);
+  }
+  assert.equal(harness.classifierCalls.length, 1);
+  assert.equal(harness.decisionEntries()[0].data.source, "auto-model");
+});
+
+test("rm recursion rules match option tokens, not paths or the next command", () => {
+  for (const command of [
+    "rm /Users/me/project/snowflake-query/file.md /Users/me/project/other.md",
+    "git rm snowflake-query/file.md\n/usr/bin/true",
+    "rm --force /Users/me/project/file.md",
+    "rm file.md\n--recursive /",
+    "rm -r build\n/usr/bin/true",
+    'rm snowflake-query/file.md "$file"',
+    "rm --force '$file'",
+  ]) {
+    assert.deepEqual(hardDenyReasons(command), [], command);
+  }
+  for (const command of [
+    "rm --force /Users/me/project/file.md",
+    "rm file.md\n--recursive /",
+    "rm /Users/me/project/snowflake-query/file.md /Users/me/project/other.md",
+  ]) {
+    assert.equal(matchedReasons(command).includes("recursive/forced rm"), false, command);
+  }
+  for (const option of ["-r", "-rf", "-fr", "-R", "--recursive", '"-rf"', "'--recursive'"]) {
+    const command = `/bin/rm ${option} /`;
+    assert.ok(hardDenyReasons(command).includes("recursive delete of a system or home root"), command);
+    assert.ok(matchedReasons(command).includes("recursive/forced rm"), command);
+    assert.ok(hardDenyReasons(`rm ${option} "$unknown"`).includes("unresolved recursive delete target"));
+    assert.ok(matchedReasons(`rm build ${option}; true`).includes("recursive/forced rm"));
+  }
+});
+
+test("recursive rm always needs the classifier", () => {
+  const cwd = "/Users/me/project";
+  for (const command of [
+    "rm -rf build",
+    "rm -rf /tmp/example",
+    'rm -rf "/private/tmp/lea-gitleaks"',
+    "rm -r dist",
+    "rm --recursive dist",
+  ]) {
+    assert.ok(matchedReasons(command, undefined, cwd).includes("recursive/forced rm"), command);
+    // User allow patterns cannot skip the classifier for recursive rm.
+    const rules = { allowedCommands: ["rm *"], disallowedCommands: [] };
+    assert.ok(matchedReasons(command, rules, cwd).includes("recursive/forced rm"), command);
+  }
+  // Temp targets are not hard-denied, so they reach the classifier.
+  assert.deepEqual(hardDenyReasons("rm -rf /private/tmp/lea-gitleaks"), []);
+  assert.ok(hardDenyReasons("rm -rf /private/tmp/../etc").includes("recursive delete of a system or home root"));
+
+  // mktemp variables are resolved for the hard-deny layer, so the classifier decides
+  // (real blocked commands from error reports).
+  for (const command of [
+    'tmpdir=$(mktemp -d) && PI_CODING_AGENT_DIR="$tmpdir" node x.mjs; rm -rf "$tmpdir"',
+    "set +e\nTMP_CACHE=$(mktemp -d /tmp/ty-uv-cache.XXXXXX)\ntrap 'rm -rf \"$TMP_CACHE\"' EXIT\nuvx ty",
+    'tmp=$(mktemp -d /tmp/root-review-XXXX); printf x > "$tmp/a.py"; rm -rf "${tmp}"',
+    'rm -rf "$TMPDIR/build"',
+  ]) {
+    assert.deepEqual(hardDenyReasons(command), [], command);
+  }
+  // Reassignment, expansion tricks, globs, and escapes keep the hard deny.
+  for (const command of [
+    'tmp=$(mktemp -d); tmp=/; rm -rf "$tmp"',
+    'tmp=$(mktemp -d); read tmp; rm -rf "$tmp"',
+    'tmp=$(mktemp -d); rm -rf "${tmp:-/}"',
+    'tmp=$(mktemp -d); rm -rf "$tmp"/*',
+    'tmp=$(mktemp -d); rm -rf "$tmp/../.."',
+    'TMPDIR=/ rm -rf "$TMPDIR"',
+    'dir=$(pwd); rm -rf "$dir"',
+  ]) {
+    assert.ok(hardDenyReasons(command).length > 0, command);
+  }
   assert.ok(hardDenyReasons('rm -rf "${HOME}"').includes("recursive delete of a system or home root"));
   assert.ok(hardDenyReasons("rm -rf /{etc,usr}").includes("unresolved recursive delete target"));
   assert.ok(hardDenyReasons('rm -rf "$(printf /)"').includes("unresolved recursive delete target"));
@@ -333,7 +444,6 @@ test("allows local verification commands without the classifier", async () => {
     "rtk uv run pytest",
     "rtk uv run ruff check .",
     "rtk uv run mypy",
-    "rm -rf build",
     "find build -type f -delete",
     "npm install ruff",
     "uv pip install ruff",
@@ -355,7 +465,7 @@ test("blocks dangerous commands without a UI when auto mode is off", async () =>
 
   const result = await harness.invoke({
     toolName: "bash",
-    input: { command: "rm -rf /tmp/example" },
+    input: { command: "rm -rf ../example" },
   });
 
   assert.equal(result.block, true);
@@ -410,7 +520,7 @@ test("injects persisted auto-mode preference notes into classifier prompts", asy
   await harness.startSession();
   const result = await harness.invoke({
     toolName: "bash",
-    input: { command: "rm -rf /tmp/example" },
+    input: { command: "rm -rf ../example" },
   });
 
   assert.equal(result, undefined);
@@ -457,23 +567,23 @@ test("shows the classifier prompt with injected preferences", async () => {
 test("auto mode approves a soft-deny command with the configured model", async () => {
   const harness = createHarness({
     hasUI: true,
-    classifierText: '{"decision":"allow","rationale":"The target is a scoped temporary directory."}',
+    classifierText: '{"decision":"allow","rationale":"The target is a scoped sibling directory."}',
   });
 
   await harness.commands.get("automode-settings").handler("on", harness.context);
   const result = await harness.invoke({
     toolName: "bash",
-    input: { command: "rm -rf /tmp/example" },
+    input: { command: "rm -rf ../example" },
   });
 
   assert.equal(result, undefined);
   assert.equal(harness.classifierCalls.length, 1);
-  assert.equal(harness.classifierCalls[0].model.id, "gpt-5.6-luna");
+  assert.equal(harness.classifierCalls[0].model.id, "gpt-6-luna");
   assert.equal(harness.classifierCalls[0].options.reasoning, "high");
   assert.equal(harness.decisionEntries()[0].data.status, "approved");
   assert.equal(harness.decisionEntries()[0].data.source, "auto-model");
-  assert.match(harness.decisionEntries()[0].data.model, /github-copilot\/gpt-5\.6-luna \(thinking high\)/);
-  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high)");
+  assert.match(harness.decisionEntries()[0].data.model, /github-copilot\/gpt-6-luna \(thinking high\)/);
+  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-6-luna, thinking high)");
 });
 
 test("auto mode blocks a denied soft-deny command and records the rationale", async () => {
@@ -526,7 +636,7 @@ test("loads persisted auto-mode state with default classifier settings", async (
   });
 
   assert.equal(result, undefined);
-  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high)");
+  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-6-luna, thinking high)");
   assert.deepEqual(globalModeState.current, { autoModeEnabled: true });
 });
 
@@ -545,7 +655,7 @@ test("preserves malformed classifier state without default substitution", async 
   await harness.commands.get("automode-settings").handler("status", harness.context);
   assert.match(harness.notifications.at(-1).message, /auto mode is OFF/);
   assert.match(harness.notifications.at(-1).message, /unavailable classifier model/);
-  assert.doesNotMatch(harness.notifications.at(-1).message, /github-copilot\/gpt-5\.6-luna/);
+  assert.doesNotMatch(harness.notifications.at(-1).message, /github-copilot\/gpt-6-luna/);
   assert.deepEqual(globalModeState.current, {
     autoModeEnabled: false,
     classifierModel: { provider: "", id: "" },
@@ -566,15 +676,15 @@ test("keeps the global auto-mode state across new sessions, forks, reloads, and 
   const firstSession = createHarness({ hasUI: true, globalModeState });
 
   await firstSession.startSession({ type: "session_start", reason: "startup" });
-  assert.equal(firstSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high)");
+  assert.equal(firstSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-6-luna, thinking high)");
 
   const nextSession = createHarness({ hasUI: true, globalModeState });
   await nextSession.startSession({ type: "session_start", reason: "fork" });
-  assert.equal(nextSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high)");
+  assert.equal(nextSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-6-luna, thinking high)");
 
   await nextSession.startSession({ type: "session_start", reason: "reload" });
   nextSession.handlers.get("session_tree")({}, nextSession.context);
-  assert.equal(nextSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking high)");
+  assert.equal(nextSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-6-luna, thinking high)");
 
   await nextSession.commands.get("automode-settings").handler("off", nextSession.context);
   const resumedSession = createHarness({ hasUI: true, globalModeState });
@@ -590,8 +700,9 @@ test("automode toggles and reports its state", async () => {
   assert.equal(harness.notifications.at(-1).message.includes("enabled"), true);
   assert.deepEqual(harness.modeEntries()[0].data, {
     autoModeEnabled: true,
-    classifierModel: { provider: "github-copilot", id: "gpt-5.6-luna" },
+    classifierModel: { provider: "github-copilot", id: "gpt-6-luna" },
     classifierThinkingLevel: "high",
+    classifierHistoryMessages: 12,
   });
 
   await command.handler("status", harness.context);
@@ -613,8 +724,8 @@ test("discovers text models for picker and autocomplete, supports slash-containi
     },
     {
       provider: "github-copilot",
-      id: "gpt-5.6-luna",
-      name: "GPT-5.6 Luna",
+      id: "gpt-6-luna",
+      name: "GPT-6 Luna",
       input: ["text"],
       reasoning: true,
     },
@@ -638,7 +749,7 @@ test("discovers text models for picker and autocomplete, supports slash-containi
   await harness.startSession();
   const command = harness.commands.get("automode-settings");
   const completions = command.getArgumentCompletions("model ");
-  assert.deepEqual(completions.slice(0, 2).map((item) => item.value), ["reset", "github-copilot/gpt-5.6-luna"]);
+  assert.deepEqual(completions.slice(0, 2).map((item) => item.value), ["reset", "github-copilot/gpt-6-luna"]);
   assert.ok(completions.some((item) => item.value === "vertex/gemini/flash-2"));
   assert.equal(completions.some((item) => item.value === "image-provider/image-model"), false);
   assert.match(completions.find((item) => item.value === "vertex/gemini/flash-2").description, /Google Vertex/);
@@ -656,8 +767,9 @@ test("discovers text models for picker and autocomplete, supports slash-containi
   await command.handler("model reset", harness.context);
   assert.deepEqual(globalModeState.current, {
     autoModeEnabled: true,
-    classifierModel: { provider: "github-copilot", id: "gpt-5.6-luna" },
+    classifierModel: { provider: "github-copilot", id: "gpt-6-luna" },
     classifierThinkingLevel: "high",
+    classifierHistoryMessages: 12,
   });
 });
 
@@ -924,7 +1036,7 @@ test("configures, reports, validates, persists, and resets classifier thinking",
   assert.equal(globalModeState.current.classifierThinkingLevel, "max");
   assert.equal(harness.modeEntries().at(-1).data.classifierThinkingLevel, "max");
   assert.match(harness.notifications.at(-1).message, /thinking max -> high/);
-  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking max -> high)");
+  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-6-luna, thinking max -> high)");
 
   const persistedAfterSet = { ...globalModeState.current };
   await command.handler("status", harness.context);
@@ -1022,7 +1134,7 @@ test("clamps classifier thinking using Pi's supported-level ordering", async () 
 test("persists classifier thinking across sessions", async () => {
   const globalModeState = { current: undefined };
   const models = [
-    { provider: "github-copilot", id: "gpt-5.6-luna", name: "GPT-5.6 Luna", input: ["text"], reasoning: true },
+    { provider: "github-copilot", id: "gpt-6-luna", name: "GPT-6 Luna", input: ["text"], reasoning: true },
     { provider: "vertex", id: "gemini/flash", name: "Gemini Flash", input: ["text"], reasoning: true },
   ];
   const first = createHarness({ hasUI: true, models, globalModeState });
@@ -1037,7 +1149,7 @@ test("persists classifier thinking across sessions", async () => {
     classifierText: '{"decision":"allow","rationale":"The persisted level was used."}',
   });
   await next.startSession();
-  assert.equal(next.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-5.6-luna, thinking medium)");
+  assert.equal(next.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-6-luna, thinking medium)");
   await next.invoke({ toolName: "bash", input: { command: "sudo -n true" } });
   assert.equal(next.classifierCalls[0].options.reasoning, "medium");
 });
@@ -1099,6 +1211,100 @@ test("autocomplete only suggests valid next classifier-model arguments", async (
   assert.deepEqual(completions("thinking re").map((item) => item.value), ["reset"]);
   assert.equal(completions("thinking max"), null);
   assert.equal(completions("thinking max extra"), null);
+});
+
+test("configures, reports, validates, persists, and resets context history messages", async () => {
+  const globalModeState = { current: undefined };
+  const harness = createHarness({
+    hasUI: true,
+    globalModeState,
+    classifierText: '{"decision":"allow","rationale":"Context history count configured."}',
+  });
+  const command = harness.commands.get("automode-settings");
+
+  await harness.startSession();
+  assert.equal(globalModeState.current.classifierHistoryMessages, 12);
+
+  await command.handler("history 20", harness.context);
+  assert.equal(globalModeState.current.classifierHistoryMessages, 20);
+  assert.equal(harness.modeEntries().at(-1).data.classifierHistoryMessages, 20);
+  assert.match(harness.notifications.at(-1).message, /20 previous messages/);
+
+  await command.handler("status", harness.context);
+  assert.match(harness.notifications.at(-1).message, /context history: 20 messages/);
+
+  await command.handler("history 0", harness.context);
+  assert.equal(globalModeState.current.classifierHistoryMessages, 0);
+  assert.match(harness.notifications.at(-1).message, /0 previous messages/);
+
+  await command.handler("history invalid", harness.context);
+  assert.match(harness.notifications.at(-1).message, /Usage: \/automode-settings history/);
+  assert.equal(globalModeState.current.classifierHistoryMessages, 0);
+
+  await command.handler("history 999", harness.context);
+  assert.match(harness.notifications.at(-1).message, /Usage: \/automode-settings history/);
+  assert.equal(globalModeState.current.classifierHistoryMessages, 0);
+
+  await command.handler("history reset", harness.context);
+  assert.equal(globalModeState.current.classifierHistoryMessages, 12);
+  assert.match(harness.notifications.at(-1).message, /12 previous messages/);
+});
+
+test("passes configured number of previous messages to classifier prompt", async () => {
+  const branch = [
+    { type: "message", message: { role: "user", content: [{ type: "text", text: "msg-1" }] } },
+    { type: "message", message: { role: "assistant", content: [{ type: "text", text: "msg-2" }] } },
+    { type: "message", message: { role: "user", content: [{ type: "text", text: "msg-3" }] } },
+    { type: "message", message: { role: "assistant", content: [{ type: "text", text: "msg-4" }] } },
+    { type: "message", message: { role: "user", content: [{ type: "text", text: "msg-5" }] } },
+  ];
+  const globalModeState = {
+    current: {
+      autoModeEnabled: true,
+      classifierModel: { provider: "github-copilot", id: "gpt-6-luna" },
+      classifierThinkingLevel: "high",
+      classifierHistoryMessages: 2,
+    },
+  };
+  const harness = createHarness({
+    hasUI: false,
+    branch,
+    globalModeState,
+    classifierText: '{"decision":"allow","rationale":"Command is safe."}',
+  });
+
+  await harness.startSession();
+  await harness.invoke({ toolName: "bash", input: { command: "sudo -n true" } });
+
+  const sentPrompt = harness.classifierCalls[0].request.messages[0].content[0].text;
+  assert.doesNotMatch(sentPrompt, /msg-1/);
+  assert.doesNotMatch(sentPrompt, /msg-2/);
+  assert.doesNotMatch(sentPrompt, /msg-3/);
+  assert.match(sentPrompt, /msg-4/);
+  assert.match(sentPrompt, /msg-5/);
+});
+
+test("configures context history messages via settings dialog and select completions", async () => {
+  const globalModeState = { current: undefined };
+  const harness = createHarness({
+    hasUI: true,
+    mode: "rpc",
+    globalModeState,
+    selectResponses: [
+      "Context history messages - 12",
+      "20 messages",
+      "Cancel",
+    ],
+  });
+
+  await harness.startSession();
+  const command = harness.commands.get("automode-settings");
+  const completions = command.getArgumentCompletions("history ");
+  assert.ok(completions.some((item) => item.value === "reset"));
+  assert.ok(completions.some((item) => item.value === "20"));
+
+  await command.handler("", harness.context);
+  assert.equal(globalModeState.current.classifierHistoryMessages, 20);
 });
 
 test("rejects a picker in noninteractive mode without changing state", async () => {
@@ -1239,6 +1445,68 @@ test("uses provider.streamSimple with generic options and keyless ambient auth",
   assert.deepEqual(harness.providerCalls[0].options.headers, { "x-ambient": "true", "x-request": "true" });
   assert.deepEqual(harness.providerCalls[0].options.env, { AWS_PROFILE: "test", AWS_REGION: "test-region" });
   assert.equal(harness.context.model, activeModel);
+});
+
+test("prefers model-specific requestAuth baseUrl over providerAuth baseUrl", async () => {
+  const selectedModel = {
+    provider: "github-copilot",
+    id: "gpt-5.6-luna",
+    name: "GPT-5.6 Luna",
+    input: ["text"],
+    reasoning: true,
+    baseUrl: "https://api.individual.githubcopilot.com",
+  };
+  const harness = createHarness({
+    hasUI: false,
+    useComplete: false,
+    models: [selectedModel],
+    globalModeState: {
+      current: {
+        autoModeEnabled: true,
+        classifierModel: { provider: "github-copilot", id: "gpt-5.6-luna" },
+      },
+    },
+    providerAuth: {
+      "github-copilot": {
+        auth: { apiKey: "tok", baseUrl: "https://api.fallback.githubcopilot.com" },
+      },
+    },
+    requestAuth: {
+      "github-copilot": {
+        ok: true,
+        apiKey: "tok",
+        baseUrl: "https://api.business.githubcopilot.com",
+      },
+    },
+    classifierText: '{"decision":"allow","rationale":"BaseUrl override verified."}',
+  });
+
+  await harness.startSession();
+  const result = await harness.invoke({ toolName: "bash", input: { command: "sudo -n true" } });
+  assert.equal(result, undefined);
+  assert.equal(harness.providerCalls.length, 1);
+  assert.equal(harness.providerCalls[0].model.baseUrl, "https://api.business.githubcopilot.com");
+});
+
+test("classifier prompt reinforces strict json schema output directive", async () => {
+  const harness = createHarness({
+    hasUI: false,
+    globalModeState: {
+      current: {
+        autoModeEnabled: true,
+        classifierModel: { provider: "github-copilot", id: "gpt-6-luna" },
+      },
+    },
+    classifierText: '{"decision":"allow","rationale":"Safe inspect command."}',
+  });
+
+  await harness.startSession();
+  await harness.invoke({ toolName: "bash", input: { command: "sudo -n true" } });
+
+  assert.equal(harness.classifierCalls.length, 1);
+  const promptText = harness.classifierCalls[0].request.messages[0].content[0].text;
+  assert.match(promptText, /Return exactly one JSON object and no markdown or extra text\./);
+  assert.match(promptText, /\{"decision":"allow"\|"deny","rationale":"short explanation"\}/);
 });
 
 test("fails closed on an unsuccessful request-auth resolution", async () => {

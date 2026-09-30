@@ -13,6 +13,7 @@ export type PermissionSettingsAction =
 	| { type: "auto-mode"; value: "on" | "off" }
 	| { type: "classifier-model"; value: string }
 	| { type: "classifier-thinking"; value: string }
+	| { type: "history-messages"; value: number }
 	| { type: "command-rules"; value: "edit" | "list" | "reset" }
 	| { type: "preferences"; value: "edit" | "add" | "list" | "clear" }
 	| { type: "prompt" };
@@ -25,6 +26,8 @@ export interface PermissionSettingsView {
 	classifierModelOptions: readonly PermissionSettingsOption[];
 	classifierThinking: string;
 	classifierThinkingOptions: readonly PermissionSettingsOption[];
+	classifierHistoryMessages: number;
+	classifierHistoryMessageOptions: readonly PermissionSettingsOption[];
 	ruleScope: string;
 	allowedCommands: readonly string[];
 	disallowedCommands: readonly string[];
@@ -96,6 +99,21 @@ function createSettingsComponent(
 				),
 		},
 		{
+			id: "history-messages",
+			label: "Context history messages",
+			description: "Configure how many recent messages from the conversation the classifier receives.",
+			currentValue: `${state.classifierHistoryMessages} message${state.classifierHistoryMessages === 1 ? "" : "s"}`,
+			submenu: (_currentValue, submenuDone) =>
+				createSelectComponent(
+					tui,
+					theme,
+					"Select the number of context history messages for the classifier",
+					state.classifierHistoryMessageOptions,
+					(value) => submenuDone(value),
+					() => submenuDone(),
+				),
+		},
+		{
 			id: "command-rules",
 			label: "Command rules",
 			description: `View and edit user-defined allow and deny patterns (${state.ruleScope} scope).`,
@@ -144,6 +162,9 @@ function createSettingsComponent(
 				done({ type: "classifier-model", value });
 			} else if (id === "classifier-thinking") {
 				done({ type: "classifier-thinking", value });
+			} else if (id === "history-messages") {
+				const count = Number.parseInt(value, 10);
+				if (!Number.isNaN(count)) done({ type: "history-messages", value: count });
 			} else if (id === "command-rules" && isCommandRulesAction(value)) {
 				done({ type: "command-rules", value });
 			} else if (id === "preferences" && isPreferencesAction(value)) {
@@ -345,6 +366,7 @@ async function openPermissionSettingsWithDialogs(
 		`Automatic safety decisions - ${state.autoModeEnabled ? "on" : "off"}`,
 		`Classifier model - ${state.classifierModel}`,
 		`Classifier thinking - ${state.classifierThinking}`,
+		`Context history messages - ${state.classifierHistoryMessages}`,
 		`Command rules - ${state.allowedCommands.length} allowed / ${state.disallowedCommands.length} denied`,
 		`Classifier preferences - ${formatPreferenceCount(state.preferences)}`,
 		"View classifier prompt",
@@ -381,9 +403,20 @@ async function openPermissionSettingsWithDialogs(
 		const option = state.classifierThinkingOptions.find((item) => item.label === selected);
 		return option ? { type: "classifier-thinking", value: option.value } : undefined;
 	}
-	if (index === 3) return openRulesWithDialogs(ctx, state, cancel);
-	if (index === 4) return openPreferencesWithDialogs(ctx, state, cancel);
-	if (index === 5) return { type: "prompt" };
+	if (index === 3) {
+		const selected = await ctx.ui.select("Select the number of context history messages for the classifier", [
+			...state.classifierHistoryMessageOptions.map((option) => option.label),
+			cancel,
+		]);
+		if (!selected || selected === cancel) return undefined;
+		const option = state.classifierHistoryMessageOptions.find((item) => item.label === selected);
+		if (!option) return undefined;
+		const parsed = Number.parseInt(option.value, 10);
+		return Number.isNaN(parsed) ? undefined : { type: "history-messages", value: parsed };
+	}
+	if (index === 4) return openRulesWithDialogs(ctx, state, cancel);
+	if (index === 5) return openPreferencesWithDialogs(ctx, state, cancel);
+	if (index === 6) return { type: "prompt" };
 	return undefined;
 }
 

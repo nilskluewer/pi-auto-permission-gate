@@ -81,6 +81,7 @@ type ModeState = {
 	// null represents an explicitly malformed persisted model reference.
 	classifierModel: ClassifierModelReference | null;
 	classifierThinkingLevel: ClassifierThinkingLevel;
+	classifierHistoryMessages?: number;
 };
 
 type CommandRuleConfig = {
@@ -126,7 +127,7 @@ type DecisionEntry = {
 
 const AUTO_MODE_SETTINGS_COMMAND = "automode-settings";
 const AUTO_MODE_MODEL_PROVIDER = "github-copilot";
-const AUTO_MODE_MODEL_ID = "gpt-5.6-luna";
+const AUTO_MODE_MODEL_ID = "gpt-6-luna";
 const DEFAULT_CLASSIFIER_THINKING_LEVEL: ClassifierThinkingLevel = "high";
 const DEFAULT_CLASSIFIER_MODEL: ClassifierModelReference = {
 	provider: AUTO_MODE_MODEL_PROVIDER,
@@ -140,10 +141,16 @@ const DECISION_ENTRY_TYPE = "permission-gate-decision";
 const GLOBAL_MODE_STATE_FILENAME = "permission-gate.json";
 const RULES_FILE_NAME = "permission-gate-rules.json";
 const AUTO_MODE_PREFERENCES_FILE_NAME = "automode-preferences.md";
+const DEFAULT_CLASSIFIER_HISTORY_MESSAGES = 12;
+const MIN_CLASSIFIER_HISTORY_MESSAGES = 0;
+const MAX_CLASSIFIER_HISTORY_MESSAGES = 100;
+const CLASSIFIER_HISTORY_CHOICES = [0, 2, 4, 6, 8, 12, 16, 20, 30, 50];
+
 const DEFAULT_MODE_STATE: ModeState = {
 	autoModeEnabled: true,
 	classifierModel: { ...DEFAULT_CLASSIFIER_MODEL },
 	classifierThinkingLevel: DEFAULT_CLASSIFIER_THINKING_LEVEL,
+	classifierHistoryMessages: DEFAULT_CLASSIFIER_HISTORY_MESSAGES,
 };
 const DEFAULT_COMMAND_RULE_CONFIG: CommandRuleConfig = {
 	allowedCommands: [
@@ -207,7 +214,7 @@ function commandGlobToRegExp(pattern: string): RegExp {
 	for (const character of pattern) {
 		if (character === "*") source += "[\\s\\S]*";
 		else if (character === "?") source += "[\\s\\S]";
-		else source += character.replace(/[\\^$\\\\.+()[\]{}|]/g, "\\\\$&");
+		else source += character.replace(/[\\^$.+()[\]{}|]/g, "\\$&");
 	}
 	return new RegExp(`${source}$`, "i");
 }
@@ -235,7 +242,9 @@ function evaluateUserCommandRules(
 	return undefined;
 }
 
-const LOCAL_DELETION_REASONS = new Set(["recursive/forced rm", "find delete"]);
+// Recursive rm always needs the classifier (or the user when auto mode is off):
+// neither user allow patterns nor scoped-deletion shortcuts can skip it.
+const CLASSIFIER_REQUIRED_REASON = "recursive/forced rm";
 const PATH_GLOB_CHARACTERS = /[*?\[\]{}]/;
 const FIND_NARROWING_PREDICATES = new Set([
 	"-atime",
@@ -276,26 +285,6 @@ function isSafeRelativeDeletionTarget(target: string, cwd: string, allowCurrentD
 	return Boolean(relativeTarget) && relativeTarget !== ".." && !relativeTarget.startsWith(`..${sep}`) && !relativeTarget.startsWith(sep);
 }
 
-function isScopedRmCommand(command: string, cwd: string): boolean {
-	if (SHELL_CONTROL_CHARACTERS.test(command) || PATH_GLOB_CHARACTERS.test(command)) return false;
-	const tokens = command.trim().split(/[ \t]+/).filter(Boolean);
-	if (tokens.shift()?.toLowerCase() !== "rm") return false;
-
-	let optionsEnded = false;
-	const targets: string[] = [];
-	for (const token of tokens) {
-		if (!optionsEnded && token === "--") {
-			optionsEnded = true;
-			continue;
-		}
-		if (!optionsEnded && token.startsWith("-")) continue;
-		if (token.startsWith("-")) return false;
-		targets.push(token);
-	}
-
-	return targets.length > 0 && targets.every((target) => isSafeRelativeDeletionTarget(target, cwd, false));
-}
-
 function isScopedFindDeleteCommand(command: string, cwd: string): boolean {
 	if (SHELL_CONTROL_CHARACTERS.test(command) || PATH_GLOB_CHARACTERS.test(command)) return false;
 	const tokens = command.trim().split(/[ \t]+/).filter(Boolean);
@@ -310,15 +299,12 @@ function isScopedFindDeleteCommand(command: string, cwd: string): boolean {
 	return roots.length > 0 && roots.every((root) => isSafeRelativeDeletionTarget(root, cwd, hasNarrowingPredicate));
 }
 
-function isScopedLocalDeletionCommand(command: string, cwd: string): boolean {
-	return isScopedRmCommand(command, cwd) || isScopedFindDeleteCommand(command, cwd);
-}
 
 const dangerousPatterns: DangerousPattern[] = [
 	// File deletion / destructive filesystem traversal
 	{
 		name: "recursive/forced rm",
-		pattern: /\brm\b(?=[^\n;&|]*\s-(?:[^\s;&|]*[rR][^\s;&|]*[fF]?|[^\s;&|]*[fF][^\s;&|]*[rR])\b|[^\n;&|]*\s--recursive\b)/i,
+		pattern: /\brm\b(?=[^\n;&|]*[ \t]+["']?(?:-[a-z]*r[a-z]*|--recursive)["']?(?=[\s;&|]|$))/i,
 	},
 	{ name: "remove Git metadata", pattern: /\brm\b[^\n;&|]*\s(?:\.git|\.git\/|['"]\.git['"])/i },
 	{ name: "find delete", pattern: /\bfind\b[^\n;&|]*\s-delete\b/i },
@@ -390,6 +376,8 @@ const dangerousPatterns: DangerousPattern[] = [
 	},
 ];
 
+// rm options must be whole tokens, not hyphens inside paths. Use horizontal
+// whitespace before options and targets so matches cannot cross command lines.
 // These operations are never delegated to a language model.
 // The list is deliberately small and reserved for catastrophic targets where an
 // automatic approval would be unsafe even with clear-looking surrounding context.
@@ -397,11 +385,11 @@ const hardDenyPatterns: DangerousPattern[] = [
 	{
 		name: "recursive delete of a system or home root",
 		pattern:
-			/\brm\b[^\n;&|]*(?:--recursive|-[^\s;&|]*[rR][^\s;&|]*)[^\n;&|]*\s+["']?(?:\/|~|\$HOME|\$\{HOME\}|\/(?:Users|home|root|System|Applications|Library|etc|usr|var|bin|sbin|opt|private|Volumes))(?:["']?(?:\s|$)|\/)/i,
+			/\brm\b[^\n;&|]*[ \t]+["']?(?:--recursive|-[a-z]*r[a-z]*)["']?(?=[\s;&|]|$)[^\n;&|]*[ \t]+["']?(?!\/private\/tmp\/(?![^\s"';&|]*\.\.)[^\s"';&|])(?:\/|~|\$HOME|\$\{HOME\}|\/(?:Users|home|root|System|Applications|Library|etc|usr|var|bin|sbin|opt|private|Volumes))(?:["']?(?:\s|$)|\/)/i,
 	},
 	{
 		name: "unresolved recursive delete target",
-		pattern: /\brm\b(?=[^\n;&|]*(?:--recursive|-[^\s;&|]*[rR][^\s;&|]*))(?=[^\n;&|]*(?:\$\(|\$\{|\$[A-Za-z_]|\$['"]|~[A-Za-z]|[`*?\[\]]|\{[^}]*,))[^\n;&|]*/i,
+		pattern: /\brm\b(?=[^\n;&|]*[ \t]+["']?(?:--recursive|-[a-z]*r[a-z]*)["']?(?=[\s;&|]|$))(?=[^\n;&|]*(?:\$\(|\$\{|\$[A-Za-z_]|\$['"]|~[A-Za-z]|[`*?\[\]]|\{[^}]*,))[^\n;&|]*/i,
 	},
 	{ name: "filesystem format or signature wipe", pattern: /\b(?:mkfs(?:\.[a-z0-9_+-]+)?|wipefs)\b/i },
 	{ name: "disk device overwrite", pattern: /\bdd\b[^\n;&|]*\bof\s*=\s*["']?\/dev\//i },
@@ -680,6 +668,7 @@ function getClassifierModelCompletions(
 		{ value: "status", label: "status", description: "Show auto mode and classifier status" },
 		{ value: "model", label: "model", description: "Choose the auto-mode classifier model" },
 		{ value: "thinking", label: "thinking", description: "Configure classifier thinking level" },
+		{ value: "history", label: "history", description: "Configure number of previous messages sent to classifier" },
 		{ value: "prompt", label: "prompt", description: "Show the classifier prompt" },
 		{ value: "preferences", label: "preferences", description: "Edit classifier preference notes" },
 	];
@@ -695,6 +684,25 @@ function getClassifierModelCompletions(
 		const thinkingPrefix = tokens.length === 1 ? "" : `${tokens[1]}${trailingSpace ? " " : ""}`;
 		return getClassifierThinkingCompletions(thinkingPrefix);
 	}
+	if (action === "history") {
+		if (tokens.length > 2) return null;
+		const historyPrefix = (tokens.length === 1 ? "" : tokens[1] ?? "").toLowerCase();
+		const historyItems: CommandCompletion[] = CLASSIFIER_HISTORY_CHOICES.map((n) => ({
+			value: String(n),
+			label: String(n),
+			description: `${n} previous messages`,
+		}));
+		const resetItem: CommandCompletion = {
+			value: "reset",
+			label: "reset",
+			description: `Restore default (${DEFAULT_CLASSIFIER_HISTORY_MESSAGES} messages)`,
+		};
+		if (tokens.length === 1 && trailingSpace) return [resetItem, ...historyItems];
+		return [
+			...(resetItem.value.startsWith(historyPrefix) ? [resetItem] : []),
+			...historyItems.filter((item) => item.value.startsWith(historyPrefix)),
+		];
+	}
 	if (action !== "model") return null;
 	if (tokens.length > 2) return null;
 
@@ -703,17 +711,39 @@ function getClassifierModelCompletions(
 }
 
 export function matchedReasons(command: string, rules: CommandRuleConfig = DEFAULT_COMMAND_RULE_CONFIG, cwd?: string): string[] {
-	if (evaluateUserCommandRules(command, rules)?.decision === "allow") return [];
-
 	const reasons = unique(dangerousPatterns.filter(({ pattern }) => pattern.test(command)).map(({ name }) => name));
-	if (cwd && isScopedLocalDeletionCommand(command, cwd)) {
-		return reasons.filter((reason) => !LOCAL_DELETION_REASONS.has(reason));
-	}
+	if (reasons.includes(CLASSIFIER_REQUIRED_REASON)) return reasons;
+	if (evaluateUserCommandRules(command, rules)?.decision === "allow") return [];
+	if (cwd && isScopedFindDeleteCommand(command, cwd)) return reasons.filter((reason) => reason !== "find delete");
 	return reasons;
 }
 
+const TEMPORARY_PLACEHOLDER = "/tmp/permission-gate-temporary";
+
+// Treat $TMPDIR and variables assigned once from `$(mktemp ...)` as resolved temp paths,
+// so `tmp=$(mktemp -d); ...; rm -rf "$tmp"` is not hard-denied. The soft rules and the
+// classifier still review the full command. Any reassignment, parameter expansion, or
+// `..` after the variable keeps it unresolved.
+function resolveTemporaryVariables(command: string): string {
+	const names = new Set(["TMPDIR"]);
+	for (const match of command.matchAll(/(?<![\w$])([A-Za-z_]\w*)=["']?\$\(\s*mktemp\b[^)]*\)["']?/g)) names.add(match[1]);
+
+	let resolved = command;
+	for (const name of names) {
+		const bareWords = command.match(new RegExp(`(?<![\\w\${/.-])${name}\\b`, "g"))?.length ?? 0;
+		if (bareWords !== (name === "TMPDIR" ? 0 : 1)) continue;
+		if (new RegExp(`\\$\\{${name}[^}]`).test(command)) continue;
+		resolved = resolved.replace(
+			new RegExp(`\\$(?:\\{${name}\\}|${name}\\b)(?![^\\s"';&|]*\\.\\.)`, "g"),
+			TEMPORARY_PLACEHOLDER,
+		);
+	}
+	return resolved;
+}
+
 export function hardDenyReasons(command: string): string[] {
-	return unique(hardDenyPatterns.filter(({ pattern }) => pattern.test(command)).map(({ name }) => name));
+	const resolved = resolveTemporaryVariables(command);
+	return unique(hardDenyPatterns.filter(({ pattern }) => pattern.test(resolved)).map(({ name }) => name));
 }
 
 function extractText(content: unknown): string {
@@ -752,11 +782,15 @@ export function parseAutoModeDecision(raw: string): ParsedAutoDecision | undefin
 	};
 }
 
-function extractRecentConversation(ctx: { sessionManager: { getBranch: () => unknown[] } }): string {
+function extractRecentConversation(
+	ctx: { sessionManager: { getBranch: () => unknown[] } },
+	historyMessages = DEFAULT_CLASSIFIER_HISTORY_MESSAGES,
+): string {
+	if (historyMessages <= 0) return "(no recent user or assistant text available)";
 	const sections: string[] = [];
 	const branch = ctx.sessionManager.getBranch();
 
-	for (const entry of branch.slice(-12)) {
+	for (const entry of branch.slice(-historyMessages)) {
 		if (!entry || typeof entry !== "object" || (entry as { type?: unknown }).type !== "message") continue;
 
 		const message = (entry as { message?: { role?: unknown; content?: unknown } }).message;
@@ -766,7 +800,7 @@ function extractRecentConversation(ctx: { sessionManager: { getBranch: () => unk
 		if (text) sections.push(`${String(message.role)}: ${text}`);
 	}
 
-	const context = sections.slice(-6).join("\n\n");
+	const context = sections.join("\n\n");
 	return truncate(context || "(no recent user or assistant text available)", MAX_RECENT_CONTEXT_LENGTH);
 }
 
@@ -775,6 +809,7 @@ function buildClassifierPrompt(
 	reasons: string[],
 	ctx: { cwd: string; sessionManager: { getBranch: () => unknown[] } },
 	preferences: string,
+	historyMessages = DEFAULT_CLASSIFIER_HISTORY_MESSAGES,
 ): string {
 	return [
 		"Classify this proposed bash tool call.",
@@ -798,12 +833,15 @@ function buildClassifierPrompt(
 		"</command>",
 		"",
 		"<recent_conversation_context>",
-		extractRecentConversation(ctx),
+		extractRecentConversation(ctx, historyMessages),
 		"</recent_conversation_context>",
+		"",
+		"Return exactly one JSON object and no markdown or extra text.",
+		'{"decision":"allow"|"deny","rationale":"short explanation"}',
 	].join("\n");
 }
 
-export function buildAutoModePrompt(preferences = ""): string {
+export function buildAutoModePrompt(preferences = "", historyMessages = DEFAULT_CLASSIFIER_HISTORY_MESSAGES): string {
 	const templateContext = {
 		cwd: "<working directory>",
 		sessionManager: { getBranch: () => [] },
@@ -813,6 +851,7 @@ export function buildAutoModePrompt(preferences = ""): string {
 		["<matched permission rules>"],
 		templateContext,
 		preferences,
+		historyMessages,
 	);
 	return [
 		"SYSTEM PROMPT",
@@ -859,6 +898,7 @@ async function requestClassifierDecision(
 	reasons: string[],
 	ctx: { cwd: string; signal?: AbortSignal; sessionManager: { getBranch: () => unknown[] } },
 	preferences: string,
+	historyMessages = DEFAULT_CLASSIFIER_HISTORY_MESSAGES,
 ): Promise<ParsedAutoDecision | undefined> {
 	if (ctx.signal?.aborted) return undefined;
 	const response = await complete(
@@ -868,7 +908,7 @@ async function requestClassifierDecision(
 			messages: [
 				{
 					role: "user",
-					content: [{ type: "text", text: buildClassifierPrompt(command, reasons, ctx, preferences) }],
+					content: [{ type: "text", text: buildClassifierPrompt(command, reasons, ctx, preferences, historyMessages) }],
 					timestamp: Date.now(),
 				},
 			],
@@ -897,6 +937,7 @@ async function classifyWithModel(
 	classifierModel: ClassifierModelReference | null,
 	classifierThinkingLevel: ClassifierThinkingLevel,
 	preferences: string,
+	classifierHistoryMessages = DEFAULT_CLASSIFIER_HISTORY_MESSAGES,
 ): Promise<{
 	decision: "allow" | "deny";
 	rationale: string;
@@ -953,13 +994,14 @@ async function classifyWithModel(
 
 		const headers = { ...(providerAuth.auth.headers ?? {}), ...(modelRequestAuth.headers ?? {}) };
 		const env = { ...(providerAuth.env ?? {}), ...(modelRequestAuth.env ?? {}) };
+		const effectiveBaseUrl = modelRequestAuth.baseUrl ?? providerAuth.auth.baseUrl;
 		auth = {
 			...(providerAuth.auth.apiKey || modelRequestAuth.apiKey
 				? { apiKey: modelRequestAuth.apiKey ?? providerAuth.auth.apiKey }
 				: {}),
 			...(Object.keys(headers).length > 0 ? { headers } : {}),
 			...(Object.keys(env).length > 0 ? { env } : {}),
-			...(providerAuth.auth.baseUrl ? { baseUrl: providerAuth.auth.baseUrl } : {}),
+			...(effectiveBaseUrl ? { baseUrl: effectiveBaseUrl } : {}),
 		};
 	} catch {
 		return {
@@ -981,6 +1023,7 @@ async function classifyWithModel(
 			reasons,
 			ctx,
 			preferences,
+			classifierHistoryMessages,
 		);
 		if (!result) {
 			return {
@@ -1016,6 +1059,12 @@ function getGlobalModeStatePath(): string {
 	return join(getAgentConfigDirectory(), GLOBAL_MODE_STATE_FILENAME);
 }
 
+function parseClassifierHistoryMessages(value: unknown): number | undefined {
+	if (typeof value !== "number" || !Number.isInteger(value)) return undefined;
+	if (value < MIN_CLASSIFIER_HISTORY_MESSAGES || value > MAX_CLASSIFIER_HISTORY_MESSAGES) return undefined;
+	return value;
+}
+
 function parseModeState(value: unknown): ModeState | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const candidate = value as Partial<ModeState>;
@@ -1032,10 +1081,15 @@ function parseModeState(value: unknown): ModeState | undefined {
 			: typeof candidate.classifierThinkingLevel === "string" && isClassifierThinkingLevel(candidate.classifierThinkingLevel)
 				? candidate.classifierThinkingLevel
 				: DEFAULT_CLASSIFIER_THINKING_LEVEL;
+	const classifierHistoryMessages =
+		candidate.classifierHistoryMessages === undefined
+			? DEFAULT_CLASSIFIER_HISTORY_MESSAGES
+			: parseClassifierHistoryMessages(candidate.classifierHistoryMessages) ?? DEFAULT_CLASSIFIER_HISTORY_MESSAGES;
 	return {
 		autoModeEnabled: candidate.autoModeEnabled,
 		classifierModel,
 		classifierThinkingLevel,
+		classifierHistoryMessages,
 	};
 }
 
@@ -1349,6 +1403,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 	let autoModeEnabled = false;
 	let classifierModel = cloneClassifierModelReference(DEFAULT_CLASSIFIER_MODEL);
 	let classifierThinkingLevel = DEFAULT_CLASSIFIER_THINKING_LEVEL;
+	let classifierHistoryMessages = DEFAULT_CLASSIFIER_HISTORY_MESSAGES;
 	let autoModePreferences = "";
 	let availableClassifierModels: AvailableClassifierModel[] = [];
 	let scopedClassifierModels: AvailableClassifierModel[] = [];
@@ -1362,6 +1417,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			autoModeEnabled,
 			classifierModel: cloneClassifierModelReference(classifierModel),
 			classifierThinkingLevel,
+			classifierHistoryMessages,
 		};
 		persistModeState(pi, state);
 		if (!(await persistGlobalModeState(dependencies, state))) {
@@ -1588,9 +1644,69 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		);
 	};
 
+	const handleClassifierHistoryCommand = async (args: string, ctx: ExtensionContext): Promise<void> => {
+		const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
+		if (parts.length === 0 && !canPromptForSelection(ctx)) {
+			notify(
+				ctx,
+				`Choosing context history message count requires interactive mode. Use /${AUTO_MODE_SETTINGS_COMMAND} history <number> instead.`,
+				"warning",
+			);
+			return;
+		}
+
+		if (parts.length === 0) {
+			const choices = CLASSIFIER_HISTORY_CHOICES.map(
+				(n) => `${n} message${n === 1 ? "" : "s"}${n === classifierHistoryMessages ? " (current)" : ""}`,
+			);
+			choices.push(`reset - Restore ${DEFAULT_CLASSIFIER_HISTORY_MESSAGES} (default)`);
+			const choice = await ctx.ui.select("Select the number of context history messages for the classifier:", choices);
+			if (!choice) return;
+			if (choice.startsWith("reset")) {
+				classifierHistoryMessages = DEFAULT_CLASSIFIER_HISTORY_MESSAGES;
+			} else {
+				const count = Number.parseInt(choice, 10);
+				if (Number.isNaN(count)) return;
+				classifierHistoryMessages = count;
+			}
+		} else {
+			if (parts.length !== 1) {
+				notify(
+					ctx,
+					`Usage: /${AUTO_MODE_SETTINGS_COMMAND} history [0-${MAX_CLASSIFIER_HISTORY_MESSAGES}|reset]`,
+					"warning",
+				);
+				return;
+			}
+
+			const requested = parts[0].toLowerCase();
+			if (requested === "reset") {
+				classifierHistoryMessages = DEFAULT_CLASSIFIER_HISTORY_MESSAGES;
+			} else {
+				const count = Number.parseInt(requested, 10);
+				if (Number.isNaN(count) || count < MIN_CLASSIFIER_HISTORY_MESSAGES || count > MAX_CLASSIFIER_HISTORY_MESSAGES || String(count) !== requested) {
+					notify(
+						ctx,
+						`Usage: /${AUTO_MODE_SETTINGS_COMMAND} history [0-${MAX_CLASSIFIER_HISTORY_MESSAGES}|reset]`,
+						"warning",
+					);
+					return;
+				}
+				classifierHistoryMessages = count;
+			}
+		}
+
+		await persistMode(ctx);
+		notify(
+			ctx,
+			`Permission gate classifier context history set to ${classifierHistoryMessages} previous message${classifierHistoryMessages === 1 ? "" : "s"}.`,
+			"info",
+		);
+	};
+
 	const handleAutoModePromptCommand = async (ctx: ExtensionContext): Promise<void> => {
 		await refreshAutoModePreferences(ctx);
-		const prompt = buildAutoModePrompt(autoModePreferences);
+		const prompt = buildAutoModePrompt(autoModePreferences, classifierHistoryMessages);
 		if (ctx.hasUI) {
 			await ctx.ui.editor("Auto-mode classifier prompt (close without saving)", prompt);
 			return;
@@ -1656,6 +1772,10 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			await handleClassifierThinkingCommand(parts.slice(1).join(" "), ctx);
 			return;
 		}
+		if (first === "history") {
+			await handleClassifierHistoryCommand(parts.slice(1).join(" "), ctx);
+			return;
+		}
 		if (first === "prompt") {
 			if (parts.length !== 1) {
 				notify(ctx, `Usage: /${AUTO_MODE_SETTINGS_COMMAND} prompt`, "warning");
@@ -1679,7 +1799,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			const selected = findAvailableClassifierModel(availableClassifierModels, classifierModel);
 			notify(
 				ctx,
-				`Permission gate auto mode is ${autoModeEnabled ? "ON" : "OFF"}; classifier model is ${formatClassifierModelLabel(classifierModel, selected, classifierThinkingLevel)}.`,
+				`Permission gate auto mode is ${autoModeEnabled ? "ON" : "OFF"}; classifier model is ${formatClassifierModelLabel(classifierModel, selected, classifierThinkingLevel)}; context history: ${classifierHistoryMessages} message${classifierHistoryMessages === 1 ? "" : "s"}.`,
 				"info",
 			);
 			setAutoModeStatus(ctx, autoModeEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
@@ -1687,7 +1807,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		} else {
 			notify(
 				ctx,
-				`Usage: /${AUTO_MODE_SETTINGS_COMMAND} [on|off|status|model [provider/model-id|reset]|thinking [level|reset]|prompt|preferences [text|list|clear]]`,
+				`Usage: /${AUTO_MODE_SETTINGS_COMMAND} [on|off|status|model [provider/model-id|reset]|thinking [level|reset]|history [count|reset]|prompt|preferences [text|list|clear]]`,
 				"warning",
 			);
 			return;
@@ -1834,6 +1954,20 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		});
 	};
 
+	const getPermissionSettingsHistoryOptions = (): PermissionSettingsOption[] => {
+		const options: PermissionSettingsOption[] = CLASSIFIER_HISTORY_CHOICES.map((n) => ({
+			value: String(n),
+			label: n === classifierHistoryMessages ? `${n} messages (current)` : `${n} messages`,
+			description: `Send the last ${n} messages from the conversation`,
+		}));
+		options.push({
+			value: String(DEFAULT_CLASSIFIER_HISTORY_MESSAGES),
+			label: `reset (${DEFAULT_CLASSIFIER_HISTORY_MESSAGES} messages)`,
+			description: "Restore the default history message limit",
+		});
+		return options;
+	};
+
 	const buildPermissionSettingsView = (ctx: ExtensionContext) => {
 		syncAvailableClassifierModels(ctx);
 		syncScopedClassifierModels(ctx);
@@ -1844,6 +1978,8 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			classifierModelOptions: getPermissionSettingsModelOptions(),
 			classifierThinking: formatClassifierThinkingLevel(classifierThinkingLevel, selected?.model),
 			classifierThinkingOptions: getPermissionSettingsThinkingOptions(),
+			classifierHistoryMessages,
+			classifierHistoryMessageOptions: getPermissionSettingsHistoryOptions(),
 			ruleScope,
 			allowedCommands: ruleConfig.allowedCommands,
 			disallowedCommands: ruleConfig.disallowedCommands,
@@ -1861,6 +1997,9 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				return;
 			case "classifier-thinking":
 				await handleClassifierThinkingCommand(action.value, ctx);
+				return;
+			case "history-messages":
+				await handleClassifierHistoryCommand(String(action.value), ctx);
 				return;
 			case "command-rules":
 				await handlePermissionRulesCommand(action.value, ctx);
@@ -1924,6 +2063,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		autoModeEnabled = restored.autoModeEnabled;
 		classifierModel = cloneClassifierModelReference(restored.classifierModel);
 		classifierThinkingLevel = restored.classifierThinkingLevel;
+		classifierHistoryMessages = restored.classifierHistoryMessages ?? DEFAULT_CLASSIFIER_HISTORY_MESSAGES;
 		autoModePreferences = loadedPreferences;
 		ruleConfig = loadedRules.config;
 		ruleScope = loadedRules.scope;
@@ -1974,7 +2114,8 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			return { block: true, reason: `${rationale} The command was blocked.` };
 		}
 
-		if (userRule?.decision === "allow" || reasons.length === 0) return undefined;
+		// matchedReasons() already applies user allow rules, except for classifier-required reasons.
+		if (reasons.length === 0) return undefined;
 
 		if (autoModeEnabled) {
 			await refreshAutoModePreferences(ctx);
@@ -1986,6 +2127,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				classifierModel,
 				classifierThinkingLevel,
 				autoModePreferences,
+				classifierHistoryMessages,
 			);
 			const approved = result.decision === "allow" && !ctx.signal?.aborted;
 			const rationale = approved

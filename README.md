@@ -26,7 +26,8 @@ It does not intercept Pi's direct `!` or `!!` shell commands, and it does not in
 | --- | --- | --- |
 | Local checks | `uv run pytest`, `rtk uv run ruff check .`, `uv run mypy` | Allowed |
 | Package installation, update, removal | `npm install`, `uv pip install`, `cargo add` | Allowed |
-| Scoped local deletion | `rm -rf build`, `find build -type f -delete` | Allowed when explicit relative targets stay below the current working directory |
+| Scoped local deletion | `find build -type f -delete` | Allowed when explicit relative targets stay below the current working directory |
+| Recursive rm | `rm -rf build`, `rm -rf /tmp/x`, `rm -rf "$tmp"` after `tmp=$(mktemp -d)` | Always checked by the classifier, or by the user when auto mode is off. Allow patterns cannot skip this check |
 | Other deletion | `.git` deletion, parent paths, roots, broad `find . -delete`, `xargs rm` | Checked or hard-blocked |
 | Package execution and publishing | `npm run`, `npm exec`, `npx`, `uvx`, `uv run python`, `npm publish` | Checked |
 | Privilege and permissions | `sudo`, `chmod 777`, recursive `chmod` or `chown` | Checked |
@@ -49,8 +50,10 @@ The gate checks bash tool calls for common destructive or high-impact operations
 - Removal of Git metadata.
 - `find -delete` and `xargs rm` patterns.
 
-Scoped local deletion is allowed by default when explicit relative targets stay below the current working directory.
-For example, `rm -rf build` and `find build -type f -delete` pass without confirmation.
+Scoped `find -delete` is allowed by default when explicit relative targets stay below the current working directory.
+For example, `find build -type f -delete` passes without confirmation.
+Recursive `rm` is never allowed without a check: the classifier, or the user when auto mode is off, must approve every `rm -r` or `rm -rf`.
+Variables assigned once from `$(mktemp ...)` and `$TMPDIR` are not hard-blocked, so the classifier can approve temp-directory cleanup.
 Parent paths, filesystem roots, `.git` metadata, shell expansions, globs, and broad `find . -delete` remain protected.
 - Package execution and publishing commands such as `npm run`, `npm publish`, and `npx`.
 - `sudo` and recursive `chmod` or `chown` commands.
@@ -94,7 +97,7 @@ The editor starts with the built-in local verification allowlist, and saving rep
 ```json
 {
   "allowedCommands": [
-    "rm -rf build*",
+    "make clean",
     "uv run python -m mypy*"
   ],
   "disallowedCommands": [
@@ -104,6 +107,7 @@ The editor starts with the built-in local verification allowlist, and saving rep
 ```
 
 The precedence is hard-deny rules, user disallowed patterns, user allowed patterns, then the built-in soft-deny rules.
+Exception: user allowed patterns cannot skip the check for recursive `rm`.
 Hard-deny rules cannot be overridden through the editor.
 
 The save menu supports the current session, a global default, or a trusted-project default.
@@ -129,6 +133,7 @@ The same command also supports direct forms:
 /automode-settings on|off|status
 /automode-settings model [provider/model-id|reset]
 /automode-settings thinking [level|reset]
+/automode-settings history [count|reset]
 /automode-settings prompt
 /automode-settings preferences [text|list|clear]
 ```
@@ -150,7 +155,7 @@ Choose the classifier with these central settings commands:
 `/automode-settings model` opens a model selector in TUI and RPC modes.
 `/automode-settings model provider/model-id` selects the exact provider and model ID and also works in noninteractive modes.
 The provider is the text before the first slash, so model IDs containing additional slashes are supported.
-`/automode-settings model reset` restores `github-copilot/gpt-5.6-luna`.
+`/automode-settings model reset` restores `github-copilot/gpt-6-luna`.
 The picker and model argument completions use only scoped text-capable models from the current Pi session.
 Configure a session model scope with Pi's `--models` option or the `enabledModels` setting before using the picker.
 Explicit `provider/model-id` arguments still resolve exact current models from Pi's model registry.
@@ -163,6 +168,19 @@ Configure classifier thinking independently from Pi's active conversation thinki
 /automode-settings thinking <off|minimal|low|medium|high|xhigh|max>
 /automode-settings thinking reset
 ```
+
+Configure how many previous conversation messages the classifier receives:
+
+```text
+/automode-settings history
+/automode-settings history <0-100>
+/automode-settings history reset
+```
+
+`/automode-settings history` opens a message count selector in TUI and RPC modes.
+The default and reset count is `12` messages (within token/length bounds).
+Setting `0` sends no previous messages.
+The value is persisted globally in `~/.pi/agent/permission-gate.json`.
 
 `/automode-settings thinking` opens a thinking-level selector in TUI and RPC modes.
 The selector marks levels supported by the selected classifier and shows the effective clamped level when a level is unsupported.
