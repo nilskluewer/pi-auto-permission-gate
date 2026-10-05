@@ -72,7 +72,8 @@ The built-in local verification allowlist includes these commands, with an optio
 - `uv run ruff check ...`.
 - `uv run mypy ...`.
 
-Allow patterns never match shell chaining, redirection, command substitution, or other shell control syntax.
+Allow patterns match a chained command (`&&`, `;`, `|`, `2>&1`, `> /dev/null`) only when every segment matches an allow pattern or is a plain `cd`, `tail`, `head`, `wc`, or `sleep`.
+Command substitution, heredocs, subshells, escapes, and redirects to files never match an allow pattern.
 
 The checks are intentionally conservative pattern checks rather than a shell parser or a sandbox.
 A command that matches a pattern is shown to the user for review, but confirmation does not make the command safe.
@@ -200,9 +201,12 @@ Pi's model support metadata controls clamping: non-reasoning models use `off`, s
 Clamping follows Pi's thinking-level ordering and the effective non-off level is passed to the classifier provider.
 Selecting a classifier or classifier thinking level does not change Pi's active model or conversation thinking level, and the extension never calls `pi.setModel()`.
 
-When auto mode is enabled, each soft-deny command is evaluated by the selected classifier.
-The classifier receives the command, matched rules, working directory, and a bounded extract of recent user and assistant text.
-The classifier has no direct tools and must return a strict JSON decision with a short rationale.
+When auto mode is enabled, each soft-deny command is evaluated by the selected classifier in two stages, like Claude Code auto mode.
+Stage 1 is a fast pass without reasoning that errs toward "deny". Only an "allow" ends there.
+Everything else goes to stage 2 with the configured thinking level. Commands that always need a human skip stage 1.
+The classifier is reasoning-blind. It receives the command, matched rules, working directory, the user's own recent messages, and the bash commands the agent already ran.
+It never sees assistant text or tool output, so the agent cannot argue with it and text planted in files cannot reach it.
+The classifier has no direct tools and must return a strict JSON decision: `decision`, `risk` (`low`, `medium`, `critical`), and a one-sentence `rationale` for the human approver.
 The decision is recorded in the chat as a session entry showing the command, matched rules, model, outcome, and rationale.
 The decision entry is kept out of the model's normal conversation context so it does not create a feedback loop.
 Auto-mode settings are persisted globally in `~/.pi/agent/permission-gate.json`, or under `PI_CODING_AGENT_DIR` when that environment variable is set.
@@ -210,13 +214,37 @@ The persisted classifier configuration contains only a reference such as `{"prov
 The model reset command persists the default reference and the thinking reset command persists `high`.
 The selected reference and configured thinking level are kept across new sessions, resumes, forks, reloads, and tree navigation.
 
-Auto mode fails closed if the selected model or provider is unavailable, the selected model becomes stale, authentication fails, the request is cancelled, the response is malformed, or the model is uncertain.
 A stale user-selected model never silently falls back to the default classifier.
-Malformed persisted classifier references remain observable as unavailable and fail closed until the user selects a model or resets the classifier.
+
+### Approval queue
+
+The classifier never blocks a command by itself. It either allows it or sends it to you.
+A command goes to you when the classifier says "deny", when its `risk` is `critical`, when it matches a critical rule (`sudo`, cloud or infrastructure changes such as `gcloud ... deploy`, `terraform apply`, `kubectl delete`, disk wipes), or when the classifier fails (provider error, cut-off output, malformed JSON, stale model, no authentication).
+Merges, pushes, and commits are not critical by themselves.
+
+In an interactive session the request is sent to one shared local approval queue and to the terminal at the same time. The first answer wins.
+The queue is a small local web server (`127.0.0.1`, random port) that all pi sessions on the machine share, so you watch one browser tab.
+The first request starts the server and opens the tab.
+Each card shows the risk, a one-sentence summary, the recommendation, the exact command, the matched rules, and the session.
+Critical cards are red and need a second click to approve. You can add a note for the agent when you deny.
+A request that nobody answers within 10 minutes counts as denied. Set `PI_PERMISSION_GATE_BROWSER=0` to use the terminal only.
+Without a UI, or when no approver can be reached, the command is blocked.
+
+The same page has a History tab with every decision: classifier approvals, hard-denies, rule denies, and your answers, with the summary, risk, source, and command. You can filter by approved or denied and search.
+The history is kept in `approval-history.jsonl` next to the queue state file, the last 500 entries.
+Run `/approvals` in pi to open the page.
+
+The agent sees only a generic message: the command was not approved, which rules matched, and an instruction not to retry it in another form.
+It never sees the classifier text. Your note, if any, is passed on.
+After 3 denials in a row or 20 in total, the gate goes into lockdown: every command needs your approval until you pick "Approve and lift lockdown" in the queue or "Yes, and lift lockdown" in the terminal.
+The agent cannot read the queue state file or call the queue API with bash. These commands are hard-denied.
+The `read` tool and other tools are not covered by this gate, so treat this as a guard against mistakes, not against a hostile agent.
 
 ### Hard-deny rules
 
-The following catastrophic operations are blocked without asking the model:
+The following catastrophic operations are blocked without asking the model or you:
+
+- Reading the approval queue state or calling its API.
 
 - Recursive deletion of system or home roots, including unresolved shell expansions or globs.
 - Filesystem formatting or filesystem signature wiping.
