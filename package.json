@@ -46,7 +46,9 @@
   },
   "scripts": {
     "pack:dry": "npm pack --dry-run",
-    "test": "node --experimental-strip-types --test tests/*.test.mjs"
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "prepublishOnly": "npm run smoke"
   },
   "publishConfig": {
     "access": "public",
