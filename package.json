@@ -48,7 +48,9 @@
     "pack:dry": "npm pack --dry-run",
     "test": "node --experimental-strip-types --test tests/*.test.mjs",
     "smoke": "node scripts/smoke.mjs",
-    "prepublishOnly": "npm run smoke"
+    "test:e2e": "node scripts/safety-e2e.mjs",
+    "test:dcg": "node --experimental-strip-types --test tests/dcg.test.mjs",
+    "prepublishOnly": "npm test && npm run test:e2e && npm run smoke"
   },
   "publishConfig": {
     "access": "public",

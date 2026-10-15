@@ -1,0 +1,55 @@
+# Managed policy for DCG 0.15.3, public test schema 1.
+# OBSERVE ONLY: --config can fall back to ambient configuration in this release.
+# No isolation claim; dcg.ts refuses enforce until that boundary is resolved.
+# Explicit leaves only; additions require destructive/safe-neighbor subprocess fixtures.
+[general]
+fail_closed = true
+unverified_decision = "deny"
+max_command_bytes = 1048576
+hook_timeout_ms = 3000
+check_updates = false
+self_heal_hook = false
+log_file = ""
+
+[packs]
+enabled = [
+  "core.git", "core.filesystem", "system.disk",
+  "remote.rsync", "storage.s3", "storage.gcs",
+  "database.postgresql", "database.mysql", "database.sqlite", "database.mongodb",
+  "database.redis", "database.snowflake", "database.bigquery", "database.supabase",
+  "containers.docker", "containers.compose", "containers.podman",
+  "infrastructure.terraform", "infrastructure.pulumi",
+  "kubernetes.kubectl", "kubernetes.helm", "cloud.aws", "cloud.gcp", "cloud.azure",
+]
+disabled = []
+custom_paths = []
+
+[policy]
+default_mode = "deny"
+
+[heredoc]
+enabled = true
+timeout_ms = 100
+max_body_bytes = 1048576
+fallback_on_parse_error = false
+fallback_on_timeout = false
+
+[agents.default]
+trust_level = "low"
+disabled_allowlist = true
+additional_allowlist = []
+extra_packs = []
+disabled_packs = []
+
+[agents.pi]
+trust_level = "low"
+disabled_allowlist = true
+additional_allowlist = []
+extra_packs = []
+disabled_packs = []
+
+[history]
+enabled = false
+
+[logging]
+enabled = false

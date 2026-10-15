@@ -51,14 +51,17 @@ async function startServer(env, existingDir) {
 	const stateFile = path.join(dir, "sub", "queue.json");
 	const child = spawnServer(stateFile, env);
 	let state;
-	for (let i = 0; i < 100 && !state; i++) {
+	// File writes and parent stdout data events are independent. A state file
+	// alone is not proof that the startup line has reached this process.
+	for (let i = 0; i < 100; i++) {
 		try {
 			state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-		} catch {
-			await sleep(50);
-		}
+		} catch {}
+		if (state?.pid === child.pid && child.stdoutText.includes("\n")) break;
+		await sleep(50);
 	}
-	assert.ok(state, "state file was written");
+	assert.equal(state?.pid, child.pid, "state file belongs to the started server");
+	assert.ok(child.stdoutText.includes("\n"), "startup line was received");
 	const base = `http://127.0.0.1:${state.port}`;
 	const s = {
 		child,

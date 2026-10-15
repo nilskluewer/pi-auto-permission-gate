@@ -16,7 +16,10 @@ export type PermissionSettingsAction =
 	| { type: "history-messages"; value: number }
 	| { type: "command-rules"; value: "edit" | "list" | "reset" }
 	| { type: "preferences"; value: "edit" | "add" | "list" | "clear" }
-	| { type: "prompt" };
+	| { type: "prompt" }
+	| { type: "dcg-mode"; value: "off" | "observe" | "enforce" }
+	| { type: "dcg-binary" }
+	| { type: "dcg-status" };
 
 export type PermissionSettingsOption = SelectItem;
 
@@ -32,6 +35,10 @@ export interface PermissionSettingsView {
 	allowedCommands: readonly string[];
 	disallowedCommands: readonly string[];
 	preferences: string;
+	dcgMode?: "off" | "observe" | "enforce";
+	dcgBinaryPath?: string;
+	dcgSha256?: string;
+	dcgStatus?: string;
 }
 
 type Tui = { requestRender: () => void };
@@ -136,6 +143,14 @@ function createSettingsComponent(
 			currentValue: "open",
 			values: ["open"],
 		},
+		{
+			id: "dcg",
+			label: "Destructive Command Guard (DCG)",
+			description: "Configure the optional analyzer: off, observe, or enforce; trusted binary and status.",
+			currentValue: state.dcgMode ?? "off",
+			submenu: (_currentValue, submenuDone) =>
+				createDcgComponent(tui, theme, state, (value) => submenuDone(value), () => submenuDone()),
+		},
 	];
 
 	const container = new Container();
@@ -171,6 +186,9 @@ function createSettingsComponent(
 				done({ type: "preferences", value });
 			} else if (id === "prompt" && value === "open") {
 				done({ type: "prompt" });
+			} else if (id === "dcg") {
+				const action = dcgAction(value);
+				if (action) done(action);
 			}
 		},
 		() => done(null),
@@ -206,10 +224,12 @@ function createSelectComponent(
 	items: readonly SelectItem[],
 	onSelect: (value: string) => void,
 	onCancel: () => void,
+	description?: string,
 ): Component {
 	const selectItems = items.map((item) => ({ ...item }));
 	const container = new Container();
 	container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
+	if (description) container.addChild(new Text(theme.fg("muted", description), 1, 0));
 
 	const selectList = new SelectList(selectItems, Math.min(Math.max(selectItems.length, 1), MAX_VISIBLE_SETTINGS), {
 		selectedPrefix: (text) => theme.fg("accent", text),
@@ -357,6 +377,78 @@ function createPreferencesComponent(
 	);
 }
 
+const DCG_WARNING =
+	"Observe never blocks solely on DCG. In enforce, analyzer failures require human review or block without UI.";
+
+function dcgDetails(state: PermissionSettingsView): string {
+	return [
+		`Mode: ${state.dcgMode ?? "off"}`,
+		`Trusted absolute binary path: ${state.dcgBinaryPath || "not configured"}`,
+		`SHA-256: ${state.dcgSha256 || "not configured"}`,
+		`Status: ${state.dcgStatus || "not configured"}`,
+		"The main gate validates binary trust, configuration, and enablement; selecting a mode does not bypass validation.",
+		DCG_WARNING,
+	].join("\n");
+}
+
+function dcgItems(): SelectItem[] {
+	return [
+		{ value: "off", label: "off", description: "Disable DCG; existing local safety rules remain active." },
+		{ value: "observe", label: "observe", description: "Record DCG observations; never block solely on DCG." },
+		{
+			value: "enforce",
+			label: "enforce",
+			description: "Enforce DCG findings; analyzer failures need human review or a no-UI block.",
+		},
+		{
+			value: "binary",
+			label: "Configure trusted binary",
+			description: "Open main-gate dialogs for an absolute binary path and SHA-256; no automatic installation or PATH lookup.",
+		},
+		{ value: "status", label: "Show DCG status", description: "Request the main gate's full DCG status report." },
+	];
+}
+
+function dcgAction(value: string): PermissionSettingsAction | undefined {
+	if (value === "off" || value === "observe" || value === "enforce") return { type: "dcg-mode", value };
+	if (value === "binary") return { type: "dcg-binary" };
+	if (value === "status") return { type: "dcg-status" };
+	return undefined;
+}
+
+function createDcgComponent(
+	tui: Tui,
+	theme: Theme,
+	state: PermissionSettingsView,
+	onSelect: (value: string) => void,
+	onCancel: () => void,
+): Component {
+	return createSelectComponent(
+		tui,
+		theme,
+		"Destructive Command Guard (DCG)",
+		dcgItems(),
+		onSelect,
+		onCancel,
+		dcgDetails(state),
+	);
+}
+
+async function openDcgWithDialogs(
+	ctx: Pick<ExtensionContext, "ui">,
+	state: PermissionSettingsView,
+	cancel: string,
+): Promise<PermissionSettingsAction | undefined> {
+	const items = dcgItems();
+	const selected = await ctx.ui.select(`Destructive Command Guard (DCG)\n${dcgDetails(state)}`, [
+		...items.map((item) => item.label),
+		cancel,
+	]);
+	if (!selected || selected === cancel) return undefined;
+	const item = items.find((item) => item.label === selected);
+	return item ? dcgAction(item.value) : undefined;
+}
+
 async function openPermissionSettingsWithDialogs(
 	ctx: Pick<ExtensionContext, "ui">,
 	state: PermissionSettingsView,
@@ -370,6 +462,7 @@ async function openPermissionSettingsWithDialogs(
 		`Command rules - ${state.allowedCommands.length} allowed / ${state.disallowedCommands.length} denied`,
 		`Classifier preferences - ${formatPreferenceCount(state.preferences)}`,
 		"View classifier prompt",
+		`Destructive Command Guard (DCG) - ${state.dcgMode ?? "off"}`,
 		cancel,
 	];
 
@@ -417,6 +510,7 @@ async function openPermissionSettingsWithDialogs(
 	if (index === 4) return openRulesWithDialogs(ctx, state, cancel);
 	if (index === 5) return openPreferencesWithDialogs(ctx, state, cancel);
 	if (index === 6) return { type: "prompt" };
+	if (index === 7) return openDcgWithDialogs(ctx, state, cancel);
 	return undefined;
 }
 

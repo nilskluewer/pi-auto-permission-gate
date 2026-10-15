@@ -23,6 +23,19 @@ jobs:
         run: npm install -g @earendil-works/pi-coding-agent@latest
       - name: Install dependencies
         run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
-      - run: npm test --if-present
-      - name: Smoke test (load the packed tarball in Pi)
+      - name: Prepare checksum-pinned DCG 0.15.3 for subprocess tests
+        env:
+          DCG_ARCHIVE_SHA256: dc7dcec9679f74ac3e6990959771ca0c84168eba658eff64fe9e63f917a84cc4
+        run: |
+          mkdir -p "$RUNNER_TEMP/dcg-test"
+          archive="$RUNNER_TEMP/dcg-test/dcg.tar.xz"
+          curl --fail --location --retry 3 https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/v0.15.3/dcg-x86_64-unknown-linux-musl.tar.xz -o "$archive"
+          printf '%s  %s\n' "$DCG_ARCHIVE_SHA256" "$archive" | sha256sum --check -
+          tar -xJf "$archive" -C "$RUNNER_TEMP/dcg-test"
+          echo "DCG_TEST_BINARY=$RUNNER_TEMP/dcg-test/dcg" >> "$GITHUB_ENV"
+          echo "DCG_TEST_SHA256=$(sha256sum "$RUNNER_TEMP/dcg-test/dcg" | cut -d ' ' -f 1)" >> "$GITHUB_ENV"
+      - run: npm test
+      - name: Real Pi pre-execution safety checks (isolated targets)
+        run: npm run test:e2e
+      - name: Smoke test (packed tarball and global forwarding layout)
         run: npm run smoke
