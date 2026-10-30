@@ -16,6 +16,10 @@ export type PermissionSettingsAction =
 	| { type: "history-messages"; value: number }
 	| { type: "command-rules"; value: "edit" | "list" | "reset" }
 	| { type: "preferences"; value: "edit" | "add" | "list" | "clear" }
+	| { type: "production-patterns" }
+	| { type: "approval-wait"; value: number }
+	| { type: "intent-grants" }
+	| { type: "statistics" }
 	| { type: "prompt" };
 
 export type PermissionSettingsOption = SelectItem;
@@ -32,6 +36,9 @@ export interface PermissionSettingsView {
 	allowedCommands: readonly string[];
 	disallowedCommands: readonly string[];
 	preferences: string;
+	productionPatterns?: readonly string[];
+	approvalWaitSeconds?: number;
+	activeGrantCount?: number;
 }
 
 type Tui = { requestRender: () => void };
@@ -129,6 +136,10 @@ function createSettingsComponent(
 			submenu: (_currentValue, submenuDone) =>
 				createPreferencesComponent(tui, theme, state, (value) => submenuDone(value), () => submenuDone()),
 		},
+		{ id: "production-patterns", label: "Production patterns", description: "Project, bucket, and context patterns. Unknown targets stay critical.", currentValue: (state.productionPatterns ?? []).join(", "), values: ["edit"] },
+		{ id: "approval-wait", label: "Approval wait", description: "Stop waiting and leave the browser request open for a late answer.", currentValue: String(state.approvalWaitSeconds ?? 300), values: ["60", "120", "300", "600", "900", "1800"] },
+		{ id: "intent-grants", label: "Session intent grants", description: "List or revoke human-approved grants for this session.", currentValue: `${state.activeGrantCount ?? 0} active`, values: ["open"] },
+		{ id: "statistics", label: "Approval statistics", description: "Show prompt rates and grant savings over the last 14 days.", currentValue: "open", values: ["open"] },
 		{
 			id: "prompt",
 			label: "View classifier prompt",
@@ -169,6 +180,10 @@ function createSettingsComponent(
 				done({ type: "command-rules", value });
 			} else if (id === "preferences" && isPreferencesAction(value)) {
 				done({ type: "preferences", value });
+			} else if (id === "approval-wait") {
+				done({ type: "approval-wait", value: Number(value) });
+			} else if (id === "production-patterns" || id === "intent-grants" || id === "statistics") {
+				done({ type: id });
 			} else if (id === "prompt" && value === "open") {
 				done({ type: "prompt" });
 			}
@@ -370,6 +385,10 @@ async function openPermissionSettingsWithDialogs(
 		`Command rules - ${state.allowedCommands.length} allowed / ${state.disallowedCommands.length} denied`,
 		`Classifier preferences - ${formatPreferenceCount(state.preferences)}`,
 		"View classifier prompt",
+		"Production patterns",
+		`Approval wait - ${state.approvalWaitSeconds ?? 300} seconds`,
+		`Session intent grants - ${state.activeGrantCount ?? 0} active`,
+		"Approval statistics (14 days)",
 		cancel,
 	];
 
@@ -417,6 +436,13 @@ async function openPermissionSettingsWithDialogs(
 	if (index === 4) return openRulesWithDialogs(ctx, state, cancel);
 	if (index === 5) return openPreferencesWithDialogs(ctx, state, cancel);
 	if (index === 6) return { type: "prompt" };
+	if (index === 7) return { type: "production-patterns" };
+	if (index === 8) {
+		const seconds = await ctx.ui.select("Approval wait (seconds)", ["30", "60", "120", "300", "600", cancel]);
+		return seconds && seconds !== cancel ? { type: "approval-wait", value: Number(seconds) } : undefined;
+	}
+	if (index === 9) return { type: "intent-grants" };
+	if (index === 10) return { type: "statistics" };
 	return undefined;
 }
 

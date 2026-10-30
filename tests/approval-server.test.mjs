@@ -157,6 +157,139 @@ function rawStatus(port, host, extra = {}) {
 	});
 }
 
+// Contract oracle: reject silent redirects, lost intent edits, resolved parking, and expiry-as-denial.
+const intentProposal = { label: "read via cat in /tmp/demo/", access: "read", reasons: ["rule:ls"], targets: ["exec:cat", "path:/tmp/demo/"] };
+
+test("redirect requires a trimmed note and delivers steering plus history", async () => {
+	const s = await startServer();
+	try {
+		const { id } = (await s.create()).json;
+		for (const note of [undefined, "", "  \n\t"]) {
+			const rejected = await s.decide(id, { decision: "redirect", note });
+			assert.equal(rejected.status, 400);
+			assert.equal(rejected.json.error, "redirect needs a note");
+		}
+		assert.equal((await s.getHistory()).json.history.length, 0);
+		const waiting = s.call("GET", `/api/requests/${id}/wait?timeoutMs=5000`);
+		assert.equal((await s.decide(id, { decision: "redirect", note: "  Use uv instead.  " })).status, 200);
+		assert.deepEqual((await waiting).json, { status: "redirected", note: "Use uv instead.", scope: "once" });
+		const history = (await s.getHistory()).json.history[0];
+		assert.equal(history.status, "redirected");
+		assert.equal(history.note, "Use uv instead.");
+		assert.equal(history.scope, "once");
+		assert.equal(history.recommendation, "approve");
+		assert.ok(history.answeredAt >= history.shownAt);
+	} finally { await s.stop(); }
+});
+
+test("intent is command-only and non-critical, validates shape and clips display bounds", async () => {
+	const s = await startServer();
+	try {
+		for (const over of [{ risk: "critical" }, { kind: "lockdown" }]) {
+			assert.equal((await s.create({ ...over, intentProposal })).status, 400);
+		}
+		for (const bad of [null, [], {}, { ...intentProposal, access: "execute" }, { ...intentProposal, label: 1 }, { ...intentProposal, reasons: [1] }, { ...intentProposal, targets: [null] }]) {
+			assert.equal((await s.create({ intentProposal: bad })).status, 400, JSON.stringify(bad));
+		}
+		const long = { ...intentProposal, label: "l".repeat(200), targets: ["p".repeat(4100), ...Array(33).fill("path:/tmp/")], reasons: Array(22).fill("reason") };
+		const created = await s.create({ intentProposal: long });
+		assert.equal(created.status, 200);
+		const events = await openSse(s.base, APPROVER);
+		try {
+			const request = (await events.next("snapshot")).pending[0];
+			assert.equal(request.parked, false);
+			assert.equal(request.intentProposal.label.length, 160);
+			assert.equal(request.intentProposal.targets.length, 32);
+			assert.equal(request.intentProposal.targets[0].length, 4096);
+			assert.equal(request.intentProposal.reasons.length, 20);
+		} finally { events.close(); }
+	} finally { await s.stop(); }
+});
+
+test("intent decisions preserve default and edited payloads without semantic narrowing", async () => {
+	const s = await startServer();
+	try {
+		const plain = (await s.create()).json.id;
+		assert.equal((await s.decide(plain, { decision: "approve", scope: "intent" })).status, 400);
+		for (const edited of [undefined, { ...intentProposal, label: "Custom intent", access: "write", targets: ["path:/tmp/elsewhere/"] }]) {
+			const { id } = (await s.create({ intentProposal })).json;
+			assert.equal((await s.decide(id, { decision: "approve", scope: "intent", intent: { ...intentProposal, targets: [4] } })).status, 400);
+			assert.equal((await s.decide(id, { decision: "approve", scope: "session" })).status, 400);
+			assert.equal((await s.decide(id, { decision: "approve", scope: "intent", intent: edited })).status, 200);
+			assert.deepEqual((await s.call("GET", `/api/requests/${id}/wait`)).json, { status: "approved", scope: "intent", intent: edited ?? intentProposal });
+			assert.equal((await s.getHistory()).json.history[0].scope, "intent");
+		}
+	} finally { await s.stop(); }
+});
+
+test("parking is session-authenticated, stays pending, broadcasts and delivers late approval", async () => {
+	const s = await startServer();
+	let events;
+	try {
+		events = await openSse(s.base, APPROVER);
+		await events.next("snapshot");
+		const { id } = (await s.create({ intentProposal })).json;
+		const added = await events.next("added");
+		assert.deepEqual(added.intentProposal, intentProposal);
+		assert.equal(added.parked, false);
+		const park = `/api/requests/${id}/park`;
+		assert.equal((await s.call("POST", park, { token: null, approver: APPROVER })).status, 401);
+		assert.equal((await s.call("POST", "/api/requests/missing/park")).status, 404);
+		assert.equal((await s.call("POST", park)).status, 200);
+		assert.deepEqual(await events.next("parked"), { id });
+		assert.deepEqual((await s.call("GET", `/api/requests/${id}/wait?timeoutMs=0`)).json, { status: "pending" });
+		const snapshot = await openSse(s.base, APPROVER);
+		try { assert.equal((await snapshot.next("snapshot")).pending[0].parked, true); } finally { snapshot.close(); }
+		const waiting = s.call("GET", `/api/requests/${id}/wait?timeoutMs=5000`);
+		await s.decide(id, { decision: "approve" });
+		assert.deepEqual((await waiting).json, { status: "approved", scope: "once" });
+		assert.equal((await s.call("POST", park)).status, 409);
+		assert.equal((await s.getHistory()).json.history.length, 1);
+	} finally { events?.close(); await s.stop(); }
+});
+
+test("parked requests still expire and history distinguishes no answer", async () => {
+	const s = await startServer();
+	try {
+		const { id } = (await s.create({ ttlMs: 200 })).json;
+		assert.equal((await s.call("POST", `/api/requests/${id}/park`)).status, 200);
+		assert.equal((await s.call("GET", `/api/requests/${id}/wait?timeoutMs=5000`)).json.status, "expired");
+		const history = (await s.getHistory()).json.history[0];
+		assert.equal(history.status, "expired");
+		assert.equal(history.note, "Timed out without an answer.");
+		assert.equal(history.answeredAt, undefined);
+		assert.equal(typeof history.shownAt, "number");
+	} finally { await s.stop(); }
+});
+
+test("history keeps fatigue metadata and drops unknown optional values across restart", async () => {
+	const s = await startServer();
+	try {
+		const metadata = { status: "redirected", source: "grant", recommendation: "review", scope: "intent", grantId: "g".repeat(110), note: "n".repeat(510), shownAt: 123, answeredAt: 456 };
+		assert.equal((await s.postHistory(metadata)).status, 200);
+		assert.equal((await s.postHistory({ status: "cancelled", source: "robot", note: 5, recommendation: "bogus", scope: "forever", grantId: 7, shownAt: "123", answeredAt: null })).status, 200);
+		const entries = (await s.getHistory()).json.history;
+		for (const key of ["status", "source", "note", "recommendation", "scope", "grantId", "shownAt", "answeredAt"]) assert.equal(entries[0][key], undefined, key);
+		assert.equal(entries[1].grantId.length, 100);
+		assert.equal(entries[1].note.length, 500);
+		await s.stop();
+		const restarted = await startServer(undefined, s.dir);
+		try {
+			const saved = (await restarted.getHistory()).json.history[1];
+			assert.deepEqual(saved, entries[1]);
+		} finally { await restarted.stop(); }
+	} finally { await s.stop(); }
+});
+
+test("page provides intent editing, redirect, parking, and distinct history states", async () => {
+	const s = await startServer();
+	try {
+		const html = await (await fetch(s.base + "/")).text();
+		for (const label of ["Approve once", "Approve for session…", "Redirect…", "Intent targets (one per line)", "Agent stopped waiting — your answer is still delivered", "Redirected", "Expired"]) assert.ok(html.includes(label), label);
+		assert.ok(html.includes("es.addEventListener('parked'"));
+	} finally { await s.stop(); }
+});
+
 test("prints one line, writes state file with mode 0600 and no approver token", async () => {
 	const s = await startServer();
 	try {
@@ -406,7 +539,7 @@ test("SSE: snapshot, added, resolved", async () => {
 		assert.equal(added.id, second);
 		assert.equal(added.tldr, "second");
 		assert.deepEqual(Object.keys(added).sort(), [
-			"command", "createdAt", "cwd", "expiresAt", "id", "kind", "model", "reasons", "recommendation", "risk", "sessionId", "sessionLabel", "tldr",
+			"command", "createdAt", "cwd", "expiresAt", "id", "kind", "model", "parked", "reasons", "recommendation", "risk", "sessionId", "sessionLabel", "tldr",
 		]);
 
 		await s.decide(first, { decision: "deny" });
@@ -445,6 +578,19 @@ test("body too large returns 413", async () => {
 	}
 });
 
+test("health reports the file hash as version, and shutdown replaces the server", async () => {
+	const { createHash } = await import("node:crypto");
+	const s = await startServer();
+	const health = await s.call("GET", "/api/health");
+	assert.equal(health.json.version, createHash("sha256").update(fs.readFileSync(SERVER)).digest("hex"));
+	assert.equal((await s.call("POST", "/api/shutdown", { token: "wrong" })).status, 401);
+	assert.equal(s.child.exitCode, null, "an unauthorized shutdown must not stop the server");
+	assert.equal((await s.call("POST", "/api/shutdown")).status, 200);
+	const { code } = await s.child.exited;
+	assert.equal(code, 0);
+	assert.equal(fs.existsSync(s.stateFile), false);
+});
+
 test("state file is removed on SIGTERM", async () => {
 	const s = await startServer();
 	assert.ok(fs.existsSync(s.stateFile));
@@ -468,14 +614,11 @@ test("history: POST validation", async () => {
 	try {
 		for (const bad of [
 			{ risk: "huge" },
-			{ status: "cancelled" },
-			{ source: "robot" },
 			{ via: "phone" },
 			{ reasons: "x" },
 			{ reasons: [1] },
 			{ command: 5 },
 			{ model: 5 },
-			{ note: 5 },
 			{ ts: "yesterday" },
 		]) {
 			assert.equal((await s.postHistory(bad)).status, 400, JSON.stringify(bad));
@@ -556,7 +699,7 @@ test("history: browser decisions and expiry are recorded, cancel is not", async 
 		assert.equal(approved.model, "mod");
 		assert.equal(denied.status, "denied");
 		assert.equal(denied.note, "no");
-		assert.equal(expired.status, "denied");
+		assert.equal(expired.status, "expired");
 		assert.equal(expired.source, "human");
 		assert.equal(expired.note, "Timed out without an answer.");
 		assert.equal(expired.command, "ls -la");
@@ -697,4 +840,77 @@ test("open: needs the session token and answers 200 (no browser in tests)", asyn
 	} finally {
 		await s.stop();
 	}
+});
+
+test("inspection metadata survives queue and history without persisting source contents", async () => {
+  const s = await startServer();
+  try {
+    const paths = [
+      { path: "/project/scripts/cleanup.py", role: "script", inspected: true, unresolved: false },
+      { path: "/project/scripts/helper.py", role: "local dependency", inspected: true, unresolved: false },
+      { path: "$OUT/report.json", role: "output target", inspected: false, unresolved: true },
+    ];
+    const pathNotes = ["One output path depends on the environment."];
+    const cwd = "/project/" + "long-directory/".repeat(20);
+    const created = await s.create({ cwd, paths, pathNotes, files: [{ path: "cleanup.py", content: "SOURCE-MUST-NOT-PERSIST" }], fingerprints: { secret: "SOURCE-MUST-NOT-PERSIST" } });
+    assert.equal(created.status, 200);
+    const events = await openSse(s.base, APPROVER);
+    const pending = await events.next("snapshot");
+    events.close();
+    const request = pending.pending.find((r) => r.id === created.json.id);
+    assert.deepEqual(request.paths, paths);
+    assert.deepEqual(request.pathNotes, pathNotes);
+    assert.equal(request.cwd, cwd);
+    assert.doesNotMatch(JSON.stringify(request), /SOURCE-MUST-NOT-PERSIST/);
+    assert.equal((await s.decide(created.json.id, { decision: "approve" })).status, 200);
+    const history = (await s.getHistory()).json.history[0];
+    assert.deepEqual(history.paths, paths);
+    assert.deepEqual(history.pathNotes, pathNotes);
+    assert.equal(history.cwd, cwd);
+    assert.doesNotMatch(fs.readFileSync(s.historyFile, "utf8"), /SOURCE-MUST-NOT-PERSIST/);
+  } finally { await s.stop(); }
+});
+
+test("inspection metadata validates types and limits rather than silently dropping paths", async () => {
+  const s = await startServer();
+  try {
+    for (const over of [
+      { paths: "not an array" },
+      { paths: Array.from({ length: 257 }, () => ({ path: "/x", role: "input" })) },
+      { paths: [{ path: "/x", role: "input", inspected: "yes" }] },
+      { paths: [{ path: "/x", role: "input", unresolved: 1 }] },
+      { paths: [{ path: 4, role: "input" }] },
+      { paths: [{ path: "x".repeat(4097), role: "input" }] },
+      { pathNotes: "not an array" },
+      { pathNotes: [42] },
+      { pathNotes: Array(65).fill("note") },
+    ]) assert.equal((await s.create(over)).status, 400, JSON.stringify(over).slice(0, 100));
+    const legacy = await s.create();
+    assert.equal(legacy.status, 200, "old clients remain supported");
+    assert.equal((await s.postHistory({ paths: [{ path: "/x", role: "input", inspected: "yes" }] })).status, 400);
+  } finally { await s.stop(); }
+});
+
+test("inspection metadata persists across server restart and history posts", async () => {
+  const s = await startServer();
+  const metadata = { paths: [{ path: "/project/main.py", role: "script", inspected: true, unresolved: false }], pathNotes: [] };
+  await s.postHistory(metadata);
+  await s.stop();
+  const restarted = await startServer(undefined, s.dir);
+  try {
+    const history = (await restarted.getHistory()).json.history[0];
+    assert.deepEqual(history.paths, metadata.paths);
+    assert.deepEqual(history.pathNotes, []);
+  } finally { await restarted.stop(); }
+});
+
+test("page provides native collapsible paths, project, and execution summary labels", async () => {
+  const s = await startServer();
+  try {
+    const html = await (await fetch(s.base + "/")).text();
+    for (const label of ["Execution summary", "Files and paths", "Unresolved paths", "Code inspected", "Static references only", "Project"]) assert.ok(html.includes(label), label);
+    assert.ok(html.includes("h('details', 'path-details')"));
+    assert.ok(html.includes("h('summary'"));
+    assert.ok(!html.includes("innerHTML ="), "path metadata must not be injected as HTML");
+  } finally { await s.stop(); }
 });

@@ -1,0 +1,12 @@
+{"type":"custom","customType":"permission-gate-decision","data":{"command":"auto allow","reasons":[],"status":"approved","source":"auto-model","rationale":"Allowed","timestamp":1792573200000},"timestamp":"2099-01-01T00:00:00.000Z"}
+{"type":"custom","customType":"permission-gate-decision","data":{"command":"auto block","reasons":[],"status":"blocked","source":"auto-model","rationale":"Blocked","timestamp":1792573260000}}
+{"type":"custom","customType":"permission-gate-decision","data":{"command":"hard block","reasons":[],"status":"blocked","source":"hard-deny","rationale":"Rule","timestamp":1792573320000}}
+{"type":"custom","customType":"permission-gate-decision","data":{"command":"rule allow","reasons":[],"status":"approved","source":"user-rule","rationale":"Rule","timestamp":1792573380000}}
+not json
+null
+{"type":"message","customType":"permission-gate-decision","data":{"timestamp":1792573200000}}
+{"type":"custom","customType":"other","data":{"status":"approved","source":"human","timestamp":1792573200000}}
+{"type":"custom","customType":"permission-gate-decision","data":null}
+{"type":"custom","customType":"permission-gate-decision","data":{"status":"cancelled","source":"human","timestamp":1792573200000}}
+{"type":"custom","customType":"permission-gate-decision","data":{"status":"approved","source":"unknown","timestamp":1792573200000}}
+{"type":"custom","customType":"permission-gate-decision","data":{"status":"approved","source":"human","timestamp":"bad"}}

@@ -20,6 +20,11 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+// The version is the hash of this file. The gate compares it with the file on disk
+// and replaces a server that runs older code.
+const SERVER_VERSION = crypto.createHash("sha256").update(fs.readFileSync(fileURLToPath(import.meta.url))).digest("hex");
 
 const MAX_BODY = 64 * 1024;
 const MAX_PENDING = 200;
@@ -120,6 +125,41 @@ const sha = (s) => crypto.createHash("sha256").update(String(s)).digest();
 const tokenOk = (given, expected) => typeof given === "string" && crypto.timingSafeEqual(sha(given), sha(expected));
 const clip = (v, n) => String(v).slice(0, n);
 
+// Only display metadata crosses this boundary. Never accept source/file contents.
+function inspectionDisplay(body) {
+	const out = {};
+	if (body.paths !== undefined) {
+		if (!Array.isArray(body.paths) || body.paths.length > 256) throw new HttpError(400, "paths must contain at most 256 entries");
+		out.paths = body.paths.map((entry) => {
+			if (!entry || typeof entry !== "object" || typeof entry.path !== "string" || !entry.path || entry.path.length > 4096 ||
+				typeof entry.role !== "string" || entry.role.length > 500 ||
+				(entry.inspected !== undefined && typeof entry.inspected !== "boolean") ||
+				(entry.unresolved !== undefined && typeof entry.unresolved !== "boolean")) throw new HttpError(400, "invalid path metadata");
+			return { path: entry.path, role: entry.role, inspected: entry.inspected === true, unresolved: entry.unresolved === true };
+		});
+	}
+	if (body.pathNotes !== undefined) {
+		if (!Array.isArray(body.pathNotes) || body.pathNotes.length > 64 || body.pathNotes.some((note) => typeof note !== "string" || note.length > 8192)) throw new HttpError(400, "invalid path notes");
+		out.pathNotes = body.pathNotes;
+	}
+	return out;
+}
+
+function normalizeIntent(value) {
+	if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.label !== "string" ||
+		!["read", "write"].includes(value.access) ||
+		!Array.isArray(value.reasons) || value.reasons.some((v) => typeof v !== "string") ||
+		!Array.isArray(value.targets) || value.targets.some((v) => typeof v !== "string")) {
+		throw new HttpError(400, "invalid intent proposal");
+	}
+	return {
+		label: clip(value.label, 160),
+		access: value.access,
+		reasons: value.reasons.slice(0, 20).map((v) => clip(v, 200)),
+		targets: value.targets.slice(0, 32).map((v) => clip(v, 4096)),
+	};
+}
+
 const SECURITY_HEADERS = {
 	"x-content-type-options": "nosniff",
 	"cache-control": "no-store",
@@ -205,26 +245,29 @@ const newestFirst = (n) => history.slice(-n).reverse();
 function normalizeEntry(body) {
 	for (const k of REQUIRED_STRINGS) if (typeof body[k] !== "string") throw new HttpError(400, `${k} must be a string`);
 	if (!["low", "medium", "critical"].includes(body.risk)) throw new HttpError(400, "bad risk");
-	if (!["approved", "denied"].includes(body.status)) throw new HttpError(400, "bad status");
-	if (!["auto", "human", "rule", "hard-deny"].includes(body.source)) throw new HttpError(400, "bad source");
 	if (body.via !== undefined && !["browser", "terminal"].includes(body.via)) throw new HttpError(400, "bad via");
 	if (!Array.isArray(body.reasons) || body.reasons.some((x) => typeof x !== "string"))
 		throw new HttpError(400, "reasons must be a string array");
-	for (const k of ["model", "note"]) if (body[k] !== undefined && typeof body[k] !== "string") throw new HttpError(400, `${k} must be a string`);
+	for (const k of ["model"]) if (body[k] !== undefined && typeof body[k] !== "string") throw new HttpError(400, `${k} must be a string`);
 	const e = {
 		sessionId: clip(body.sessionId, 200),
 		sessionLabel: clip(body.sessionLabel, 200),
-		cwd: clip(body.cwd, 200),
+		cwd: clip(body.cwd, 4096),
+		...inspectionDisplay(body),
 		command: clip(body.command, 8000),
 		risk: body.risk,
 		tldr: clip(body.tldr, 600),
-		status: body.status,
-		source: body.source,
 		reasons: body.reasons.slice(0, 20).map((x) => clip(x, 200)),
 	};
 	if (body.via) e.via = body.via;
 	if (body.model) e.model = clip(body.model, 200);
-	if (body.note) e.note = clip(body.note, 500);
+	if (["approved", "denied", "redirected", "expired"].includes(body.status)) e.status = body.status;
+	if (["auto", "human", "rule", "hard-deny", "grant"].includes(body.source)) e.source = body.source;
+	if (typeof body.note === "string" && body.note) e.note = clip(body.note, 500);
+	if (["approve", "deny", "review"].includes(body.recommendation)) e.recommendation = body.recommendation;
+	if (["once", "session", "intent"].includes(body.scope)) e.scope = body.scope;
+	if (typeof body.grantId === "string") e.grantId = clip(body.grantId, 100);
+	for (const key of ["shownAt", "answeredAt"]) if (typeof body[key] === "number" && Number.isFinite(body[key])) e[key] = body[key];
 	return e;
 }
 
@@ -274,6 +317,7 @@ function historyFromRequest(r, status, note, via) {
 		sessionId: r.sessionId,
 		sessionLabel: r.sessionLabel,
 		cwd: r.cwd,
+		...inspectionDisplay(r),
 		command: r.command,
 		risk: r.risk,
 		tldr: r.tldr,
@@ -284,7 +328,12 @@ function historyFromRequest(r, status, note, via) {
 	if (via) e.via = via;
 	if (r.model) e.model = r.model;
 	if (note) e.note = note;
-	return e;
+	e.recommendation = r.recommendation;
+	e.shownAt = r.createdAt;
+	if (r.answeredAt !== undefined) e.answeredAt = r.answeredAt;
+	if (r.scope) e.scope = r.scope;
+	// The gate reconciles scope and grant metadata after it validates the answer.
+	return { ...normalizeEntry(e), id: r.id };
 }
 
 function publicRequest(r) {
@@ -293,6 +342,7 @@ function publicRequest(r) {
 		sessionId: r.sessionId,
 		sessionLabel: r.sessionLabel,
 		cwd: r.cwd,
+		...inspectionDisplay(r),
 		kind: r.kind,
 		command: r.command,
 		risk: r.risk,
@@ -302,6 +352,8 @@ function publicRequest(r) {
 		model: r.model,
 		createdAt: r.createdAt,
 		expiresAt: r.expiresAt,
+		parked: r.parked,
+		...(r.intentProposal ? { intentProposal: r.intentProposal } : {}),
 	};
 }
 
@@ -309,6 +361,7 @@ function result(r) {
 	const out = { status: r.status };
 	if (r.note) out.note = r.note;
 	if (r.scope) out.scope = r.scope;
+	if (r.intent) out.intent = r.intent;
 	return out;
 }
 
@@ -322,6 +375,8 @@ function resolveRequest(r, status, extra = {}) {
 	r.status = status;
 	if (extra.note) r.note = extra.note;
 	if (extra.scope) r.scope = extra.scope;
+	if (extra.intent) r.intent = extra.intent;
+	if (["approved", "denied", "redirected"].includes(status)) r.answeredAt = Date.now();
 	clearTimeout(r.expiryTimer);
 	for (const w of r.waiters) {
 		clearTimeout(w.timer);
@@ -367,13 +422,19 @@ function createRequest(body) {
 		throw new HttpError(400, "ttlMs must be a number");
 	if (pendingList().length >= MAX_PENDING) throw new HttpError(429, "too many pending requests");
 
+	let intentProposal;
+	if (body.intentProposal !== undefined) {
+		if (body.kind !== "command" || body.risk === "critical") throw new HttpError(400, "intent is not supported for this request");
+		intentProposal = normalizeIntent(body.intentProposal);
+	}
 	const ttl = Math.min(MAX_TTL_MS, Math.max(MIN_TTL_MS, body.ttlMs ?? DEFAULT_TTL_MS));
 	const now = Date.now();
 	const r = {
 		id: crypto.randomUUID(),
 		sessionId: clip(body.sessionId, 200),
 		sessionLabel: clip(body.sessionLabel, 200),
-		cwd: clip(body.cwd, 200),
+		cwd: clip(body.cwd, 4096),
+		...inspectionDisplay(body),
 		kind: body.kind,
 		command: clip(body.command, 8000),
 		risk: body.risk,
@@ -384,10 +445,12 @@ function createRequest(body) {
 		createdAt: now,
 		expiresAt: now + ttl,
 		status: "pending",
+		parked: false,
+		intentProposal,
 		waiters: new Set(),
 	};
 	r.expiryTimer = setTimeout(() => {
-		if (resolveRequest(r, "expired")) addHistory(historyFromRequest(r, "denied", "Timed out without an answer."));
+		if (resolveRequest(r, "expired")) addHistory(historyFromRequest(r, "expired", "Timed out without an answer."));
 	}, ttl);
 	requests.set(r.id, r);
 	const noViewer = sseClients.size === 0;
@@ -397,21 +460,25 @@ function createRequest(body) {
 }
 
 function decide(r, body) {
-	if (!["approve", "deny"].includes(body.decision)) throw new HttpError(400, "bad decision");
+	if (!["approve", "deny", "redirect"].includes(body.decision)) throw new HttpError(400, "bad decision");
 	if (body.note !== undefined && typeof body.note !== "string") throw new HttpError(400, "note must be a string");
-	if (body.scope !== undefined && !["once", "session"].includes(body.scope)) throw new HttpError(400, "bad scope");
+	if (body.scope !== undefined && !["once", "session", "intent"].includes(body.scope)) throw new HttpError(400, "bad scope");
 	if (body.confirm !== undefined && typeof body.confirm !== "boolean") throw new HttpError(400, "confirm must be a boolean");
 	if (!isPending(r)) throw new HttpError(409, "request is not pending");
-	const note = body.note ? clip(body.note, 500) : undefined;
-	if (body.decision === "deny") {
-		resolveRequest(r, "denied", { note, scope: "once" });
-		addHistory(historyFromRequest(r, "denied", note, "browser"));
-		return;
-	}
 	const scope = body.scope ?? "once";
 	if (scope === "session" && r.kind !== "lockdown") throw new HttpError(400, "scope session is not supported");
+	if (scope === "intent" && !r.intentProposal) throw new HttpError(400, "scope intent is not supported");
+	const edited = body.intent === undefined ? undefined : normalizeIntent(body.intent);
+	const note = body.note ? clip(body.decision === "redirect" ? body.note.trim() : body.note, 500) : undefined;
+	if (body.decision === "redirect" && !note) throw new HttpError(400, "redirect needs a note");
+	if (body.decision !== "approve") {
+		const status = body.decision === "redirect" ? "redirected" : "denied";
+		resolveRequest(r, status, { note, scope: "once" });
+		addHistory(historyFromRequest(r, status, note, "browser"));
+		return;
+	}
 	if (r.risk === "critical" && body.confirm !== true) throw new HttpError(400, "critical request needs confirm: true");
-	resolveRequest(r, "approved", { note, scope });
+	resolveRequest(r, "approved", { note, scope, intent: scope === "intent" ? edited ?? r.intentProposal : undefined });
 	addHistory(historyFromRequest(r, "approved", note, "browser"));
 }
 
@@ -476,7 +543,15 @@ async function route(req, res) {
 
 	if (method === "GET" && p === "/api/health") {
 		sessionAuth();
-		return sendJson(res, 200, { ok: true });
+		return sendJson(res, 200, { ok: true, version: SERVER_VERSION });
+	}
+	if (method === "POST" && p === "/api/shutdown") {
+		// A gate with newer code replaces this server. Tell open tabs, then exit.
+		sessionAuth();
+		broadcast("replaced", {});
+		sendJson(res, 200, { ok: true });
+		setTimeout(() => shutdown(0), 100).unref();
+		return;
 	}
 	if (method === "POST" && p === "/api/open") {
 		// The user asked for the page (the /approvals command), so open it even when a tab is connected.
@@ -499,6 +574,15 @@ async function route(req, res) {
 		if (body.ts !== undefined && !(typeof body.ts === "number" && Number.isFinite(body.ts))) throw new HttpError(400, "ts must be a number");
 		const fields = normalizeEntry(body);
 		const ts = body.ts !== undefined && body.ts >= now - DAY_MS && body.ts <= now + 60_000 ? body.ts : now;
+		if (body.id !== undefined) {
+			const index = history.findIndex((entry) => entry.id === body.id && entry.sessionId === fields.sessionId);
+			if (index < 0) throw new HttpError(404, "history entry not found for this session");
+			const entry = { id: history[index].id, ts, ...fields };
+			history[index] = entry;
+			try { rewriteHistoryFile(); } catch {}
+			broadcast("history", entry);
+			return sendJson(res, 200, { id: entry.id });
+		}
 		return sendJson(res, 200, { id: addHistory(fields, ts).id });
 	}
 	if (method === "GET" && p === "/api/history") {
@@ -511,7 +595,7 @@ async function route(req, res) {
 		approverAuth(url.searchParams.get("a"));
 		return handleEvents(req, res);
 	}
-	const m = /^\/api\/requests\/([^/]+)(\/wait|\/decision)?$/.exec(p);
+	const m = /^\/api\/requests\/([^/]+)(\/wait|\/decision|\/park)?$/.exec(p);
 	if (m) {
 		const [, id, sub] = m;
 		if (method === "GET" && sub === "/wait") {
@@ -519,6 +603,15 @@ async function route(req, res) {
 			const r = requests.get(id);
 			if (!r) throw new HttpError(404, "unknown request");
 			return handleWait(req, res, url, r);
+		}
+		if (method === "POST" && sub === "/park") {
+			sessionAuth();
+			const r = requests.get(id);
+			if (!r) throw new HttpError(404, "unknown request");
+			if (!isPending(r)) throw new HttpError(409, "request is not pending");
+			r.parked = true;
+			broadcast("parked", { id });
+			return sendJson(res, 200, { ok: true });
 		}
 		if (method === "DELETE" && !sub) {
 			sessionAuth();
@@ -606,15 +699,120 @@ const PAGE = String.raw`<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="dark light">
 <title>Permission Gate</title>
 <link id="icon" rel="icon" href="data:,">
 <style>
 :root {
-  --bg: #0e1116; --card: #161b22; --card-2: #1c222b; --line: #2a313c; --text: #e6edf3; --muted: #9ba7b4;
-  --green: #3fb950; --amber: #e3a428; --red: #f85149; --blue: #4c8dff;
+  --bg: #14181f;
+  --card: #1c222d;
+  --card-2: #232b38;
+  --card-cmd: #12161d;
+  --line: #2e3847;
+  --line-strong: #415065;
+  --text: #e2e7ef;
+  --muted: #9ba8b8;
+  --link: #94baff;
+  --focus: #94baff;
+
+  /* Refined pastels (dark mode) */
+  --green: #8fd5a6;
+  --green-bg: rgba(143, 213, 166, 0.12);
+  --green-border: rgba(143, 213, 166, 0.4);
+  --green-text: #b6edd2;
+  --green-btn: #2d5a3f;
+  --green-btn-hover: #376d4d;
+  --green-btn-text: #eafcf1;
+
+  --amber: #f2cb87;
+  --amber-bg: rgba(242, 203, 135, 0.12);
+  --amber-border: rgba(242, 203, 135, 0.4);
+  --amber-text: #fae4bb;
+
+  --red: #f19999;
+  --red-bg: rgba(241, 153, 153, 0.12);
+  --red-border: rgba(241, 153, 153, 0.45);
+  --red-text: #ffd3d3;
+  --red-btn: #783133;
+  --red-btn-hover: #8f3a3d;
+
+  --blue: #a3c7f7;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
+
+[data-theme="light"] {
+  --bg: #f5f6f8;
+  --card: #ffffff;
+  --card-2: #f0f2f5;
+  --card-cmd: #e9ecf0;
+  --line: #d8dee6;
+  --line-strong: #bcc6d2;
+  --text: #222933;
+  --muted: #667485;
+  --link: #2b5cb8;
+  --focus: #4b7bd8;
+
+  /* Refined pastels (light mode) */
+  --green: #488f62;
+  --green-bg: #e5f5ec;
+  --green-border: #a8dcc0;
+  --green-text: #235835;
+  --green-btn: #e5f5ec;
+  --green-btn-hover: #d2eddca6;
+  --green-btn-text: #1d4d2e;
+
+  --amber: #a8721c;
+  --amber-bg: #fef4e2;
+  --amber-border: #f3d49b;
+  --amber-text: #6b4507;
+
+  --red: #b84f4f;
+  --red-bg: #fdeeee;
+  --red-border: #f5b8b8;
+  --red-text: #731e1e;
+  --red-btn: #fde8e8;
+  --red-btn-hover: #fad5d5;
+
+  --blue: #3d6cb9;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f5f6f8;
+    --card: #ffffff;
+    --card-2: #f0f2f5;
+    --card-cmd: #e9ecf0;
+    --line: #d8dee6;
+    --line-strong: #bcc6d2;
+    --text: #222933;
+    --muted: #667485;
+    --link: #2b5cb8;
+    --focus: #4b7bd8;
+
+    --green: #488f62;
+    --green-bg: #e5f5ec;
+    --green-border: #a8dcc0;
+    --green-text: #235835;
+    --green-btn: #e5f5ec;
+    --green-btn-hover: #d2eddca6;
+    --green-btn-text: #1d4d2e;
+
+    --amber: #a8721c;
+    --amber-bg: #fef4e2;
+    --amber-border: #f3d49b;
+    --amber-text: #6b4507;
+
+    --red: #b84f4f;
+    --red-bg: #fdeeee;
+    --red-border: #f5b8b8;
+    --red-text: #731e1e;
+    --red-btn: #fde8e8;
+    --red-btn-hover: #fad5d5;
+
+    --blue: #3d6cb9;
+  }
+}
+
 * { box-sizing: border-box; }
 html { background: var(--bg); }
 body { margin: 0; color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
@@ -623,17 +821,19 @@ body { margin: 0; color: var(--text); font: 15px/1.5 system-ui, -apple-system, "
 header { display: flex; align-items: center; gap: 12px; padding: 22px 0 14px; }
 [hidden] { display: none !important; }
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); }
-.tab { background: none; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; color: var(--muted); font: inherit; font-size: 14px; font-weight: 600; padding: 8px 14px; cursor: pointer; border-radius: 6px 6px 0 0; }
+.tab { background: none; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; color: var(--muted); font: inherit; font-size: 14px; font-weight: 600; padding: 8px 14px; cursor: pointer; border-radius: 0; }
 .tab:hover { color: var(--text); }
 .tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--blue); }
 h1 { font-size: 19px; font-weight: 650; margin: 0; letter-spacing: .1px; }
-.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); box-shadow: 0 0 0 3px rgba(248,81,73,.18); flex: none; }
-.dot.on { background: var(--green); box-shadow: 0 0 0 3px rgba(63,185,80,.18); }
+.dot { width: 10px; height: 10px; border-radius: 0; background: var(--red); box-shadow: 0 0 0 2px var(--red-border); flex: none; }
+.dot.on { background: var(--green); box-shadow: 0 0 0 2px var(--green-border); }
 .count { color: var(--muted); font-size: 14px; }
 .spacer { flex: 1; }
-.link { background: none; border: 0; color: var(--blue); font: inherit; font-size: 13px; cursor: pointer; padding: 2px 4px; border-radius: 4px; text-decoration: underline; text-underline-offset: 2px; }
-button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
-.banner { border: 1px solid rgba(248,81,73,.45); background: rgba(248,81,73,.1); color: #ffb4af; padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
+.theme-toggle { background: var(--card-2); border: 1px solid var(--line); color: var(--text); font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; padding: 4px 10px; border-radius: 0; }
+.theme-toggle:hover { border-color: var(--line-strong); }
+.link { background: none; border: 0; color: var(--link); font: inherit; font-size: 13px; cursor: pointer; padding: 2px 4px; border-radius: 0; text-decoration: underline; text-underline-offset: 2px; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.banner { border: 1px solid var(--red-border); background: var(--red-bg); color: var(--red-text); padding: 10px 14px; border-radius: 0; margin-bottom: 16px; font-size: 14px; }
 .banner[hidden] { display: none; }
 .empty { text-align: center; padding: 90px 20px; color: var(--muted); }
 .empty strong { display: block; color: var(--text); font-size: 18px; font-weight: 600; margin-bottom: 6px; }
@@ -642,60 +842,84 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
 .group-title { display: flex; align-items: baseline; gap: 8px; margin: 0 0 10px 2px; font-size: 13px; font-weight: 600; color: var(--text); }
 .group-title span { color: var(--muted); font-weight: 400; font-family: var(--mono); font-size: 12px; }
 .cards { display: flex; flex-direction: column; gap: 12px; }
-.card { position: relative; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px 16px 24px; overflow: hidden; transition: opacity .35s, transform .35s; }
-.card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 5px; background: var(--green); }
+.card { position: relative; background: var(--card); border: 1px solid var(--line); border-radius: 0; padding: 16px 18px 16px 24px; overflow: hidden; transition: opacity .35s, transform .35s; }
+.card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--green); }
 .card.risk-medium::before { background: var(--amber); }
-.card.risk-critical { border-color: rgba(248,81,73,.7); background: linear-gradient(rgba(248,81,73,.07), rgba(248,81,73,.07)), var(--card); }
+.card.risk-critical { border-color: var(--red-border); background: linear-gradient(var(--red-bg), var(--red-bg)), var(--card); }
 .card.risk-critical::before { background: var(--red); }
 .card.leaving { opacity: 0; transform: translateY(-6px); pointer-events: none; }
 .top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
-.badge { font-size: 11px; font-weight: 700; letter-spacing: .6px; padding: 2px 8px; border-radius: 999px; color: #0b0f14; background: var(--green); }
-.risk-medium .badge { background: var(--amber); }
-.risk-critical .badge { background: var(--red); color: #fff; }
-.pill { font-size: 12px; font-weight: 600; padding: 2px 10px; border-radius: 999px; border: 1px solid; }
-.pill.approve { color: #6ee07f; border-color: rgba(63,185,80,.5); background: rgba(63,185,80,.1); }
-.pill.deny { color: #ff8a84; border-color: rgba(248,81,73,.55); background: rgba(248,81,73,.1); }
-.pill.review { color: #f0be5a; border-color: rgba(227,164,40,.5); background: rgba(227,164,40,.1); }
+.badge { font-size: 11px; font-weight: 700; letter-spacing: .6px; padding: 2px 7px; border-radius: 0; color: #16241b; background: var(--green); border: 1px solid var(--green); }
+.risk-medium .badge { background: var(--amber); color: #2e2007; border-color: var(--amber); }
+.risk-critical .badge { background: var(--red); color: #361010; border-color: var(--red); }
+.pill { font-size: 12px; font-weight: 600; padding: 2px 9px; border-radius: 0; border: 1px solid; }
+.pill.approve { color: var(--green-text); border-color: var(--green-border); background: var(--green-bg); }
+.pill.deny { color: var(--red-text); border-color: var(--red-border); background: var(--red-bg); }
+.pill.review, .pill.redirected { color: var(--amber-text); border-color: var(--amber-border); background: var(--amber-bg); }
+.pill.expired { color: var(--muted); border-color: var(--line-strong); background: var(--card-2); }
+.parked { margin: 0 0 14px; padding: 8px 12px; color: var(--amber-text); background: var(--amber-bg); border: 1px solid var(--amber-border); font-size: 13px; overflow-wrap: anywhere; }
+.intent-editor { margin-top: 14px; padding: 14px; border: 1px solid var(--line-strong); background: var(--card-2); }
+.field { display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: var(--muted); margin-bottom: 12px; min-width: 0; }
+.field input, .field textarea, .field select { width: 100%; min-width: 0; border: 1px solid var(--line-strong); background: var(--card-cmd); color: var(--text); padding: 8px 10px; font: inherit; border-radius: 0; }
+.field textarea { resize: vertical; font: 12px/1.6 var(--mono); min-height: 100px; }
+.note-field { margin-bottom: 10px; }
+.note-field .note { flex: none; width: 100%; }
+.intent-session { margin: 0 0 12px; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 .time { margin-left: auto; color: var(--muted); font-size: 12.5px; white-space: nowrap; }
-.tldr { font-size: 18px; line-height: 1.4; font-weight: 600; margin: 0 0 12px; overflow-wrap: anywhere; }
-.lock { border: 1px solid rgba(227,164,40,.5); background: rgba(227,164,40,.1); color: #f3cd7e; border-radius: 8px; padding: 8px 12px; font-size: 13.5px; margin: 0 0 12px; }
+.tldr { font-size: 15px; line-height: 1.6; font-weight: 400; color: var(--text); margin: 0 0 14px; overflow-wrap: anywhere; }
+.section-label { display: block; color: var(--muted); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .8px; margin: 0 0 5px; }
+.project { margin-bottom: 14px; overflow-wrap: anywhere; }
+.project strong { display: block; font-size: 15px; }
+.project code { color: var(--muted); font: 12px/1.6 var(--mono); }
+.path-details { margin: 0 0 14px; border: 1px solid var(--line); border-radius: 0; background: var(--card-2); }
+.path-details > summary { padding: 10px 12px; cursor: pointer; font-size: 13px; font-weight: 600; }
+.path-details > summary:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.path-body { padding: 0 12px 12px; max-height: 30em; overflow: auto; }
+.path-group { margin-top: 10px; }
+.path-directory { display: block; font: 12px/1.6 var(--mono); color: var(--blue); overflow-wrap: anywhere; font-weight: 600; }
+.path-list { list-style: none; padding: 0 0 0 14px; margin: 2px 0 0; }
+.path-list li { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; font: 12px/1.7 var(--mono); overflow-wrap: anywhere; }
+.path-role, .path-note { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.path-note { margin: 8px 0 0; }
+.path-status { color: var(--green); font-size: 11px; font-weight: 600; }
+.lock { border: 1px solid var(--amber-border); background: var(--amber-bg); color: var(--amber-text); border-radius: 0; padding: 8px 12px; font-size: 13.5px; margin: 0 0 12px; }
 .cmd-wrap { margin-bottom: 10px; }
-.cmd { background: #0b0e13; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
-.cmd-text { margin: 0; font: 13px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; max-height: 18em; overflow: hidden; color: #d7dee6; }
+.cmd { background: var(--card-cmd); border: 1px solid var(--line); border-radius: 0; padding: 10px 12px; }
+.cmd-text { margin: 0; font: 13px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; max-height: 18em; overflow: hidden; color: var(--text); }
 .cmd-text.open { max-height: none; }
 .toggle { margin-top: 4px; padding-left: 0; }
 .toggle[hidden] { display: none; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-.chip { font-size: 12px; color: var(--muted); background: var(--card-2); border: 1px solid var(--line); border-radius: 6px; padding: 1px 8px; overflow-wrap: anywhere; }
+.chip { font-size: 12px; color: var(--muted); background: var(--card-2); border: 1px solid var(--line); border-radius: 0; padding: 1px 7px; overflow-wrap: anywhere; }
 .meta { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--muted); font-size: 12.5px; margin-bottom: 14px; }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.note { flex: 1 1 200px; min-width: 160px; height: 36px; background: #0b0e13; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 0 10px; font: inherit; font-size: 13.5px; }
-.note::placeholder { color: #7d8895; }
-.btn { height: 36px; padding: 0 16px; border-radius: 8px; border: 1px solid var(--line); background: var(--card-2); color: var(--text); font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; }
-.btn:hover:not(:disabled) { border-color: #3b4452; background: #232a35; }
-.btn.primary { background: #238636; border-color: #2ea043; color: #fff; }
-.btn.primary:hover:not(:disabled) { background: #2ea043; border-color: #3fb950; }
-.btn.armed, .btn.armed:hover:not(:disabled) { background: #da3633; border-color: #f85149; color: #fff; }
+.note { flex: 1 1 200px; min-width: 160px; height: 36px; background: var(--card-cmd); color: var(--text); border: 1px solid var(--line); border-radius: 0; padding: 0 10px; font: inherit; font-size: 13.5px; }
+.note::placeholder { color: var(--muted); opacity: 0.75; }
+.btn { height: 36px; padding: 0 16px; border-radius: 0; border: 1px solid var(--line); background: var(--card-2); color: var(--text); font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; }
+.btn:hover:not(:disabled) { border-color: var(--line-strong); background: var(--card); }
+.btn.primary { background: var(--green-btn); border-color: var(--green-border); color: var(--green-btn-text); }
+.btn.primary:hover:not(:disabled) { background: var(--green-btn-hover); border-color: var(--green); }
+.btn.armed, .btn.armed:hover:not(:disabled) { background: var(--red-btn); border-color: var(--red); color: #fff; }
 .btn:disabled { opacity: .45; cursor: not-allowed; }
-.err { color: #ff8a84; font-size: 13px; flex-basis: 100%; }
+.err { color: var(--red-text); font-size: 13px; flex-basis: 100%; }
 .err:empty { display: none; }
-.badge.b-medium { background: var(--amber); }
-.badge.b-critical { background: var(--red); color: #fff; }
+.badge.b-medium { background: var(--amber); color: #2e2007; }
+.badge.b-critical { background: var(--red); color: #361010; }
 .cmd-text.scroll { max-height: 24em; overflow: auto; }
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 8px; }
-.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-.seg button { background: var(--card); color: var(--muted); border: 0; border-right: 1px solid var(--line); font: inherit; font-size: 13px; font-weight: 600; height: 32px; padding: 0 14px; cursor: pointer; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 0; overflow: hidden; }
+.seg button { background: var(--card); color: var(--muted); border: 0; border-right: 1px solid var(--line); font: inherit; font-size: 13px; font-weight: 600; height: 32px; padding: 0 14px; cursor: pointer; border-radius: 0; }
 .seg button:last-child { border-right: 0; }
 .seg button:hover { color: var(--text); }
-.seg button[aria-pressed="true"] { background: #243044; color: var(--text); }
+.seg button[aria-pressed="true"] { background: var(--card-2); color: var(--text); }
 .seg button:focus-visible { outline-offset: -2px; }
-.search { flex: 1 1 220px; min-width: 160px; height: 32px; background: #0b0e13; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 0 10px; font: inherit; font-size: 13.5px; }
-.search::placeholder { color: #7d8895; }
+.search { flex: 1 1 220px; min-width: 160px; height: 32px; background: var(--card-cmd); color: var(--text); border: 1px solid var(--line); border-radius: 0; padding: 0 10px; font: inherit; font-size: 13.5px; }
+.search::placeholder { color: var(--muted); opacity: 0.75; }
 .showing { color: var(--muted); font-size: 12.5px; margin: 0 2px 10px; }
-.hlist { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--card); overflow-anchor: none; }
+.hlist { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: 0; overflow: hidden; background: var(--card); overflow-anchor: none; }
 .hrow { border-bottom: 1px solid var(--line); }
 .hrow:last-child { border-bottom: 0; }
-.hhead { display: grid; grid-template-columns: 66px 84px 74px 74px minmax(0, 1fr); gap: 4px 12px; align-items: center; width: 100%; text-align: left; background: none; border: 0; color: var(--text); font: inherit; padding: 9px 14px; cursor: pointer; }
+.hhead { display: grid; grid-template-columns: 66px 100px 74px 74px minmax(0, 1fr); gap: 4px 12px; align-items: center; width: 100%; text-align: left; background: none; border: 0; color: var(--text); font: inherit; padding: 9px 14px; cursor: pointer; border-radius: 0; }
 .hhead:hover, .hrow.open .hhead { background: var(--card-2); }
 .hhead:focus-visible { outline-offset: -2px; }
 .hhead .pill, .hhead .badge { justify-self: start; text-align: center; }
@@ -703,7 +927,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
 .htime small { display: block; color: var(--muted); font-size: 11px; }
 .hsrc { font-size: 12.5px; color: var(--muted); }
 .hmain { display: block; min-width: 0; }
-.htldr { display: block; font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.htldr { display: block; font-size: 13.5px; font-weight: 400; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .hsub { display: flex; gap: 8px; font-size: 12px; color: var(--muted); min-width: 0; }
 .hsub .lbl { flex: none; max-width: 35%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hsub code { font: 12px var(--mono); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -734,6 +958,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
       <h1>Permission Gate</h1>
       <span id="count" class="count">0 pending</span>
       <span class="spacer"></span>
+      <button id="theme" class="theme-toggle" type="button" aria-label="Toggle theme">Light mode</button>
       <button id="notify" class="link" type="button" hidden>Enable notifications</button>
     </header>
     <div class="tabs" role="tablist" aria-label="Views">
@@ -752,8 +977,10 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
         <button type="button" data-f="all" aria-pressed="true">All</button>
         <button type="button" data-f="approved" aria-pressed="false">Approved</button>
         <button type="button" data-f="denied" aria-pressed="false">Denied</button>
+        <button type="button" data-f="redirected" aria-pressed="false">Redirected</button>
+        <button type="button" data-f="expired" aria-pressed="false">Expired</button>
       </div>
-      <input id="search" class="search" type="search" placeholder="Search history" aria-label="Search command, summary, session and reasons" autocomplete="off">
+      <input id="search" class="search" type="search" placeholder="Search history" aria-label="Search command, summary, project, paths, session and reasons" autocomplete="off">
     </div>
     <p id="showing" class="showing">Showing 0 of 0</p>
     <div id="hempty" class="empty"><strong id="hempty-t">No decisions yet</strong><span id="hempty-s">Decisions will be listed here.</span></div>
@@ -777,7 +1004,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
   } catch (e) {}
 
   var $ = function (id) { return document.getElementById(id); };
-  var listEl = $('list'), emptyEl = $('empty'), bannerEl = $('banner'), dotEl = $('dot'), countEl = $('count'), notifyEl = $('notify');
+  var listEl = $('list'), emptyEl = $('empty'), bannerEl = $('banner'), dotEl = $('dot'), countEl = $('count'), notifyEl = $('notify'), themeEl = $('theme');
   var tabPendingEl = $('tab-pending');
   var cards = {};      // id -> card object
   var groups = {};     // sessionId -> group element
@@ -846,6 +1073,39 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
   });
   refreshNotifyLink();
 
+  // ----- theme toggling (sharp, pastel, dark/light) -----
+  var savedTheme = null;
+  try { savedTheme = localStorage.getItem('pg-theme'); } catch (e) {}
+  function applyTheme(t) {
+    if (t === 'light' || t === 'dark') {
+      document.documentElement.setAttribute('data-theme', t);
+      if (themeEl) themeEl.textContent = t === 'light' ? 'Dark mode' : 'Light mode';
+    } else {
+      document.documentElement.removeAttribute('data-theme');
+      var isLight = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+      if (themeEl) themeEl.textContent = isLight ? 'Dark mode' : 'Light mode';
+    }
+  }
+  if (savedTheme) applyTheme(savedTheme);
+  else applyTheme('auto');
+  if (themeEl) {
+    themeEl.addEventListener('click', function () {
+      var current = document.documentElement.getAttribute('data-theme');
+      if (!current) {
+        var isLight = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+        current = isLight ? 'light' : 'dark';
+      }
+      var next = current === 'light' ? 'dark' : 'light';
+      applyTheme(next);
+      try { localStorage.setItem('pg-theme', next); } catch (e) {}
+    });
+  }
+  if (window.matchMedia) {
+    window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', function () {
+      try { if (!localStorage.getItem('pg-theme')) applyTheme('auto'); } catch (e) {}
+    });
+  }
+
   function notifyNew(r) {
     if (!document.hidden) return;
     startFlash();
@@ -862,6 +1122,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
     for (var id in cards) {
       var c = cards[id], off = !connected || c.busy;
       for (var i = 0; i < c.buttons.length; i++) c.buttons[i].disabled = off;
+      if (c.redirect) c.redirect.disabled = off || !c.note.value.trim();
     }
   }
 
@@ -869,6 +1130,12 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
     setBusy(c, true);
     c.err.textContent = '';
     var body = { decision: decision, scope: scope, note: c.note.value.trim() || undefined };
+    if (scope === 'intent') body.intent = {
+      label: c.intentLabel.value,
+      access: c.intentAccess.value,
+      reasons: c.req.intentProposal.reasons.slice(),
+      targets: c.intentTargets.value.split('\n').map(function (v) { return v.trim(); }).filter(Boolean)
+    };
     if (confirm) body.confirm = true;
     fetch('/api/requests/' + encodeURIComponent(c.req.id) + '/decision', {
       method: 'POST',
@@ -904,6 +1171,80 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
     return b;
   }
 
+  function intentEditor(c) {
+    var proposal = c.req.intentProposal;
+    var panel = h('div', 'intent-editor');
+    panel.hidden = true;
+    panel.appendChild(h('p', 'intent-session', 'This session only: ' + c.req.sessionLabel + ' · ' + c.req.sessionId));
+    function field(text, control) {
+      var label = h('label', 'field', text);
+      label.appendChild(control);
+      panel.appendChild(label);
+      return control;
+    }
+    c.intentLabel = field('Intent label', h('input'));
+    c.intentLabel.type = 'text';
+    c.intentLabel.maxLength = 160;
+    c.intentLabel.value = proposal.label;
+    c.intentAccess = field('Access', h('select'));
+    ['read', 'write'].forEach(function (access) {
+      var option = h('option', '', access === 'read' ? 'Read only' : 'Read and write');
+      option.value = access;
+      c.intentAccess.appendChild(option);
+    });
+    c.intentAccess.value = proposal.access;
+    c.intentTargets = field('Intent targets (one per line)', h('textarea'));
+    c.intentTargets.value = proposal.targets.join('\n');
+    c.intentTargets.rows = Math.min(8, Math.max(3, proposal.targets.length));
+    panel.appendChild(h('p', 'intent-session', 'You can narrow this intent. The gate checks the final scope before the command can run.'));
+    var approve = approveButton(c, 'Approve intent', 'intent', true);
+    c.buttons.push(approve);
+    panel.appendChild(approve);
+    return panel;
+  }
+
+  function projectBlock(cwd) {
+    var block = h('div', 'project');
+    block.appendChild(h('span', 'section-label', 'Project'));
+    block.appendChild(h('strong', '', baseName(cwd) || cwd));
+    block.appendChild(h('code', '', cwd));
+    return block;
+  }
+
+  function pathDetails(r) {
+    var details = h('details', 'path-details');
+    var paths = r.paths || [];
+    details.appendChild(h('summary', '', 'Files and paths' + (r.paths ? ' (' + paths.length + ')' : ' — unavailable')));
+    var body = h('div', 'path-body');
+    var groups = new Map();
+    paths.forEach(function (entry) {
+      var slash = entry.path.lastIndexOf('/');
+      var directory = entry.unresolved ? 'Unresolved paths' : (slash === 0 ? '/' : entry.path.slice(0, slash) + '/');
+      var name = entry.unresolved ? entry.path : entry.path.slice(slash + 1) || '/';
+      if (!groups.has(directory)) groups.set(directory, []);
+      groups.get(directory).push({ entry: entry, name: name });
+    });
+    groups.forEach(function (files, directory) {
+      var group = h('div', 'path-group');
+      group.appendChild(h('code', 'path-directory', directory));
+      var list = h('ul', 'path-list');
+      files.forEach(function (file) {
+        var row = h('li');
+        row.appendChild(h('span', '', file.name));
+        row.appendChild(h('span', 'path-role', file.entry.role));
+        if (file.entry.inspected) row.appendChild(h('span', 'path-status', 'Code inspected'));
+        if (file.entry.unresolved) row.appendChild(h('span', 'path-role', 'Unresolved'));
+        list.appendChild(row);
+      });
+      group.appendChild(list);
+      body.appendChild(group);
+    });
+    body.appendChild(h('p', 'path-note', r.paths ? 'Static references only. Runtime code can construct additional paths. File contents are not stored here.' : 'This request did not include a path inspection. Review the exact command.'));
+    (r.pathNotes || []).forEach(function (note) { body.appendChild(h('p', 'path-note', note)); });
+    details.appendChild(body);
+    return details;
+  }
+
   function buildCard(r) {
     var c = { req: r, busy: false, expanded: false, leaving: false, buttons: [] };
     var el = h('article', 'card risk-' + r.risk);
@@ -919,8 +1260,14 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
     c.timeEl = h('span', 'time');
     top.appendChild(c.timeEl);
     el.appendChild(top);
+    c.parked = h('div', 'parked', 'Agent stopped waiting — your answer is still delivered');
+    c.parked.hidden = !r.parked;
+    el.appendChild(c.parked);
 
+    el.appendChild(projectBlock(r.cwd));
+    el.appendChild(h('span', 'section-label', 'Execution summary'));
     el.appendChild(h('p', 'tldr', r.tldr));
+    el.appendChild(pathDetails(r));
     if (r.kind === 'lockdown') {
       el.appendChild(h('div', 'lock', 'Lockdown: the agent was blocked several times. Every command needs your approval until you lift it.'));
     }
@@ -959,7 +1306,11 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
     c.note.maxLength = 500;
     c.note.placeholder = 'Note for the agent (optional)';
     c.note.setAttribute('aria-label', 'Note for the agent (optional)');
-    var approve = approveButton(c, r.kind === 'lockdown' ? 'Approve this command' : 'Approve', 'once', true);
+    var noteLabel = h('label', 'field note-field', 'Note or redirect instruction');
+    noteLabel.appendChild(c.note);
+    el.appendChild(noteLabel);
+    c.note.addEventListener('input', syncDisabled);
+    var approve = approveButton(c, r.kind === 'lockdown' ? 'Approve this command' : 'Approve once', 'once', true);
     c.buttons.push(approve);
     actions.appendChild(approve);
     if (r.kind === 'lockdown') {
@@ -967,16 +1318,36 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
       c.buttons.push(lift);
       actions.appendChild(lift);
     }
+    var editor;
+    if (r.intentProposal) {
+      editor = intentEditor(c);
+      var grant = h('button', 'btn', 'Approve for session…');
+      grant.type = 'button';
+      grant.setAttribute('aria-expanded', 'false');
+      grant.addEventListener('click', function () {
+        editor.hidden = !editor.hidden;
+        grant.setAttribute('aria-expanded', editor.hidden ? 'false' : 'true');
+        if (!editor.hidden) c.intentLabel.focus();
+      });
+      c.buttons.push(grant);
+      actions.appendChild(grant);
+    }
+    c.redirect = h('button', 'btn', 'Redirect…');
+    c.redirect.type = 'button';
+    c.redirect.title = 'Enter an instruction in the note field to redirect.';
+    c.redirect.addEventListener('click', function () { send(c, 'redirect', 'once', false); });
+    c.buttons.push(c.redirect);
+    actions.appendChild(c.redirect);
     var deny = h('button', 'btn', 'Deny');
     deny.type = 'button';
     deny.addEventListener('click', function () { send(c, 'deny', 'once', false); });
     c.buttons.push(deny);
     actions.appendChild(deny);
-    actions.appendChild(c.note);
     c.err = h('div', 'err');
     c.err.setAttribute('role', 'alert');
     actions.appendChild(c.err);
     el.appendChild(actions);
+    if (editor) el.appendChild(editor);
 
     updateTimes(c);
     return c;
@@ -1041,7 +1412,11 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
   }
 
   function addCard(r) {
-    if (cards[r.id]) return false;
+    if (cards[r.id]) {
+      cards[r.id].req.parked = r.parked;
+      cards[r.id].parked.hidden = !r.parked;
+      return false;
+    }
     cards[r.id] = buildCard(r);
     return true;
   }
@@ -1091,8 +1466,21 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
       var r = JSON.parse(e.data);
       if (addCard(r)) { render(); notifyNew(r); }
     });
+    es.addEventListener('parked', function (e) {
+      var c = cards[JSON.parse(e.data).id];
+      if (c) { c.req.parked = true; c.parked.hidden = false; }
+    });
     es.addEventListener('resolved', function (e) { removeCard(JSON.parse(e.data).id); });
     es.addEventListener('history', function (e) { addHistoryEntry(JSON.parse(e.data)); });
+    es.addEventListener('replaced', function () {
+      // The server restarts with new code on a new port. This tab cannot reconnect.
+      es.close();
+      clearTimeout(retryTimer);
+      es.onerror = null;
+      setConnected(false);
+      bannerEl.textContent = 'The approval server was updated. Pi opens a new tab with the next request. You can close this tab.';
+      bannerEl.hidden = false;
+    });
   }
 
   // ----- history -----
@@ -1103,7 +1491,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
   var hFilter = 'all', hQuery = '', expandedId = null;
   var hlistEl = $('hlist'), hemptyEl = $('hempty'), showingEl = $('showing'), tabHistoryEl = $('tab-history'), searchEl = $('search');
   var panelPending = $('panel-pending'), panelHistory = $('panel-history');
-  var SRC = { auto: 'Auto', human: 'You', rule: 'Rule', 'hard-deny': 'Hard deny' };
+  var SRC = { auto: 'Auto', human: 'You', rule: 'Rule', 'hard-deny': 'Hard deny', grant: 'Grant' };
 
   function pad(n) { return n < 10 ? '0' + n : '' + n; }
   function clock(d) { return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()); }
@@ -1111,12 +1499,14 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
   function matches(e) {
     if (hFilter !== 'all' && e.status !== hFilter) return false;
     if (!hQuery) return true;
-    var hay = e.command + '\n' + e.tldr + '\n' + e.sessionLabel + '\n' + e.reasons.join('\n');
+    var hay = e.command + '\n' + e.tldr + '\n' + e.sessionLabel + '\n' + e.cwd + '\n' + e.reasons.join('\n') + '\n' + (e.paths || []).map(function (p) { return p.path; }).join('\n');
     return hay.toLowerCase().indexOf(hQuery) !== -1;
   }
 
   function buildDetail(e) {
     var d = h('div', 'hdetail');
+    d.appendChild(projectBlock(e.cwd));
+    d.appendChild(pathDetails(e));
     var box = h('div', 'cmd');
     box.appendChild(h('pre', 'cmd-text scroll', e.command));
     d.appendChild(box);
@@ -1131,6 +1521,11 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
     meta.appendChild(h('span', '', 'Session: ' + label + (folder === label ? '' : ' (' + folder + ')')));
     if (e.model) meta.appendChild(h('span', '', 'Model: ' + e.model));
     if (e.via) meta.appendChild(h('span', '', 'Via: ' + e.via));
+    if (e.recommendation) meta.appendChild(h('span', '', 'Recommended: ' + e.recommendation));
+    if (e.scope) meta.appendChild(h('span', '', 'Scope: ' + e.scope));
+    if (e.grantId) meta.appendChild(h('span', '', 'Grant: ' + e.grantId));
+    if (Number.isFinite(e.shownAt)) meta.appendChild(h('span', '', 'Shown: ' + new Date(e.shownAt).toLocaleString()));
+    if (Number.isFinite(e.answeredAt)) meta.appendChild(h('span', '', 'Answered: ' + new Date(e.answeredAt).toLocaleString()));
     d.appendChild(meta);
     if (e.note) d.appendChild(h('div', 'hnote', 'Note: ' + e.note));
     return d;
@@ -1156,8 +1551,10 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
       t.appendChild(h('small', '', d.toLocaleDateString([], { day: 'numeric', month: 'short' })));
     }
     head.appendChild(t);
-    head.appendChild(h('span', 'pill ' + (e.status === 'approved' ? 'approve' : 'deny'), e.status === 'approved' ? 'Approved' : 'Denied'));
-    head.appendChild(h('span', 'hsrc', SRC[e.source] || e.source));
+    var statusStyle = { approved: 'approve', denied: 'deny', redirected: 'redirected', expired: 'expired' };
+    var statusText = { approved: 'Approved', denied: 'Denied', redirected: 'Redirected', expired: 'Expired' };
+    head.appendChild(h('span', 'pill ' + (statusStyle[e.status] || 'review'), statusText[e.status] || 'Unknown'));
+    head.appendChild(h('span', 'hsrc', SRC[e.source] || e.source || 'Unknown'));
     head.appendChild(h('span', 'badge b-' + e.risk, e.risk.toUpperCase()));
     var main = h('span', 'hmain');
     main.appendChild(h('span', 'htldr', e.tldr));
@@ -1211,7 +1608,12 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
 
   // Insert one new entry at the top. Keep scroll position and open rows.
   function addHistoryEntry(e) {
-    if (histIds[e.id]) return;
+    if (histIds[e.id]) {
+      var index = hist.findIndex(function (entry) { return entry.id === e.id; });
+      if (index >= 0) hist[index] = e;
+      renderHistory();
+      return;
+    }
     histIds[e.id] = true;
     hist.unshift(e);
     if (hist.length > HMAX) {

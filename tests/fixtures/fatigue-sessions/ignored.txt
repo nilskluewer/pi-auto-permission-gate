@@ -1,0 +1,1 @@
+{"type":"custom","customType":"permission-gate-decision","data":{"command":"must not count","status":"approved","source":"human","timestamp":1792573200000}}
