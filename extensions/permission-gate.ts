@@ -3105,6 +3105,31 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 	});
 }
 
+export const NO_GATE_FLAG = "no-permission-gate";
+
+/**
+ * `--no-permission-gate` turns the gate off for one run (unattended automations).
+ * It works only inside the spi sandbox (SPI=1), where the VM is the security boundary.
+ */
 export default function (pi: ExtensionAPI): void {
-	createPermissionGate(pi);
+	pi.registerFlag(NO_GATE_FLAG, {
+		type: "boolean",
+		description: "Turn the permission gate off for this run. Works only inside the spi sandbox (SPI=1).",
+	});
+	const requested = () => pi.getFlag(NO_GATE_FLAG) === true;
+	const off = () => requested() && process.env.SPI === "1";
+	pi.on("session_start", (_event, ctx) => {
+		if (!requested()) return;
+		if (off()) ctx.ui.setStatus(STATUS_ID, "permission gate: OFF (--no-permission-gate, sandbox)");
+		else ctx.ui.notify("--no-permission-gate works only inside the spi sandbox (SPI=1). The permission gate stays on.", "warning");
+	});
+	// Every gate handler becomes a no-op while the gate is off.
+	const gated = new Proxy(pi, {
+		get(target, prop, receiver) {
+			if (prop !== "on") return Reflect.get(target, prop, receiver);
+			return (event: string, handler: (event: unknown, ctx: unknown) => unknown) =>
+				target.on(event as never, ((e: unknown, ctx: unknown) => (off() ? undefined : handler(e, ctx))) as never);
+		},
+	});
+	createPermissionGate(gated);
 }
