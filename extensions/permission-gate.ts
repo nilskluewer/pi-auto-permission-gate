@@ -370,6 +370,8 @@ type AutoModePreferencesLoader = () => Promise<string | undefined>;
 type AutoModePreferencesSaver = (preferences: string) => Promise<void>;
 
 export type PermissionGateDependencies = {
+	/** Read once at the first session_start: true starts with the gate fully off. */
+	startOff?: () => boolean;
 	approvalWaitMs?: number;
 	now?: () => number;
 	complete?: ClassifierComplete;
@@ -421,6 +423,7 @@ const DEFAULT_CLASSIFIER_MODEL: ClassifierModelReference = {
 const NO_SCOPED_CLASSIFIER_MODELS_WARNING =
 	"This session has no scoped models. Configure a session model scope with Pi's --models option or the enabledModels setting before using the model picker.";
 const STATUS_ID = "permission-gate";
+const GATE_COMMAND = "permission-gate";
 const MODE_ENTRY_TYPE = "permission-gate-mode";
 const DECISION_ENTRY_TYPE = "permission-gate-decision";
 // The agent waits this long for an answer. After that, the browser request stays open
@@ -1952,6 +1955,16 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 	let autoModePreferences = "";
 	let productionPatterns = [...DEFAULT_PRODUCTION_PATTERNS];
 	let approvalWaitSeconds = DEFAULT_APPROVAL_WAIT_SECONDS;
+	// Fully off: tool_call does nothing. Set by --no-permission-gate or /permission-gate off.
+	let gateOff: boolean | undefined;
+	// One footer slot: "permission gate: OFF" replaces the auto-mode status while the gate is off.
+	const refreshStatus = (ctx: ExtensionContext): void => {
+		if (gateOff) {
+			if (ctx.hasUI) ctx.ui.setStatus(STATUS_ID, "permission gate: OFF");
+			return;
+		}
+		setAutoModeStatus(ctx, autoModeEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
+	};
 	const now = dependencies.now ?? Date.now;
 	const intentStore = createIntentStore({ now });
 	let sessionGeneration = 0;
@@ -2108,7 +2121,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			}
 			classifierModel = { provider: selected.model.provider, id: selected.model.id };
 			await persistMode(ctx);
-			setAutoModeStatus(ctx, autoModeEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
+			refreshStatus(ctx);
 			notify(
 			ctx,
 			`Permission gate classifier model set to ${formatClassifierModelLabel(classifierModel, selected, classifierThinkingLevel)}.`,
@@ -2127,7 +2140,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			classifierModel = cloneClassifierModelReference(DEFAULT_CLASSIFIER_MODEL);
 			syncAvailableClassifierModels(ctx);
 			await persistMode(ctx);
-			setAutoModeStatus(ctx, autoModeEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
+			refreshStatus(ctx);
 			notify(
 				ctx,
 				`Permission gate classifier model reset to ${formatClassifierModelLabel(classifierModel, findAvailableClassifierModel(availableClassifierModels, classifierModel), classifierThinkingLevel)}.`,
@@ -2150,7 +2163,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		}
 		classifierModel = { provider: selected.model.provider, id: selected.model.id };
 		await persistMode(ctx);
-		setAutoModeStatus(ctx, autoModeEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
+		refreshStatus(ctx);
 		notify(
 			ctx,
 			`Permission gate classifier model set to ${formatClassifierModelLabel(classifierModel, selected, classifierThinkingLevel)}.`,
@@ -2213,7 +2226,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 
 		syncAvailableClassifierModels(ctx);
 		await persistMode(ctx);
-		setAutoModeStatus(ctx, autoModeEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
+		refreshStatus(ctx);
 		notify(
 			ctx,
 			`Permission gate classifier for ${classifierModelDisplayId(classifierModel)} is ${formatClassifierThinkingLevel(classifierThinkingLevel, findAvailableClassifierModel(availableClassifierModels, classifierModel)?.model)}.`,
@@ -2424,7 +2437,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				`Permission gate auto mode is ${autoModeEnabled ? "ON" : "OFF"}; classifier model is ${formatClassifierModelLabel(classifierModel, selected, classifierThinkingLevel)}; context history: ${classifierHistoryMessages} message${classifierHistoryMessages === 1 ? "" : "s"}; approval wait: ${approvalWaitSeconds}s; production patterns: ${productionPatterns.join(", ")}; active grants: ${intentStore.list(gateSessionId).length}.`,
 				"info",
 			);
-			setAutoModeStatus(ctx, autoModeEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
+			refreshStatus(ctx);
 			return;
 		} else {
 			notify(
@@ -2437,7 +2450,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 
 		syncAvailableClassifierModels(ctx);
 		await persistMode(ctx);
-		setAutoModeStatus(ctx, autoModeEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
+		refreshStatus(ctx);
 		notify(
 			ctx,
 			autoModeEnabled
@@ -2685,6 +2698,23 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		},
 	});
 
+	pi.registerCommand(GATE_COMMAND, {
+		description: "Turn the permission gate fully on or off for this pi process: /permission-gate on|off|status",
+		getArgumentCompletions: (prefix) =>
+			["on", "off", "status"].filter((v) => v.startsWith(prefix.trim().toLowerCase())).map((v) => ({ value: v, label: v })),
+		handler: async (args, ctx) => {
+			const action = String(args ?? "").trim().toLowerCase();
+			if (action === "on" || action === "off") {
+				gateOff = action === "off";
+				refreshStatus(ctx);
+			} else if (action && action !== "status") {
+				notify(ctx, "Usage: /permission-gate on|off|status", "warning");
+				return;
+			}
+			notify(ctx, `Permission gate: ${gateOff ? "OFF" : "ON"}.`, "info");
+		},
+	});
+
 	pi.registerCommand("approvals", {
 		description: "Open the approval queue and decision history in the browser",
 		handler: async (_args, ctx) => {
@@ -2701,6 +2731,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 
 	pi.on("session_shutdown", clearSessionApprovals);
 	pi.on("session_start", async (_event, ctx) => {
+		gateOff ??= dependencies.startOff?.() ?? false;
 		clearSessionApprovals();
 		const [restored, loadedRules, loadedPreferences] = await Promise.all([
 			initializeModeState(dependencies, ctx),
@@ -2721,7 +2752,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		ruleScope = loadedRules.scope;
 		syncAvailableClassifierModels(ctx);
 		syncScopedClassifierModels(ctx);
-		setAutoModeStatus(ctx, autoModeEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
+		refreshStatus(ctx);
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
@@ -2729,7 +2760,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		// silently turn auto mode off or restore an obsolete branch-local value.
 		syncAvailableClassifierModels(ctx);
 		syncScopedClassifierModels(ctx);
-		setAutoModeStatus(ctx, autoModeEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
+		refreshStatus(ctx);
 	});
 
 	let historyReporter: HistoryReporter | undefined;
@@ -2934,6 +2965,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			.join(" ");
 
 	pi.on("tool_call", async (event, ctx) => {
+		if (gateOff) return undefined;
 		if (event.toolName !== "bash") return undefined;
 
 		const command = typeof event.input.command === "string" ? event.input.command : "";
@@ -3107,29 +3139,11 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 
 export const NO_GATE_FLAG = "no-permission-gate";
 
-/**
- * `--no-permission-gate` turns the gate off for one run (unattended automations).
- * It works only inside the spi sandbox (SPI=1), where the VM is the security boundary.
- */
+/** `--no-permission-gate` starts pi with the gate fully off. `/permission-gate on|off` changes it at runtime. */
 export default function (pi: ExtensionAPI): void {
 	pi.registerFlag(NO_GATE_FLAG, {
 		type: "boolean",
-		description: "Turn the permission gate off for this run. Works only inside the spi sandbox (SPI=1).",
+		description: "Start with the permission gate fully off (no checks, no approvals).",
 	});
-	const requested = () => pi.getFlag(NO_GATE_FLAG) === true;
-	const off = () => requested() && process.env.SPI === "1";
-	pi.on("session_start", (_event, ctx) => {
-		if (!requested()) return;
-		if (off()) ctx.ui.setStatus(STATUS_ID, "permission gate: OFF (--no-permission-gate, sandbox)");
-		else ctx.ui.notify("--no-permission-gate works only inside the spi sandbox (SPI=1). The permission gate stays on.", "warning");
-	});
-	// Every gate handler becomes a no-op while the gate is off.
-	const gated = new Proxy(pi, {
-		get(target, prop, receiver) {
-			if (prop !== "on") return Reflect.get(target, prop, receiver);
-			return (event: string, handler: (event: unknown, ctx: unknown) => unknown) =>
-				target.on(event as never, ((e: unknown, ctx: unknown) => (off() ? undefined : handler(e, ctx))) as never);
-		},
-	});
-	createPermissionGate(gated);
+	createPermissionGate(pi, { startOff: () => pi.getFlag(NO_GATE_FLAG) === true });
 }

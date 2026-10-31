@@ -303,9 +303,14 @@ This separation follows the useful part of Claude Code's auto-mode design: deter
 Auto mode is a safety aid, not a sandbox or a security boundary.
 Do not enable it when the process must be prevented from making any autonomous changes.
 
-## Unattended runs in a sandbox
+## Turn the gate off
 
-`pi --no-permission-gate` turns the gate off for that run, for example in scheduled automations where nobody can answer approval dialogs. The flag works only when pi runs its tools in the spi sandbox (`SPI=1`); there the VM is the security boundary. Outside the sandbox, the gate stays on and shows a warning.
+The gate can be turned fully off. Then it checks nothing: no hard denies, no command rules, no classifier, no approvals.
+
+- `pi --no-permission-gate` starts pi with the gate off, for example for scheduled automations.
+- `/permission-gate off` turns it off in a running pi; `/permission-gate on` turns it on again; `/permission-gate status` shows the state.
+
+The state is for the pi process only; it is not saved. While the gate is off, the footer shows `permission gate: OFF`.
 
 ## Install
 

@@ -63,6 +63,7 @@ function createHarness({
   approvalWaitMs,
   now,
   browserDisabled = false,
+  startOff,
 } = {}) {
   const approvalRequests = [];
   const messages = [];
@@ -211,6 +212,7 @@ function createHarness({
   };
 
   createPermissionGate(pi, {
+    startOff,
     approvalWaitMs,
     now,
     ...(useComplete ? { complete } : {}),
@@ -272,6 +274,45 @@ function createHarness({
     },
   };
 }
+
+// Hard-deny command, built at runtime so the source text does not trip a live gate.
+const HARD_DENY = { toolName: "bash", input: { command: ["rm", "-rf", "/"].join(" ") } };
+
+test("startOff (--no-permission-gate): the gate does nothing, also for hard-deny commands", async () => {
+  const harness = createHarness({ hasUI: true, startOff: () => true });
+  await harness.startSession();
+  assert.equal(await harness.invoke(HARD_DENY), undefined);
+  assert.equal(harness.classifierCalls.length, 0);
+  assert.equal(harness.decisionEntries().length, 0);
+  assert.equal(harness.statuses.get("permission-gate"), "permission gate: OFF");
+  assert.equal(harness.notifications.filter((n) => n.level === "warning").length, 0);
+});
+
+test("/permission-gate off and on change the gate at runtime", async () => {
+  const harness = createHarness({ hasUI: true });
+  await harness.startSession();
+  const gate = harness.commands.get("permission-gate");
+  assert.equal((await harness.invoke(HARD_DENY))?.block, true);
+
+  await gate.handler("off", harness.context);
+  assert.equal(await harness.invoke(HARD_DENY), undefined);
+  assert.equal(harness.statuses.get("permission-gate"), "permission gate: OFF");
+
+  await harness.startSession({ type: "session_start", reason: "new" });
+  assert.equal(await harness.invoke(HARD_DENY), undefined, "off stays off for the whole pi process");
+
+  await gate.handler("on", harness.context);
+  assert.equal((await harness.invoke(HARD_DENY))?.block, true);
+  assert.equal(harness.statuses.get("permission-gate")?.startsWith("auto mode: ON"), true);
+});
+
+test("the default export registers --no-permission-gate", async () => {
+  const { default: register, NO_GATE_FLAG } = await import("../extensions/permission-gate.ts");
+  const flags = [];
+  register({ registerFlag: (name) => flags.push(name), getFlag: () => false, on() {}, registerCommand() {}, registerEntryRenderer() {} });
+  assert.deepEqual(flags, ["no-permission-gate"]);
+  assert.equal(NO_GATE_FLAG, "no-permission-gate");
+});
 
 test("recognizes soft and hard permission rules", () => {
   assert.deepEqual(matchedReasons("rm -rf /tmp/example"), ["recursive/forced rm"]);
@@ -830,9 +871,9 @@ test("discovers text models for picker and autocomplete, supports slash-containi
   });
 });
 
-test("registers only the settings and approvals commands", () => {
+test("registers only the settings, gate switch, and approvals commands", () => {
   const harness = createHarness();
-  assert.deepEqual([...harness.commands.keys()], ["automode-settings", "approvals"]);
+  assert.deepEqual([...harness.commands.keys()], ["automode-settings", "permission-gate", "approvals"]);
 });
 
 test("central auto-mode settings command groups configuration", async () => {
