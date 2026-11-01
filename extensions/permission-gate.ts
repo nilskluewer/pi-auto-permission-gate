@@ -1965,6 +1965,11 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		}
 		setAutoModeStatus(ctx, autoModeEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
 	};
+	const setGate = (ctx: ExtensionContext, value: "on" | "off"): void => {
+		gateOff = value === "off";
+		refreshStatus(ctx);
+		notify(ctx, `Permission gate: ${gateOff ? "OFF" : "ON"}.`, "info");
+	};
 	const now = dependencies.now ?? Date.now;
 	const intentStore = createIntentStore({ now });
 	let sessionGeneration = 0;
@@ -2608,6 +2613,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		syncScopedClassifierModels(ctx);
 		const selected = findAvailableClassifierModel(availableClassifierModels, classifierModel);
 		return {
+			gateOff: gateOff === true,
 			autoModeEnabled,
 			classifierModel: formatClassifierModelLabel(classifierModel, selected, classifierThinkingLevel),
 			classifierModelOptions: getPermissionSettingsModelOptions(),
@@ -2625,6 +2631,8 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 
 	const handlePermissionSettingsAction = async (action: PermissionSettingsAction, ctx: ExtensionContext): Promise<void> => {
 		switch (action.type) {
+			case "gate":
+				setGate(ctx, action.value); return;
 			case "production-patterns":
 				await handleAutoModeSettingsCommand("production", ctx); return;
 			case "approval-wait":
@@ -2705,13 +2713,12 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		handler: async (args, ctx) => {
 			const action = String(args ?? "").trim().toLowerCase();
 			if (action === "on" || action === "off") {
-				gateOff = action === "off";
-				refreshStatus(ctx);
-			} else if (action && action !== "status") {
+				setGate(ctx, action);
+			} else if (!action || action === "status") {
+				notify(ctx, `Permission gate: ${gateOff ? "OFF" : "ON"}.`, "info");
+			} else {
 				notify(ctx, "Usage: /permission-gate on|off|status", "warning");
-				return;
 			}
-			notify(ctx, `Permission gate: ${gateOff ? "OFF" : "ON"}.`, "info");
 		},
 	});
 

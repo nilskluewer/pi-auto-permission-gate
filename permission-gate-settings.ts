@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-tui";
 
 export type PermissionSettingsAction =
+	| { type: "gate"; value: "on" | "off" }
 	| { type: "auto-mode"; value: "on" | "off" }
 	| { type: "classifier-model"; value: string }
 	| { type: "classifier-thinking"; value: string }
@@ -25,6 +26,7 @@ export type PermissionSettingsAction =
 export type PermissionSettingsOption = SelectItem;
 
 export interface PermissionSettingsView {
+	gateOff?: boolean;
 	autoModeEnabled: boolean;
 	classifierModel: string;
 	classifierModelOptions: readonly PermissionSettingsOption[];
@@ -44,6 +46,8 @@ export interface PermissionSettingsView {
 type Tui = { requestRender: () => void };
 
 const MAX_VISIBLE_SETTINGS = 12;
+const GATE_OFF_DESCRIPTION =
+	"Off: no checks at all (no hard denies, command rules, classifier, or approvals) until pi exits.";
 
 export async function openPermissionSettings(
 	ctx: Pick<ExtensionContext, "mode" | "hasUI" | "ui">,
@@ -69,9 +73,16 @@ function createSettingsComponent(
 ): Component {
 	const items: SettingItem[] = [
 		{
+			id: "gate",
+			label: "Permission gate",
+			description: `${GATE_OFF_DESCRIPTION} Same as /permission-gate on|off.`,
+			currentValue: state.gateOff ? "off" : "on",
+			values: ["on", "off"],
+		},
+		{
 			id: "auto-mode",
 			label: "Automatic safety decisions",
-			description: "Let the configured classifier decide whether soft-deny bash commands may run.",
+			description: "Let the configured classifier decide whether soft-deny bash commands may run. Off: soft-deny commands ask for your approval; hard denies stay.",
 			currentValue: state.autoModeEnabled ? "on" : "off",
 			values: ["on", "off"],
 		},
@@ -167,7 +178,9 @@ function createSettingsComponent(
 		Math.min(items.length, MAX_VISIBLE_SETTINGS),
 		getSettingsListTheme(),
 		(id, value) => {
-			if (id === "auto-mode" && (value === "on" || value === "off")) {
+			if (id === "gate" && (value === "on" || value === "off")) {
+				done({ type: "gate", value });
+			} else if (id === "auto-mode" && (value === "on" || value === "off")) {
 				done({ type: "auto-mode", value });
 			} else if (id === "classifier-model" && value !== "info:no-models") {
 				done({ type: "classifier-model", value });
@@ -191,14 +204,8 @@ function createSettingsComponent(
 		() => done(null),
 		{ enableSearch: true },
 	);
+	// SettingsList renders its own key hint line.
 	container.addChild(settingsList);
-	container.addChild(
-		new Text(
-			theme.fg("dim", "↑/↓ navigate · type to search · enter/space change or open · esc close"),
-			1,
-			0,
-		),
-	);
 
 	return {
 		render(width: number): string[] {
@@ -377,7 +384,9 @@ async function openPermissionSettingsWithDialogs(
 	state: PermissionSettingsView,
 ): Promise<PermissionSettingsAction | undefined> {
 	const cancel = "Cancel";
+	const gateOption = `Permission gate - ${state.gateOff ? "off" : "on"}`;
 	const mainOptions = [
+		gateOption,
 		`Automatic safety decisions - ${state.autoModeEnabled ? "on" : "off"}`,
 		`Classifier model - ${state.classifierModel}`,
 		`Classifier thinking - ${state.classifierThinking}`,
@@ -394,7 +403,17 @@ async function openPermissionSettingsWithDialogs(
 
 	const choice = await ctx.ui.select("Permission Gate Settings", mainOptions);
 	if (!choice || choice === cancel) return undefined;
-	const index = mainOptions.indexOf(choice);
+	if (choice === gateOption) {
+		const selected = await ctx.ui.select(`Permission gate. ${GATE_OFF_DESCRIPTION}`, [
+			state.gateOff ? "off" : "on",
+			state.gateOff ? "on" : "off",
+			cancel,
+		]);
+		if (!selected || selected === cancel) return undefined;
+		return { type: "gate", value: selected as "on" | "off" };
+	}
+	// Indexes below count the rows after the permission gate row.
+	const index = mainOptions.indexOf(choice) - 1;
 	if (index === 0) {
 		const selected = await ctx.ui.select("Automatic safety decisions", [
 			state.autoModeEnabled ? "on" : "off",

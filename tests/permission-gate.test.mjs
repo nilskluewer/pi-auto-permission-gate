@@ -970,6 +970,23 @@ test("toggles auto mode from the unified settings page", async () => {
   assert.match(harness.notifications.at(-1).message, /auto mode enabled/);
 });
 
+test("turns the permission gate fully off from the unified settings page", async () => {
+  const harness = createHarness({
+    hasUI: true,
+    mode: "rpc",
+    selectResponses: ["Permission gate - on", "off", "Cancel"],
+  });
+  await harness.startSession();
+  assert.equal((await harness.invoke(HARD_DENY))?.block, true);
+
+  await harness.commands.get("automode-settings").handler("", harness.context);
+
+  assert.equal(harness.selectCalls[0].options[0], "Permission gate - on");
+  assert.equal(harness.selectCalls[2].options[0], "Permission gate - off");
+  assert.equal(await harness.invoke(HARD_DENY), undefined);
+  assert.equal(harness.statuses.get("permission-gate"), "permission gate: OFF");
+});
+
 test("opens the classifier prompt from the unified settings page", async () => {
   const globalPreferences = { current: "- Keep the prompt route covered." };
   const harness = createHarness({

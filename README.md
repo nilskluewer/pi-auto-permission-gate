@@ -309,6 +309,9 @@ The gate can be turned fully off. Then it checks nothing: no hard denies, no com
 
 - `pi --no-permission-gate` starts pi with the gate off, for example for scheduled automations.
 - `/permission-gate off` turns it off in a running pi; `/permission-gate on` turns it on again; `/permission-gate status` shows the state.
+- The first row of `/automode-settings`, "Permission gate", does the same.
+
+"Automatic safety decisions: off" is different: it turns off only the classifier. Hard denies and command rules stay, and soft-deny commands then ask for your approval.
 
 The state is for the pi process only; it is not saved. While the gate is off, the footer shows `permission gate: OFF`.
 
