@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Permission Gate</title>
+<link id="icon" rel="icon" href="data:,">
+<style>{{STYLES}}</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="sticky">
+    <header>
+      <span id="dot" class="dot" role="img" aria-label="Disconnected"></span>
+      <h1>Permission Gate</h1>
+      <span id="count" class="count">0 pending</span>
+      <span class="spacer"></span>
+      <button id="theme" class="theme-toggle" type="button" aria-label="Toggle theme">Light mode</button>
+      <button id="notify" class="link" type="button" hidden>Enable notifications</button>
+    </header>
+    <div class="tabs" role="tablist" aria-label="Views">
+      <button id="tab-pending" class="tab" role="tab" type="button" aria-selected="true" aria-controls="panel-pending">Pending (0)</button>
+      <button id="tab-history" class="tab" role="tab" type="button" aria-selected="false" aria-controls="panel-history" tabindex="-1">History (0)</button>
+    </div>
+  </div>
+  <div id="banner" class="banner" role="status" hidden>Disconnected. Retrying...</div>
+  <section id="panel-pending" role="tabpanel" aria-labelledby="tab-pending">
+    <div id="empty" class="empty"><strong>No pending approvals</strong>New requests from your pi sessions will show up here.</div>
+    <main id="list" aria-live="polite"></main>
+  </section>
+  <section id="panel-history" role="tabpanel" aria-labelledby="tab-history" hidden>
+    <div class="toolbar">
+      <div class="seg" role="group" aria-label="Filter by result">
+        <button type="button" data-f="all" aria-pressed="true">All</button>
+        <button type="button" data-f="approved" aria-pressed="false">Approved</button>
+        <button type="button" data-f="denied" aria-pressed="false">Denied</button>
+        <button type="button" data-f="redirected" aria-pressed="false">Redirected</button>
+        <button type="button" data-f="expired" aria-pressed="false">Expired</button>
+      </div>
+      <input id="search" class="search" type="search" placeholder="Search history" aria-label="Search command, summary, project, paths, session and reasons" autocomplete="off">
+    </div>
+    <p id="showing" class="showing">Showing 0 of 0</p>
+    <div id="hempty" class="empty"><strong id="hempty-t">No decisions yet</strong><span id="hempty-s">Decisions will be listed here.</span></div>
+    <ul id="hlist" class="hlist" hidden></ul>
+  </section>
+</div>
+<script>{{SCRIPTS}}</script>
+</body>
+</html>
+
