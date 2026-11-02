@@ -8,6 +8,7 @@ import {
 	parseClassifierModelReference,
 } from "./classifier-models.ts";
 import { normalizeAutoModePreferences } from "./classifier-prompt.ts";
+import { cloneDefaultCommandRuleConfig } from "./command-rules.ts";
 import { getAutoModePreferencesPath, getGlobalModeStatePath, getGlobalRulesPath } from "./config-paths.ts";
 import {
 	APPROVAL_WAIT_CHOICES,
@@ -15,16 +16,12 @@ import {
 	DEFAULT_CLASSIFIER_HISTORY_MESSAGES,
 	DEFAULT_CLASSIFIER_MODEL,
 	DEFAULT_CLASSIFIER_THINKING_LEVEL,
-	DEFAULT_COMMAND_RULE_CONFIG,
-	DEFAULT_MODE_STATE,
 	MAX_CLASSIFIER_HISTORY_MESSAGES,
 	MIN_CLASSIFIER_HISTORY_MESSAGES,
 	RULES_FILE_NAME,
 } from "./constants.ts";
 import { DEFAULT_PRODUCTION_PATTERNS } from "./criticality.ts";
-import { notify } from "./gate-display.ts";
-import { dangerousPatterns, hardDenyPatterns } from "./risk-patterns.ts";
-import { truncate, unique } from "./text.ts";
+import { unique } from "./text.ts";
 import type { CommandRuleConfig, ModeState, PermissionGateDependencies } from "./types.ts";
 
 function parseClassifierHistoryMessages(value: unknown): number | undefined {
@@ -95,12 +92,17 @@ async function saveModeStateToDisk(state: ModeState): Promise<void> {
 	}
 }
 
-async function loadConfiguredModeState(dependencies: PermissionGateDependencies): Promise<ModeState | undefined> {
+export async function loadConfiguredModeState(
+	dependencies: PermissionGateDependencies,
+): Promise<ModeState | undefined> {
 	const loader = dependencies.loadGlobalModeState ?? loadModeStateFromDisk;
 	return parseModeState(await loader());
 }
 
-async function saveConfiguredModeState(dependencies: PermissionGateDependencies, state: ModeState): Promise<void> {
+export async function saveConfiguredModeState(
+	dependencies: PermissionGateDependencies,
+	state: ModeState,
+): Promise<void> {
 	const saver = dependencies.saveGlobalModeState ?? saveModeStateToDisk;
 	await saver(state);
 }
@@ -153,24 +155,6 @@ export async function saveConfiguredAutoModePreferences(
 	await saver(normalizeAutoModePreferences(preferences));
 }
 
-export async function initializeAutoModePreferences(
-	dependencies: PermissionGateDependencies,
-	ctx: { hasUI: boolean; ui: { notify: (message: string, level: "info" | "warning" | "error") => void } },
-): Promise<string> {
-	try {
-		return await loadConfiguredAutoModePreferences(dependencies);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		console.warn("[permission-gate] Could not load auto-mode preferences:", error);
-		notify(
-			ctx,
-			`Permission gate could not load auto-mode preferences; using none: ${truncate(message, 300)}`,
-			"warning",
-		);
-		return "";
-	}
-}
-
 export function appendAutoModePreference(preferences: string, note: string): string {
 	const normalizedNote = note.trim();
 	if (!normalizedNote) return normalizeAutoModePreferences(preferences);
@@ -181,36 +165,6 @@ export function appendAutoModePreference(preferences: string, note: string): str
 		.join("\n");
 	const existing = normalizeAutoModePreferences(preferences);
 	return normalizeAutoModePreferences(existing ? `${existing}\n\n${formattedNote}` : formattedNote);
-}
-
-export async function initializeModeState(
-	dependencies: PermissionGateDependencies,
-	ctx: { hasUI: boolean; ui: { notify: (message: string, level: "info" | "warning" | "error") => void } },
-): Promise<ModeState> {
-	try {
-		const persisted = await loadConfiguredModeState(dependencies);
-		if (persisted) return persisted;
-
-		const defaults = { ...DEFAULT_MODE_STATE };
-		await saveConfiguredModeState(dependencies, defaults);
-		return defaults;
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		console.warn("[permission-gate] Could not load global mode state:", error);
-		notify(
-			ctx,
-			`Permission gate could not load or save global mode settings; using defaults: ${truncate(message, 200)}`,
-			"warning",
-		);
-		return { ...DEFAULT_MODE_STATE };
-	}
-}
-
-export function cloneDefaultCommandRuleConfig(): CommandRuleConfig {
-	return {
-		allowedCommands: [...DEFAULT_COMMAND_RULE_CONFIG.allowedCommands],
-		disallowedCommands: [...DEFAULT_COMMAND_RULE_CONFIG.disallowedCommands],
-	};
 }
 
 export function parseCommandRuleConfig(value: unknown): CommandRuleConfig | undefined {
@@ -259,7 +213,7 @@ async function saveCommandRuleConfig(path: string, config: CommandRuleConfig): P
 	await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
-async function loadEffectiveCommandRules(
+export async function loadEffectiveCommandRules(
 	dependencies: PermissionGateDependencies,
 	ctx: { cwd: string; isProjectTrusted: () => boolean },
 ): Promise<{ config: CommandRuleConfig; scope: "global" | "project" }> {
@@ -292,52 +246,6 @@ export async function saveCommandRules(
 		return;
 	}
 	await saveCommandRuleConfig(scope === "global" ? getGlobalRulesPath() : getProjectRulesPath(cwd), config);
-}
-
-export async function initializeCommandRules(
-	dependencies: PermissionGateDependencies,
-	ctx: {
-		cwd: string;
-		hasUI: boolean;
-		isProjectTrusted: () => boolean;
-		ui: { notify: (message: string, level: "info" | "warning" | "error") => void };
-	},
-): Promise<{ config: CommandRuleConfig; scope: "global" | "project" }> {
-	try {
-		return await loadEffectiveCommandRules(dependencies, ctx);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		console.warn("[permission-gate] Could not load command rules:", error);
-		notify(
-			ctx,
-			`Permission gate could not load command rules; using built-in defaults: ${truncate(message, 300)}`,
-			"warning",
-		);
-		return { config: cloneDefaultCommandRuleConfig(), scope: "global" };
-	}
-}
-
-export function formatCommandRules(config: CommandRuleConfig, scope: string): string {
-	const formatList = (patterns: string[]) =>
-		patterns.length > 0 ? patterns.map((pattern) => `  - ${pattern}`).join("\n") : "  (none)";
-	return [
-		`Permission gate command rules (${scope})`,
-		"",
-		"Allowed command patterns:",
-		formatList(config.allowedCommands),
-		"",
-		"Disallowed command patterns:",
-		formatList(config.disallowedCommands),
-		"",
-		"Patterns use shell-style * and ? wildcards.",
-		"Hard-deny safety rules cannot be overridden.",
-		"",
-		"Built-in soft-deny categories:",
-		...unique(dangerousPatterns.map(({ name }) => `  - ${name}`)),
-		"",
-		"Hard-deny categories:",
-		...unique(hardDenyPatterns.map(({ name }) => `  - ${name}`)),
-	].join("\n");
 }
 
 function getProjectRulesPath(cwd: string): string {

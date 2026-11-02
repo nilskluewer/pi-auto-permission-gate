@@ -1,3 +1,4 @@
+import { DEFAULT_COMMAND_RULE_CONFIG } from "./constants.ts";
 import type { CommandRuleConfig } from "./types.ts";
 
 // User-editable command patterns use shell-style '*' and '?' wildcards.
@@ -106,4 +107,11 @@ export function evaluateUserCommandRules(
 	const allowedPattern = findAllowedPattern(command, config.allowedCommands);
 	if (allowedPattern) return { decision: "allow", pattern: allowedPattern };
 	return undefined;
+}
+
+export function cloneDefaultCommandRuleConfig(): CommandRuleConfig {
+	return {
+		allowedCommands: [...DEFAULT_COMMAND_RULE_CONFIG.allowedCommands],
+		disallowedCommands: [...DEFAULT_COMMAND_RULE_CONFIG.disallowedCommands],
+	};
 }

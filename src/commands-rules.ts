@@ -1,12 +1,10 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { cloneDefaultCommandRuleConfig } from "./command-rules.ts";
 import { notify } from "./gate-display.ts";
 import type { GateState } from "./gate-state.ts";
-import {
-	cloneDefaultCommandRuleConfig,
-	formatCommandRules,
-	parseCommandRuleConfig,
-	saveCommandRules,
-} from "./persistence.ts";
+import { parseCommandRuleConfig, saveCommandRules } from "./persistence.ts";
+import { dangerousPatterns, hardDenyPatterns } from "./risk-patterns.ts";
+import { unique } from "./text.ts";
 import type { CommandRuleConfig } from "./types.ts";
 
 export type PermissionRulesAction = "edit" | "list" | "reset";
@@ -119,4 +117,27 @@ export async function handlePermissionRulesCommand(
 	gate.ruleConfig = nextConfig;
 	gate.ruleScope = scope;
 	notify(ctx, `Permission gate command rules saved as the ${scope} default.`, "info");
+}
+
+function formatCommandRules(config: CommandRuleConfig, scope: string): string {
+	const formatList = (patterns: string[]) =>
+		patterns.length > 0 ? patterns.map((pattern) => `  - ${pattern}`).join("\n") : "  (none)";
+	return [
+		`Permission gate command rules (${scope})`,
+		"",
+		"Allowed command patterns:",
+		formatList(config.allowedCommands),
+		"",
+		"Disallowed command patterns:",
+		formatList(config.disallowedCommands),
+		"",
+		"Patterns use shell-style * and ? wildcards.",
+		"Hard-deny safety rules cannot be overridden.",
+		"",
+		"Built-in soft-deny categories:",
+		...unique(dangerousPatterns.map(({ name }) => `  - ${name}`)),
+		"",
+		"Hard-deny categories:",
+		...unique(hardDenyPatterns.map(({ name }) => `  - ${name}`)),
+	].join("\n");
 }

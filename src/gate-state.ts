@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { cloneClassifierModelReference } from "./classifier-models.ts";
+import { cloneDefaultCommandRuleConfig } from "./command-rules.ts";
 import {
 	DEFAULT_APPROVAL_WAIT_SECONDS,
 	DEFAULT_CLASSIFIER_HISTORY_MESSAGES,
@@ -9,7 +10,6 @@ import {
 } from "./constants.ts";
 import { DEFAULT_PRODUCTION_PATTERNS } from "./criticality.ts";
 import { createIntentStore } from "./intent-grants.ts";
-import { cloneDefaultCommandRuleConfig } from "./persistence.ts";
 import type {
 	ApprovalRequester,
 	AvailableClassifierModel,
