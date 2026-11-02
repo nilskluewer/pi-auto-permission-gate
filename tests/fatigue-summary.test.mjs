@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { readSessionDecisions, summarizeDecisions, formatFatigueSummary } from "../extensions/fatigue-summary.mjs";
+import { formatFatigueSummary, readSessionDecisions, summarizeDecisions } from "../src/fatigue-summary.mjs";
 
 const fixtures = fileURLToPath(new URL("./fixtures/fatigue-sessions/", import.meta.url));
 
@@ -13,10 +13,24 @@ const fixtures = fileURLToPath(new URL("./fixtures/fatigue-sessions/", import.me
 // Answer delays: 1000, 3000, 5000, 7000 ms; median = (3000+5000)/2 = 4000.
 // Disagreements: deny -> approve, approve -> deny, approve -> redirect = 3.
 const expected = {
-	total: 12, autoApproved: 1, autoBlocked: 1, hardDenied: 1, grantCovered: 1,
-	ruleDecisions: 2, prompts: 6, approved: 2, denied: 1, redirected: 1, expired: 1,
-	legacyBlocked: 1, activeHours: 3, promptsPerActiveHour: 2,
-	steerOrDenyRate: 0.5, expiryRate: 1 / 6, medianAnswerMs: 4000, disagreement: 3,
+	total: 12,
+	autoApproved: 1,
+	autoBlocked: 1,
+	hardDenied: 1,
+	grantCovered: 1,
+	ruleDecisions: 2,
+	prompts: 6,
+	approved: 2,
+	denied: 1,
+	redirected: 1,
+	expired: 1,
+	legacyBlocked: 1,
+	activeHours: 3,
+	promptsPerActiveHour: 2,
+	steerOrDenyRate: 0.5,
+	expiryRate: 1 / 6,
+	medianAnswerMs: 4000,
+	disagreement: 3,
 };
 
 test("reads root and one child level; ignores malformed and unrelated records", async () => {
@@ -47,10 +61,23 @@ test("does not read deeper folders or non-jsonl files", async () => {
 test("empty summaries have zero rates and no answer median", () => {
 	const summary = summarizeDecisions([]);
 	assert.deepEqual(summary, {
-		total: 0, autoApproved: 0, autoBlocked: 0, hardDenied: 0, grantCovered: 0,
-		ruleDecisions: 0, prompts: 0, approved: 0, denied: 0, redirected: 0, expired: 0,
-		legacyBlocked: 0, activeHours: 0, promptsPerActiveHour: 0, steerOrDenyRate: 0,
-		expiryRate: 0, disagreement: 0,
+		total: 0,
+		autoApproved: 0,
+		autoBlocked: 0,
+		hardDenied: 0,
+		grantCovered: 0,
+		ruleDecisions: 0,
+		prompts: 0,
+		approved: 0,
+		denied: 0,
+		redirected: 0,
+		expired: 0,
+		legacyBlocked: 0,
+		activeHours: 0,
+		promptsPerActiveHour: 0,
+		steerOrDenyRate: 0,
+		expiryRate: 0,
+		disagreement: 0,
 	});
 	assert.doesNotMatch(formatFatigueSummary(summary), /NaN|Infinity|undefined/);
 });
@@ -58,7 +85,9 @@ test("empty summaries have zero rates and no answer median", () => {
 test("counts UTC date-hour pairs, not hours of day or elapsed time", () => {
 	// The same hour on two dates is two active hours, not one or 25.
 	const entries = [1792573200000, 1792659600000].map((timestamp) => ({
-		source: "human", status: "approved", timestamp,
+		source: "human",
+		status: "approved",
+		timestamp,
 	}));
 	const summary = summarizeDecisions(entries);
 	assert.equal(summary.activeHours, 2);
@@ -68,8 +97,11 @@ test("counts UTC date-hour pairs, not hours of day or elapsed time", () => {
 test("uses odd medians and ignores invalid or negative answer durations", () => {
 	// Valid delays 0, 2000, 9000 ms -> middle value 2000, not mean 3666.67.
 	const entries = [0, 2000, 9000, -1, Infinity, "3000"].map((delay) => ({
-		source: "human", status: "approved", timestamp: 1792573200000,
-		shownAt: 0, answeredAt: delay,
+		source: "human",
+		status: "approved",
+		timestamp: 1792573200000,
+		shownAt: 0,
+		answeredAt: delay,
 	}));
 	assert.equal(summarizeDecisions(entries).medianAnswerMs, 2000);
 });

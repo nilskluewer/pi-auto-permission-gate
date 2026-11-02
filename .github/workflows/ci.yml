@@ -21,8 +21,8 @@ jobs:
           node-version: 24
       - name: Install Pi
         run: npm install -g @earendil-works/pi-coding-agent@latest
-      - name: Install dependencies
-        run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
-      - run: npm test --if-present
+      - run: npm ci
+      - name: Typecheck, lint, and test
+        run: npm run lint && npm test
       - name: Smoke test (load the packed tarball in Pi)
         run: npm run smoke

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
+
 // Approval server: one small local HTTP server shared by all pi sessions.
 // It holds one queue of permission requests. A browser tab shows the queue.
-// Usage: node approval-server.mjs <stateFilePath>
+// Usage: node server.mjs <stateFilePath>
 // Node built-ins only. The browser UI is inlined at the end of this file.
 //
 // Env:
@@ -15,16 +16,19 @@
 // History: decisions are kept in memory (ring buffer) and in a JSONL file
 // next to the state file. The file path is fixed. No request can change it.
 
-import http from "node:http";
+import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 // The version is the hash of this file. The gate compares it with the file on disk
 // and replaces a server that runs older code.
-const SERVER_VERSION = crypto.createHash("sha256").update(fs.readFileSync(fileURLToPath(import.meta.url))).digest("hex");
+const SERVER_VERSION = crypto
+	.createHash("sha256")
+	.update(fs.readFileSync(fileURLToPath(import.meta.url)))
+	.digest("hex");
 
 const MAX_BODY = 64 * 1024;
 const MAX_PENDING = 200;
@@ -48,7 +52,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 const stateFile = process.argv[2];
 if (!stateFile || !path.isAbsolute(stateFile)) {
-	console.error("usage: node approval-server.mjs <absolute-state-file-path>");
+	console.error("usage: node server.mjs <absolute-state-file-path>");
 	process.exit(2);
 }
 
@@ -129,27 +133,53 @@ const clip = (v, n) => String(v).slice(0, n);
 function inspectionDisplay(body) {
 	const out = {};
 	if (body.paths !== undefined) {
-		if (!Array.isArray(body.paths) || body.paths.length > 256) throw new HttpError(400, "paths must contain at most 256 entries");
+		if (!Array.isArray(body.paths) || body.paths.length > 256)
+			throw new HttpError(400, "paths must contain at most 256 entries");
 		out.paths = body.paths.map((entry) => {
-			if (!entry || typeof entry !== "object" || typeof entry.path !== "string" || !entry.path || entry.path.length > 4096 ||
-				typeof entry.role !== "string" || entry.role.length > 500 ||
+			if (
+				!entry ||
+				typeof entry !== "object" ||
+				typeof entry.path !== "string" ||
+				!entry.path ||
+				entry.path.length > 4096 ||
+				typeof entry.role !== "string" ||
+				entry.role.length > 500 ||
 				(entry.inspected !== undefined && typeof entry.inspected !== "boolean") ||
-				(entry.unresolved !== undefined && typeof entry.unresolved !== "boolean")) throw new HttpError(400, "invalid path metadata");
-			return { path: entry.path, role: entry.role, inspected: entry.inspected === true, unresolved: entry.unresolved === true };
+				(entry.unresolved !== undefined && typeof entry.unresolved !== "boolean")
+			)
+				throw new HttpError(400, "invalid path metadata");
+			return {
+				path: entry.path,
+				role: entry.role,
+				inspected: entry.inspected === true,
+				unresolved: entry.unresolved === true,
+			};
 		});
 	}
 	if (body.pathNotes !== undefined) {
-		if (!Array.isArray(body.pathNotes) || body.pathNotes.length > 64 || body.pathNotes.some((note) => typeof note !== "string" || note.length > 8192)) throw new HttpError(400, "invalid path notes");
+		if (
+			!Array.isArray(body.pathNotes) ||
+			body.pathNotes.length > 64 ||
+			body.pathNotes.some((note) => typeof note !== "string" || note.length > 8192)
+		)
+			throw new HttpError(400, "invalid path notes");
 		out.pathNotes = body.pathNotes;
 	}
 	return out;
 }
 
 function normalizeIntent(value) {
-	if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.label !== "string" ||
+	if (
+		!value ||
+		typeof value !== "object" ||
+		Array.isArray(value) ||
+		typeof value.label !== "string" ||
 		!["read", "write"].includes(value.access) ||
-		!Array.isArray(value.reasons) || value.reasons.some((v) => typeof v !== "string") ||
-		!Array.isArray(value.targets) || value.targets.some((v) => typeof v !== "string")) {
+		!Array.isArray(value.reasons) ||
+		value.reasons.some((v) => typeof v !== "string") ||
+		!Array.isArray(value.targets) ||
+		value.targets.some((v) => typeof v !== "string")
+	) {
 		throw new HttpError(400, "invalid intent proposal");
 	}
 	return {
@@ -248,7 +278,8 @@ function normalizeEntry(body) {
 	if (body.via !== undefined && !["browser", "terminal"].includes(body.via)) throw new HttpError(400, "bad via");
 	if (!Array.isArray(body.reasons) || body.reasons.some((x) => typeof x !== "string"))
 		throw new HttpError(400, "reasons must be a string array");
-	for (const k of ["model"]) if (body[k] !== undefined && typeof body[k] !== "string") throw new HttpError(400, `${k} must be a string`);
+	for (const k of ["model"])
+		if (body[k] !== undefined && typeof body[k] !== "string") throw new HttpError(400, `${k} must be a string`);
 	const e = {
 		sessionId: clip(body.sessionId, 200),
 		sessionLabel: clip(body.sessionLabel, 200),
@@ -267,13 +298,14 @@ function normalizeEntry(body) {
 	if (["approve", "deny", "review"].includes(body.recommendation)) e.recommendation = body.recommendation;
 	if (["once", "session", "intent"].includes(body.scope)) e.scope = body.scope;
 	if (typeof body.grantId === "string") e.grantId = clip(body.grantId, 100);
-	for (const key of ["shownAt", "answeredAt"]) if (typeof body[key] === "number" && Number.isFinite(body[key])) e[key] = body[key];
+	for (const key of ["shownAt", "answeredAt"])
+		if (typeof body[key] === "number" && Number.isFinite(body[key])) e[key] = body[key];
 	return e;
 }
 
 function rewriteHistoryFile() {
 	const tmp = `${historyFile}.${process.pid}.tmp`;
-	fs.writeFileSync(tmp, history.map((e) => JSON.stringify(e) + "\n").join(""), { mode: 0o600 });
+	fs.writeFileSync(tmp, history.map((e) => `${JSON.stringify(e)}\n`).join(""), { mode: 0o600 });
 	fs.renameSync(tmp, historyFile);
 	historyLines = history.length;
 }
@@ -304,7 +336,7 @@ function addHistory(fields, ts = Date.now()) {
 	history.push(entry);
 	if (history.length > HISTORY_KEEP) history.shift();
 	try {
-		fs.appendFileSync(historyFile, JSON.stringify(entry) + "\n", { mode: 0o600 });
+		fs.appendFileSync(historyFile, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
 		historyLines++;
 		if (historyLines > HISTORY_MAX_LINES) rewriteHistoryFile();
 	} catch {}
@@ -424,7 +456,8 @@ function createRequest(body) {
 
 	let intentProposal;
 	if (body.intentProposal !== undefined) {
-		if (body.kind !== "command" || body.risk === "critical") throw new HttpError(400, "intent is not supported for this request");
+		if (body.kind !== "command" || body.risk === "critical")
+			throw new HttpError(400, "intent is not supported for this request");
 		intentProposal = normalizeIntent(body.intentProposal);
 	}
 	const ttl = Math.min(MAX_TTL_MS, Math.max(MIN_TTL_MS, body.ttlMs ?? DEFAULT_TTL_MS));
@@ -462,8 +495,10 @@ function createRequest(body) {
 function decide(r, body) {
 	if (!["approve", "deny", "redirect"].includes(body.decision)) throw new HttpError(400, "bad decision");
 	if (body.note !== undefined && typeof body.note !== "string") throw new HttpError(400, "note must be a string");
-	if (body.scope !== undefined && !["once", "session", "intent"].includes(body.scope)) throw new HttpError(400, "bad scope");
-	if (body.confirm !== undefined && typeof body.confirm !== "boolean") throw new HttpError(400, "confirm must be a boolean");
+	if (body.scope !== undefined && !["once", "session", "intent"].includes(body.scope))
+		throw new HttpError(400, "bad scope");
+	if (body.confirm !== undefined && typeof body.confirm !== "boolean")
+		throw new HttpError(400, "confirm must be a boolean");
 	if (!isPending(r)) throw new HttpError(409, "request is not pending");
 	const scope = body.scope ?? "once";
 	if (scope === "session" && r.kind !== "lockdown") throw new HttpError(400, "scope session is not supported");
@@ -478,16 +513,19 @@ function decide(r, body) {
 		return;
 	}
 	if (r.risk === "critical" && body.confirm !== true) throw new HttpError(400, "critical request needs confirm: true");
-	resolveRequest(r, "approved", { note, scope, intent: scope === "intent" ? edited ?? r.intentProposal : undefined });
+	resolveRequest(r, "approved", { note, scope, intent: scope === "intent" ? (edited ?? r.intentProposal) : undefined });
 	addHistory(historyFromRequest(r, "approved", note, "browser"));
 }
 
 // ---------- HTTP routing ----------
 
-function handleWait(req, res, url, r) {
+function handleWait(_req, res, url, r) {
 	if (!isPending(r)) return sendJson(res, 200, result(r));
 	const asked = Number(url.searchParams.get("timeoutMs"));
-	const timeout = Math.min(MAX_WAIT_MS, Number.isFinite(asked) && asked >= 0 && url.searchParams.has("timeoutMs") ? asked : 25_000);
+	const timeout = Math.min(
+		MAX_WAIT_MS,
+		Number.isFinite(asked) && asked >= 0 && url.searchParams.has("timeoutMs") ? asked : 25_000,
+	);
 	const waiter = { res, timer: null };
 	waiter.timer = setTimeout(() => {
 		r.waiters.delete(waiter);
@@ -500,7 +538,7 @@ function handleWait(req, res, url, r) {
 	});
 }
 
-function handleEvents(req, res) {
+function handleEvents(_req, res) {
 	res.writeHead(200, {
 		...SECURITY_HEADERS,
 		"content-type": "text/event-stream; charset=utf-8",
@@ -522,7 +560,8 @@ const PAGE_HEADERS = {
 
 async function route(req, res) {
 	const host = req.headers.host;
-	if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) return sendJson(res, 403, { error: "forbidden host" });
+	if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`)
+		return sendJson(res, 403, { error: "forbidden host" });
 	lastActivity = Date.now();
 	const url = new URL(req.url, "http://127.0.0.1");
 	const p = url.pathname;
@@ -571,7 +610,8 @@ async function route(req, res) {
 		if (historyCalls.length >= HISTORY_RATE_LIMIT) throw new HttpError(429, "too many history posts");
 		historyCalls.push(now);
 		const body = await readJson(req);
-		if (body.ts !== undefined && !(typeof body.ts === "number" && Number.isFinite(body.ts))) throw new HttpError(400, "ts must be a number");
+		if (body.ts !== undefined && !(typeof body.ts === "number" && Number.isFinite(body.ts)))
+			throw new HttpError(400, "ts must be a number");
 		const fields = normalizeEntry(body);
 		const ts = body.ts !== undefined && body.ts >= now - DAY_MS && body.ts <= now + 60_000 ? body.ts : now;
 		if (body.id !== undefined) {
@@ -579,7 +619,9 @@ async function route(req, res) {
 			if (index < 0) throw new HttpError(404, "history entry not found for this session");
 			const entry = { id: history[index].id, ts, ...fields };
 			history[index] = entry;
-			try { rewriteHistoryFile(); } catch {}
+			try {
+				rewriteHistoryFile();
+			} catch {}
 			broadcast("history", entry);
 			return sendJson(res, 200, { id: entry.id });
 		}

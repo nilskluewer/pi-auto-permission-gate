@@ -1,10 +1,11 @@
 // Static evidence for permission review, not a shell parser or a sandbox.
 // Never execute code, expand shell expressions, or fetch remote dependencies.
+
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { open, realpath, stat } from "node:fs/promises";
-import { createHash } from "node:crypto";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 export const INSPECTION_LIMITS = Object.freeze({
 	files: 16,
@@ -18,7 +19,7 @@ const SCRIPT = /\.(?:py|[cm]?js|[cm]?ts|tsx|jsx|sh|bash|zsh|rb|pl|php|lua|r)$/i;
 const SHELL_BRANCH = /^(?:if|then|elif|else|for|while|until|do|case|select|function|coproc)$/;
 const localExecutable = (word) =>
 	word.includes("/") && (!isAbsolute(word) || !/^\/(?:usr\/)?s?bin\//.test(word) || SCRIPT.test(word));
-const DYNAMIC = /[$`*?\[\]{}]/;
+const DYNAMIC = /[$`*?[\]{}]/;
 const LAUNCHER = /^(?:env|rtk|uv|run|sudo|command|exec|timeout|nice|time|nohup|stdbuf)$/;
 const OPTION_VALUE =
 	/^(?:-u|-n|--unset|--user|--group|--project|--directory|--package|--with|--with-editable|--with-requirements|--extra|--python)$/;
@@ -135,7 +136,7 @@ export async function inspectCommand(command, cwd) {
 		const path = dynamic ? value : localPath(value, base);
 		if (paths.has(path)) {
 			const entry = paths.get(path);
-			if (!entry.role.split(", ").includes(role)) entry.role += ", " + role;
+			if (!entry.role.split(", ").includes(role)) entry.role += `, ${role}`;
 			return entry;
 		}
 		if (
@@ -236,12 +237,12 @@ export async function inspectCommand(command, cwd) {
 					if (arg === "-m") {
 						const module = words[j + 1];
 						if (module && /^[\w.]+$/.test(module)) {
-							const local = join(base, ...module.split(".")) + ".py";
+							const local = `${join(base, ...module.split("."))}.py`;
 							try {
 								if ((await stat(local)).isFile()) enqueue(local, "local module", base, depth);
 								else throw new Error();
 							} catch {
-								notes.add("Module execution uses code not included in this inspection: " + module);
+								notes.add(`Module execution uses code not included in this inspection: ${module}`);
 							}
 						}
 						found = true;
@@ -375,7 +376,7 @@ export async function inspectCommand(command, cwd) {
 				content,
 			)
 		)
-			notes.add("Dynamic code loading was found in " + source + "; its dependencies may be missing.");
+			notes.add(`Dynamic code loading was found in ${source}; its dependencies may be missing.`);
 	};
 	const resolveDependency = async (basePath, suffixes, depth, required = true) => {
 		for (const suffix of suffixes) {
@@ -389,7 +390,7 @@ export async function inspectCommand(command, cwd) {
 		}
 		if (required) {
 			add(basePath, "unresolved local dependency");
-			notes.add("Local dependency could not be resolved: " + basePath);
+			notes.add(`Local dependency could not be resolved: ${basePath}`);
 		}
 	};
 	// Inline code stays in the command; inspect its explicit imports and paths too.
@@ -418,13 +419,13 @@ export async function inspectCommand(command, cwd) {
 			continue;
 		}
 		if (sensitivePath(entry.path)) {
-			notes.add("Potential secret file was not sent to the classifier: " + entry.path);
+			notes.add(`Potential secret file was not sent to the classifier: ${entry.path}`);
 			continue;
 		}
 		try {
 			const canonicalPath = await realpath(entry.path);
 			if (sensitivePath(canonicalPath)) {
-				notes.add("Potential secret file was not sent to the classifier: " + entry.path);
+				notes.add(`Potential secret file was not sent to the classifier: ${entry.path}`);
 				continue;
 			}
 			const read = await readRegularFile(canonicalPath, INSPECTION_LIMITS.bytes - bytes);
@@ -435,13 +436,13 @@ export async function inspectCommand(command, cwd) {
 			await scanSource(read.content, entry.path, depth);
 			await scanInline();
 		} catch (error) {
-			notes.add("Code was not inspected: " + entry.path + " (" + error.message + ").");
+			notes.add(`Code was not inspected: ${entry.path} (${error.message}).`);
 		}
 	}
 	const displayNotes = [];
 	let noteBytes = 0;
 	for (const note of notes) {
-		const display = note.length > 1024 ? note.slice(0, 1000) + "… (note shortened)" : note;
+		const display = note.length > 1024 ? `${note.slice(0, 1000)}… (note shortened)` : note;
 		const size = Buffer.byteLength(display);
 		if (displayNotes.length >= 63 || noteBytes + size > 12 * 1024) {
 			displayNotes.push("Additional inspection limits were omitted; inspection is incomplete.");
@@ -495,7 +496,7 @@ export function formatPaths(paths = []) {
 	return groupPaths(paths)
 		.flatMap(({ directory, files }) => [
 			directory + (directory.endsWith("/") ? "" : "/"),
-			...files.map((entry) => "  " + entry.name + " [" + entry.role + (entry.inspected ? "; inspected" : "") + "]"),
+			...files.map((entry) => `  ${entry.name} [${entry.role}${entry.inspected ? "; inspected" : ""}]`),
 		])
 		.join("\n");
 }

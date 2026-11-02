@@ -60,10 +60,23 @@ export async function readSessionDecisions(sessionsDir, range = {}) {
 /** Keep old blocks separate: they do not prove that the user answered. */
 export function summarizeDecisions(entries) {
 	const summary = {
-		total: entries.length, autoApproved: 0, autoBlocked: 0, hardDenied: 0,
-		grantCovered: 0, ruleDecisions: 0, prompts: 0, approved: 0, denied: 0,
-		redirected: 0, expired: 0, legacyBlocked: 0, activeHours: 0,
-		promptsPerActiveHour: 0, steerOrDenyRate: 0, expiryRate: 0, disagreement: 0,
+		total: entries.length,
+		autoApproved: 0,
+		autoBlocked: 0,
+		hardDenied: 0,
+		grantCovered: 0,
+		ruleDecisions: 0,
+		prompts: 0,
+		approved: 0,
+		denied: 0,
+		redirected: 0,
+		expired: 0,
+		legacyBlocked: 0,
+		activeHours: 0,
+		promptsPerActiveHour: 0,
+		steerOrDenyRate: 0,
+		expiryRate: 0,
+		disagreement: 0,
 	};
 	const hours = new Set();
 	const delays = [];
@@ -93,10 +106,12 @@ export function summarizeDecisions(entries) {
 		if (entry.status === "redirected") summary.redirected++;
 		if (entry.status === "expired") summary.expired++;
 		const answered = !legacy && ["approved", "blocked", "redirected"].includes(entry.status);
-		if (answered && (
-			(entry.recommendation === "approve" && entry.status !== "approved") ||
-			(entry.recommendation === "deny" && entry.status === "approved")
-		)) summary.disagreement++;
+		if (
+			answered &&
+			((entry.recommendation === "approve" && entry.status !== "approved") ||
+				(entry.recommendation === "deny" && entry.status === "approved"))
+		)
+			summary.disagreement++;
 	}
 	summary.activeHours = hours.size;
 	summary.promptsPerActiveHour = hours.size ? summary.prompts / hours.size : 0;

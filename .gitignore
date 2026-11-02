@@ -2,3 +2,4 @@ node_modules/
 .DS_Store
 *.tgz
 npm-debug.log*
+pi-session-*.html

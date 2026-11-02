@@ -11,14 +11,26 @@ import { realpathSync } from "node:fs";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext, type ToolCallEvent } from "@earendil-works/pi-coding-agent";
-import { Text, type AutocompleteItem } from "@earendil-works/pi-tui";
-import { codeReviewReasons, inspectCommand, inspectionIsFresh, inspectionPrompt, formatPaths, shellWords } from "./command-inspection.mjs";
+import { fileURLToPath } from "node:url";
+import {
+	CONFIG_DIR_NAME,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type ToolCallEvent,
+} from "@earendil-works/pi-coding-agent";
+import { type AutocompleteItem, Text } from "@earendil-works/pi-tui";
+import {
+	codeReviewReasons,
+	formatPaths,
+	inspectCommand,
+	inspectionIsFresh,
+	inspectionPrompt,
+	shellWords,
+} from "./command-inspection.mjs";
 import { assessCriticality, DEFAULT_PRODUCTION_PATTERNS, isAccessChange } from "./criticality.mjs";
-import { proposeIntent, isNarrowerOrEqual, createIntentStore, commandAccess } from "./intent-grants.mjs";
-import { readSessionDecisions, summarizeDecisions, formatFatigueSummary } from "./fatigue-summary.mjs";
+import { formatFatigueSummary, readSessionDecisions, summarizeDecisions } from "./fatigue-summary.mjs";
+import { commandAccess, createIntentStore, isNarrowerOrEqual, proposeIntent } from "./intent-grants.mjs";
 
 type IntentProposal = { label: string; access: "read" | "write"; reasons: string[]; targets: string[] };
 type DecisionMeasurements = {
@@ -29,17 +41,18 @@ type DecisionMeasurements = {
 	grantId?: string;
 	note?: string;
 };
+
 import {
 	openPermissionSettings,
 	type PermissionSettingsAction,
 	type PermissionSettingsOption,
-} from "../permission-gate-settings.ts";
+} from "./settings-page.ts";
 
 type CommandInspection = Awaited<ReturnType<typeof inspectCommand>>;
 type InspectionDisplay = { paths?: CommandInspection["paths"]; pathNotes?: string[] };
 
 // ---- Approval queue client ----
-// Client for the shared approval queue (approval-server.mjs). One local server serves all
+// Client for the shared approval queue (approval-server/server.mjs). One local server serves all
 // pi sessions, so the user watches one browser tab. Every failure returns undefined so the
 // caller can fall back to the terminal prompt. The client never stores the approver token:
 // only the browser has it, so a session can submit and wait but never decide.
@@ -72,12 +85,16 @@ type ApprovalOutcome = {
 };
 
 type ApprovalLifecycle = { parkSignal: AbortSignal; onLateOutcome: (outcome: ApprovalOutcome) => void };
-type ApprovalRequester = (request: ApprovalRequest, signal: AbortSignal, lifecycle?: ApprovalLifecycle) => Promise<ApprovalOutcome | undefined>;
+type ApprovalRequester = (
+	request: ApprovalRequest,
+	signal: AbortSignal,
+	lifecycle?: ApprovalLifecycle,
+) => Promise<ApprovalOutcome | undefined>;
 
 type QueueState = { port: number; pid: number; sessionToken: string };
 
 // The extension may be loaded through a symlink, so resolve the real location of the sibling server file.
-const SERVER_PATH = join(dirname(realpathSync(fileURLToPath(import.meta.url))), "approval-server.mjs");
+const SERVER_PATH = join(dirname(realpathSync(fileURLToPath(import.meta.url))), "approval-server", "server.mjs");
 const QUEUE_START_TIMEOUT_MS = 5000;
 const QUEUE_LONG_POLL_MS = 25_000;
 
@@ -140,7 +157,9 @@ function serverFileVersion(): Promise<string | undefined> {
 // servers do not have it, so they get SIGTERM. The pid comes from the state file of a
 // server that accepted our session token.
 async function stopQueueServer(state: QueueState): Promise<void> {
-	const { status } = await queueCall(state, "POST", "/api/shutdown", { signal: AbortSignal.timeout(1500) }).catch(() => ({ status: 0 }));
+	const { status } = await queueCall(state, "POST", "/api/shutdown", { signal: AbortSignal.timeout(1500) }).catch(
+		() => ({ status: 0 }),
+	);
 	if (status !== 200) {
 		try {
 			process.kill(state.pid, "SIGTERM");
@@ -149,7 +168,8 @@ async function stopQueueServer(state: QueueState): Promise<void> {
 		}
 	}
 	const deadline = Date.now() + QUEUE_START_TIMEOUT_MS;
-	while (Date.now() < deadline && (await isQueueHealthy(state))) await new Promise((resolve) => setTimeout(resolve, 100));
+	while (Date.now() < deadline && (await isQueueHealthy(state)))
+		await new Promise((resolve) => setTimeout(resolve, 100));
 }
 
 async function ensureQueueServer(statePath: string): Promise<QueueState | undefined> {
@@ -176,21 +196,22 @@ async function ensureQueueServer(statePath: string): Promise<QueueState | undefi
 	return undefined;
 }
 
-type HistoryEntry = InspectionDisplay & DecisionMeasurements & {
-	id?: string;
-	sessionId: string;
-	sessionLabel: string;
-	cwd: string;
-	command: string;
-	risk: ApprovalRisk;
-	tldr: string;
-	status: "approved" | "denied" | "redirected" | "expired";
-	source: "auto" | "human" | "rule" | "hard-deny" | "grant";
-	via?: "browser" | "terminal";
-	reasons: string[];
-	model?: string;
-	ts: number;
-};
+type HistoryEntry = InspectionDisplay &
+	DecisionMeasurements & {
+		id?: string;
+		sessionId: string;
+		sessionLabel: string;
+		cwd: string;
+		command: string;
+		risk: ApprovalRisk;
+		tldr: string;
+		status: "approved" | "denied" | "redirected" | "expired";
+		source: "auto" | "human" | "rule" | "hard-deny" | "grant";
+		via?: "browser" | "terminal";
+		reasons: string[];
+		model?: string;
+		ts: number;
+	};
 
 type HistoryReporter = (entry: HistoryEntry) => Promise<void>;
 
@@ -227,7 +248,8 @@ function createApprovalRequester(statePath: string): ApprovalRequester {
 		let id: string;
 		try {
 			const created = await queueCall(state, "POST", "/api/requests", {
-				body: request, signal: AbortSignal.any([signal, AbortSignal.timeout(QUEUE_START_TIMEOUT_MS)]),
+				body: request,
+				signal: AbortSignal.any([signal, AbortSignal.timeout(QUEUE_START_TIMEOUT_MS)]),
 			});
 			if (created.status !== 200 || typeof created.json.id !== "string") return undefined;
 			id = created.json.id;
@@ -239,18 +261,28 @@ function createApprovalRequester(statePath: string): ApprovalRequester {
 		const deadline = Date.now() + (request.ttlMs ?? 600_000);
 		const park = () => {
 			parked = true;
-			void queueCall(state, "POST", `/api/requests/${id}/park`, { signal: AbortSignal.timeout(5000) }).catch(() => undefined);
+			void queueCall(state, "POST", `/api/requests/${id}/park`, { signal: AbortSignal.timeout(5000) }).catch(
+				() => undefined,
+			);
 		};
-		const cancel = () => void queueCall(state, "DELETE", `/api/requests/${id}`, { signal: AbortSignal.timeout(5000) }).catch(() => undefined);
+		const cancel = () =>
+			void queueCall(state, "DELETE", `/api/requests/${id}`, { signal: AbortSignal.timeout(5000) }).catch(
+				() => undefined,
+			);
 		signal.addEventListener("abort", cancel, { once: true });
 		lifecycle?.parkSignal.addEventListener("abort", park, { once: true });
 		if (lifecycle?.parkSignal.aborted) park();
 		try {
-			if (signal.aborted) { cancel(); return { status: "cancelled" }; }
+			if (signal.aborted) {
+				cancel();
+				return { status: "cancelled" };
+			}
 			while (!signal.aborted && Date.now() < deadline) {
 				let waited: Awaited<ReturnType<typeof queueCall>>;
 				try {
-					waited = await queueCall(state, "GET", `/api/requests/${id}/wait?timeoutMs=${QUEUE_LONG_POLL_MS}`, { signal: AbortSignal.any([signal, AbortSignal.timeout(QUEUE_LONG_POLL_MS + 5000)]) });
+					waited = await queueCall(state, "GET", `/api/requests/${id}/wait?timeoutMs=${QUEUE_LONG_POLL_MS}`, {
+						signal: AbortSignal.any([signal, AbortSignal.timeout(QUEUE_LONG_POLL_MS + 5000)]),
+					});
 				} catch {
 					if (!parked || signal.aborted) return signal.aborted ? { status: "cancelled" } : undefined;
 					await delay(300, undefined, { signal });
@@ -263,7 +295,13 @@ function createApprovalRequester(statePath: string): ApprovalRequester {
 					continue;
 				}
 				if (status === "pending") continue;
-				if (status === "approved" || status === "denied" || status === "redirected" || status === "expired" || status === "cancelled") {
+				if (
+					status === "approved" ||
+					status === "denied" ||
+					status === "redirected" ||
+					status === "expired" ||
+					status === "cancelled"
+				) {
 					const outcome: ApprovalOutcome = {
 						status,
 						historyId: id,
@@ -395,20 +433,23 @@ export type ParsedAutoDecision = {
 
 type DecisionSource = "hard-deny" | "auto-model" | "user-rule" | "human" | "intent-grant";
 type DecisionStatus = "approved" | "blocked" | "redirected" | "expired";
-type ClassifierContext = Pick<ExtensionContext, "cwd" | "signal" | "modelRegistry" | "sessionManager"> & { inspection?: CommandInspection };
-
-type DecisionEntry = InspectionDisplay & DecisionMeasurements & {
-	command: string;
-	reasons: string[];
-	status: DecisionStatus;
-	source: DecisionSource;
-	rationale: string;
-	model?: string;
-	risk?: ApprovalRisk;
-	// Where a human answered. The queue server logs browser answers itself.
-	via?: "browser" | "terminal";
-	timestamp: number;
+type ClassifierContext = Pick<ExtensionContext, "cwd" | "signal" | "modelRegistry" | "sessionManager"> & {
+	inspection?: CommandInspection;
 };
+
+type DecisionEntry = InspectionDisplay &
+	DecisionMeasurements & {
+		command: string;
+		reasons: string[];
+		status: DecisionStatus;
+		source: DecisionSource;
+		rationale: string;
+		model?: string;
+		risk?: ApprovalRisk;
+		// Where a human answered. The queue server logs browser answers itself.
+		via?: "browser" | "terminal";
+		timestamp: number;
+	};
 
 const AUTO_MODE_SETTINGS_COMMAND = "automode-settings";
 const AUTO_MODE_MODEL_PROVIDER = "github-copilot";
@@ -636,7 +677,7 @@ function evaluateUserCommandRules(
 // Recursive rm always needs the classifier (or the user when auto mode is off):
 // neither user allow patterns nor scoped-deletion shortcuts can skip it.
 const CLASSIFIER_REQUIRED_REASON = "recursive/forced rm";
-const PATH_GLOB_CHARACTERS = /[*?\[\]{}]/;
+const PATH_GLOB_CHARACTERS = /[*?[\]{}]/;
 const FIND_NARROWING_PREDICATES = new Set([
 	"-atime",
 	"-ctime",
@@ -661,7 +702,13 @@ const FIND_NARROWING_PREDICATES = new Set([
 ]);
 
 function isSafeRelativeDeletionTarget(target: string, cwd: string, allowCurrentDirectory: boolean): boolean {
-	if (!target || target.startsWith("/") || target.startsWith("~") || target.startsWith("$") || /^[A-Za-z]:[\\/]/.test(target)) {
+	if (
+		!target ||
+		target.startsWith("/") ||
+		target.startsWith("~") ||
+		target.startsWith("$") ||
+		/^[A-Za-z]:[\\/]/.test(target)
+	) {
 		return false;
 	}
 	if (PATH_GLOB_CHARACTERS.test(target)) return false;
@@ -673,23 +720,32 @@ function isSafeRelativeDeletionTarget(target: string, cwd: string, allowCurrentD
 	const projectRoot = resolve(cwd);
 	const resolvedTarget = resolve(projectRoot, target);
 	const relativeTarget = relative(projectRoot, resolvedTarget);
-	return Boolean(relativeTarget) && relativeTarget !== ".." && !relativeTarget.startsWith(`..${sep}`) && !relativeTarget.startsWith(sep);
+	return (
+		Boolean(relativeTarget) &&
+		relativeTarget !== ".." &&
+		!relativeTarget.startsWith(`..${sep}`) &&
+		!relativeTarget.startsWith(sep)
+	);
 }
 
 function isScopedFindDeleteCommand(command: string, cwd: string): boolean {
 	if (SHELL_CONTROL_CHARACTERS.test(command) || PATH_GLOB_CHARACTERS.test(command)) return false;
-	const tokens = command.trim().split(/[ \t]+/).filter(Boolean);
+	const tokens = command
+		.trim()
+		.split(/[ \t]+/)
+		.filter(Boolean);
 	if (tokens.shift()?.toLowerCase() !== "find" || tokens.includes("-exec") || tokens.includes("-execdir")) return false;
 	if (!tokens.includes("-delete")) return false;
 
-	const expressionStart = tokens.findIndex((token) => token.startsWith("-") || token === "!" || token === "(" || token === ")");
+	const expressionStart = tokens.findIndex(
+		(token) => token.startsWith("-") || token === "!" || token === "(" || token === ")",
+	);
 	if (expressionStart <= 0) return false;
 
 	const roots = tokens.slice(0, expressionStart);
 	const hasNarrowingPredicate = tokens.some((token) => FIND_NARROWING_PREDICATES.has(token));
 	return roots.length > 0 && roots.every((root) => isSafeRelativeDeletionTarget(root, cwd, hasNarrowingPredicate));
 }
-
 
 const dangerousPatterns: DangerousPattern[] = [
 	// File deletion / destructive filesystem traversal
@@ -704,7 +760,8 @@ const dangerousPatterns: DangerousPattern[] = [
 	// Package execution and publishing can execute third-party code or affect remote state.
 	{
 		name: "package execution or publish",
-		pattern: /\b(?:npm|pnpm|yarn|bun|pip|pip3|uv|poetry|cargo|gem|go|brew|apt(?:-get)?|dnf|pacman)\b[^\n;&|]*\b(?:exec|run|dlx|publish)\b/i,
+		pattern:
+			/\b(?:npm|pnpm|yarn|bun|pip|pip3|uv|poetry|cargo|gem|go|brew|apt(?:-get)?|dnf|pacman)\b[^\n;&|]*\b(?:exec|run|dlx|publish)\b/i,
 	},
 	{ name: "package runner", pattern: /\b(?:npx|pnpm\s+dlx|yarn\s+dlx|bunx|pipx|uvx)\b/i },
 
@@ -792,7 +849,8 @@ const hardDenyPatterns: DangerousPattern[] = [
 	},
 	{
 		name: "unresolved recursive delete target",
-		pattern: /\brm\b(?=[^\n;&|]*[ \t]+["']?(?:--recursive|-[a-z]*r[a-z]*)["']?(?=[\s;&|]|$))(?=[^\n;&|]*(?:\$\(|\$\{|\$[A-Za-z_]|\$['"]|~[A-Za-z]|[`*?\[\]]|\{[^}]*,))[^\n;&|]*/i,
+		pattern:
+			/\brm\b(?=[^\n;&|]*[ \t]+["']?(?:--recursive|-[a-z]*r[a-z]*)["']?(?=[\s;&|]|$))(?=[^\n;&|]*(?:\$\(|\$\{|\$[A-Za-z_]|\$['"]|~[A-Za-z]|[`*?[\]]|\{[^}]*,))[^\n;&|]*/i,
 	},
 	{ name: "filesystem format or signature wipe", pattern: /\b(?:mkfs(?:\.[a-z0-9_+-]+)?|wipefs)\b/i },
 	{ name: "disk device overwrite", pattern: /\bdd\b[^\n;&|]*\bof\s*=\s*["']?\/dev\//i },
@@ -802,15 +860,18 @@ const hardDenyPatterns: DangerousPattern[] = [
 	},
 	{
 		name: "forced push to a protected branch",
-		pattern: /\bgit\b[^\n;&|]*\bpush\b[^\n;&|]*(?:--force(?:-with-lease)?|-[^\s;&|]*f[^\s;&|]*)\b[^\n;&|]*\b(?:main|master|production|prod)\b/i,
+		pattern:
+			/\bgit\b[^\n;&|]*\bpush\b[^\n;&|]*(?:--force(?:-with-lease)?|-[^\s;&|]*f[^\s;&|]*)\b[^\n;&|]*\b(?:main|master|production|prod)\b/i,
 	},
 	{
 		name: "forced push to a protected branch",
-		pattern: /\bgit\b[^\n;&|]*\bpush\b[^\n;&|]*\b(?:main|master|production|prod)\b[^\n;&|]*(?:--force(?:-with-lease)?|-[^\s;&|]*f[^\s;&|]*)\b/i,
+		pattern:
+			/\bgit\b[^\n;&|]*\bpush\b[^\n;&|]*\b(?:main|master|production|prod)\b[^\n;&|]*(?:--force(?:-with-lease)?|-[^\s;&|]*f[^\s;&|]*)\b/i,
 	},
 	{
 		name: "unresolved forced push target",
-		pattern: /\bgit\b(?=[^\n;&|]*\bpush\b)(?=[^\n;&|]*(?:--force(?:-with-lease)?|-[^\s;&|]*f[^\s;&|]*))(?=[^\n;&|]*(?:\$\(|\$\{|\$[A-Za-z_]|\$['"]|~[A-Za-z]|[`*?\[\]]|\{[^}]*,))[^\n;&|]*/i,
+		pattern:
+			/\bgit\b(?=[^\n;&|]*\bpush\b)(?=[^\n;&|]*(?:--force(?:-with-lease)?|-[^\s;&|]*f[^\s;&|]*))(?=[^\n;&|]*(?:\$\(|\$\{|\$[A-Za-z_]|\$['"]|~[A-Za-z]|[`*?[\]]|\{[^}]*,))[^\n;&|]*/i,
 	},
 ];
 
@@ -852,7 +913,9 @@ function findAvailableClassifierModel(
 	availableModels: readonly AvailableClassifierModel[],
 	reference: ClassifierModelReference | null,
 ): AvailableClassifierModel | undefined {
-	return reference ? availableModels.find((model) => model.canonicalId === canonicalClassifierModelId(reference)) : undefined;
+	return reference
+		? availableModels.find((model) => model.canonicalId === canonicalClassifierModelId(reference))
+		: undefined;
 }
 
 function isClassifierThinkingLevel(value: string): value is ClassifierThinkingLevel {
@@ -869,7 +932,10 @@ function getSupportedClassifierThinkingLevels(model: RegistryModel): ClassifierT
 	});
 }
 
-function clampClassifierThinkingLevel(model: RegistryModel, configured: ClassifierThinkingLevel): ClassifierThinkingLevel {
+function clampClassifierThinkingLevel(
+	model: RegistryModel,
+	configured: ClassifierThinkingLevel,
+): ClassifierThinkingLevel {
 	const availableLevels = getSupportedClassifierThinkingLevels(model);
 	if (availableLevels.includes(configured)) return configured;
 
@@ -892,10 +958,7 @@ function effectiveClassifierThinkingLevel(
 	return model ? clampClassifierThinkingLevel(model, configured) : "unavailable";
 }
 
-function formatClassifierThinkingLevel(
-	configured: ClassifierThinkingLevel,
-	model: RegistryModel | undefined,
-): string {
+function formatClassifierThinkingLevel(configured: ClassifierThinkingLevel, model: RegistryModel | undefined): string {
 	const effective = effectiveClassifierThinkingLevel(model, configured);
 	return configured === effective ? `thinking ${configured}` : `thinking ${configured} -> ${effective}`;
 }
@@ -926,7 +989,9 @@ function filterTextModels(models: readonly unknown[]): RegistryModel[] {
 	});
 }
 
-function getAvailableClassifierModels(ctx: { modelRegistry: { getAvailable: () => readonly unknown[] } }): RegistryModel[] {
+function getAvailableClassifierModels(ctx: {
+	modelRegistry: { getAvailable: () => readonly unknown[] };
+}): RegistryModel[] {
 	try {
 		return filterTextModels(ctx.modelRegistry.getAvailable());
 	} catch {
@@ -946,26 +1011,21 @@ function describeClassifierModels(
 	}));
 }
 
-function cacheAvailableClassifierModels(
-	ctx: {
-		modelRegistry: {
-			getAvailable: () => readonly unknown[];
-			getProviderDisplayName: (provider: string) => string;
-		};
-	},
-): AvailableClassifierModel[] {
-	return describeClassifierModels(
-		ctx.modelRegistry.getAvailable(),
-		(provider) => ctx.modelRegistry.getProviderDisplayName(provider),
+function cacheAvailableClassifierModels(ctx: {
+	modelRegistry: {
+		getAvailable: () => readonly unknown[];
+		getProviderDisplayName: (provider: string) => string;
+	};
+}): AvailableClassifierModel[] {
+	return describeClassifierModels(ctx.modelRegistry.getAvailable(), (provider) =>
+		ctx.modelRegistry.getProviderDisplayName(provider),
 	);
 }
 
-function cacheScopedClassifierModels(
-	ctx: {
-		scopedModels: readonly { model: unknown }[];
-		modelRegistry: { getProviderDisplayName: (provider: string) => string };
-	},
-): AvailableClassifierModel[] {
+function cacheScopedClassifierModels(ctx: {
+	scopedModels: readonly { model: unknown }[];
+	modelRegistry: { getProviderDisplayName: (provider: string) => string };
+}): AvailableClassifierModel[] {
 	return describeClassifierModels(
 		ctx.scopedModels.map((scoped) => scoped.model),
 		(provider) => ctx.modelRegistry.getProviderDisplayName(provider),
@@ -985,10 +1045,7 @@ function getModelDescription(model: AvailableClassifierModel): string {
 	return `${model.providerDisplayName} - ${model.modelName}`;
 }
 
-function getClassifierThinkingChoices(
-	model: RegistryModel | undefined,
-	configured: ClassifierThinkingLevel,
-): string[] {
+function getClassifierThinkingChoices(model: RegistryModel | undefined, configured: ClassifierThinkingLevel): string[] {
 	const supportedLevels = model ? getSupportedClassifierThinkingLevels(model) : [];
 	const levels = model
 		? [...supportedLevels, ...CLASSIFIER_THINKING_LEVELS.filter((level) => !supportedLevels.includes(level))]
@@ -1052,10 +1109,7 @@ function getClassifierModelArgumentCompletions(
 			description: getModelDescription(model),
 		}));
 	if (tokens.length === 0 || trailingSpace) return [resetItem, ...modelItems];
-	return [
-		...(resetItem.value.startsWith(lowerQuery) ? [resetItem] : []),
-		...modelItems,
-	];
+	return [...(resetItem.value.startsWith(lowerQuery) ? [resetItem] : []), ...modelItems];
 }
 
 function getClassifierModelCompletions(
@@ -1093,7 +1147,7 @@ function getClassifierModelCompletions(
 	}
 	if (action === "history") {
 		if (tokens.length > 2) return null;
-		const historyPrefix = (tokens.length === 1 ? "" : tokens[1] ?? "").toLowerCase();
+		const historyPrefix = (tokens.length === 1 ? "" : (tokens[1] ?? "")).toLowerCase();
 		const historyItems: CommandCompletion[] = CLASSIFIER_HISTORY_CHOICES.map((n) => ({
 			value: String(n),
 			label: String(n),
@@ -1117,30 +1171,54 @@ function getClassifierModelCompletions(
 	return getClassifierModelArgumentCompletions(modelPrefix, availableModels);
 }
 
-export function matchedReasons(command: string, rules: CommandRuleConfig = DEFAULT_COMMAND_RULE_CONFIG, cwd?: string): string[] {
-	const reasons = unique([...dangerousPatterns.filter(({ pattern }) => pattern.test(command)).map(({ name }) => name), ...codeReviewReasons(command)]);
-	if (isAccessChange(command) && !reasons.includes("cloud or infrastructure change")) reasons.push("cloud or infrastructure change");
-	if (commandAccess(command) === "write" && shellWords(command).some((word, index, words) => {
-		const operand = word.replace(/^--?[\w-]+=/, "").replace(/^~(?=\/)/, homedir()).replace(/^\$\{?HOME\}?(?=\/)/, homedir());
-		if (!/[\/]|\.json$|automode-preferences\.md$/.test(operand) || /\s/.test(operand)) return false;
-		const path = resolve(cwd ?? process.cwd(), operand);
-		const agent = resolve(getAgentConfigDirectory());
-		const configName = /^(?:(?:settings|models|keybindings|mcp)\.json|permission-gate[^/]*|automode-preferences\.md)$/;
-		const sensitive = path === agent || (dirname(path) === agent && configName.test(basename(path))) ||
-			(/(?:^|\/)\.pi\//.test(path) && configName.test(basename(path)) && basename(dirname(path)) === ".pi");
-		if (!sensitive) return false;
-		if (words[index - 1] === ">") return true;
-		const start = words.slice(0, index).findLastIndex((w) => /^[;&|()\n]$/.test(w)) + 1;
-		const endOffset = words.slice(index + 1).findIndex((w) => /^[;&|()\n<>]$/.test(w));
-		const end = endOffset < 0 ? words.length : index + 1 + endOffset;
-		const executable = basename(words[start] ?? "");
-		if (["cat", "head", "tail", "grep", "rg", "ag", "echo", "printf", "jq"].includes(executable)) return false;
-		if (executable === "cp" && index < end - 1) return false;
-		return true;
-	})) reasons.push("Pi or gate configuration write");
-	if (reasons.includes(CLASSIFIER_REQUIRED_REASON) || isAccessChange(command) || reasons.includes("Pi or gate configuration write")) return reasons;
+export function matchedReasons(
+	command: string,
+	rules: CommandRuleConfig = DEFAULT_COMMAND_RULE_CONFIG,
+	cwd?: string,
+): string[] {
+	const reasons = unique([
+		...dangerousPatterns.filter(({ pattern }) => pattern.test(command)).map(({ name }) => name),
+		...codeReviewReasons(command),
+	]);
+	if (isAccessChange(command) && !reasons.includes("cloud or infrastructure change"))
+		reasons.push("cloud or infrastructure change");
+	if (
+		commandAccess(command) === "write" &&
+		shellWords(command).some((word, index, words) => {
+			const operand = word
+				.replace(/^--?[\w-]+=/, "")
+				.replace(/^~(?=\/)/, homedir())
+				.replace(/^\$\{?HOME\}?(?=\/)/, homedir());
+			if (!/[/]|\.json$|automode-preferences\.md$/.test(operand) || /\s/.test(operand)) return false;
+			const path = resolve(cwd ?? process.cwd(), operand);
+			const agent = resolve(getAgentConfigDirectory());
+			const configName =
+				/^(?:(?:settings|models|keybindings|mcp)\.json|permission-gate[^/]*|automode-preferences\.md)$/;
+			const sensitive =
+				path === agent ||
+				(dirname(path) === agent && configName.test(basename(path))) ||
+				(/(?:^|\/)\.pi\//.test(path) && configName.test(basename(path)) && basename(dirname(path)) === ".pi");
+			if (!sensitive) return false;
+			if (words[index - 1] === ">") return true;
+			const start = words.slice(0, index).findLastIndex((w) => /^[;&|()\n]$/.test(w)) + 1;
+			const endOffset = words.slice(index + 1).findIndex((w) => /^[;&|()\n<>]$/.test(w));
+			const end = endOffset < 0 ? words.length : index + 1 + endOffset;
+			const executable = basename(words[start] ?? "");
+			if (["cat", "head", "tail", "grep", "rg", "ag", "echo", "printf", "jq"].includes(executable)) return false;
+			if (executable === "cp" && index < end - 1) return false;
+			return true;
+		})
+	)
+		reasons.push("Pi or gate configuration write");
+	if (
+		reasons.includes(CLASSIFIER_REQUIRED_REASON) ||
+		isAccessChange(command) ||
+		reasons.includes("Pi or gate configuration write")
+	)
+		return reasons;
 	// A literal single-quoted string cannot expand or hide another shell command.
-	if (reasons.length === 0 && command.trim() && splitSimpleSegments(command.replace(/'[^']*'/g, "''")) === undefined) reasons.push("shell syntax requires classifier assessment");
+	if (reasons.length === 0 && command.trim() && splitSimpleSegments(command.replace(/'[^']*'/g, "''")) === undefined)
+		reasons.push("shell syntax requires classifier assessment");
 	if (evaluateUserCommandRules(command, rules)?.decision === "allow") return [];
 	if (cwd && isScopedFindDeleteCommand(command, cwd)) return reasons.filter((reason) => reason !== "find delete");
 	return reasons;
@@ -1154,7 +1232,8 @@ const TEMPORARY_PLACEHOLDER = "/tmp/permission-gate-temporary";
 // `..` after the variable keeps it unresolved.
 function resolveTemporaryVariables(command: string): string {
 	const names = new Set(["TMPDIR"]);
-	for (const match of command.matchAll(/(?<![\w$])([A-Za-z_]\w*)=["']?\$\(\s*mktemp\b[^)]*\)["']?/g)) names.add(match[1]);
+	for (const match of command.matchAll(/(?<![\w$])([A-Za-z_]\w*)=["']?\$\(\s*mktemp\b[^)]*\)["']?/g))
+		names.add(match[1]);
 
 	let resolved = command;
 	for (const name of names) {
@@ -1174,7 +1253,9 @@ function accessesApprovalQueue(command: string): boolean {
 	const words = shellWords(command);
 	const skipped = new Set<number>();
 	// Never exempt an operand that can execute a command substitution.
-	const skipPattern = (index: number) => { if (!/\$\(|`/.test(words[index] ?? "")) skipped.add(index); };
+	const skipPattern = (index: number) => {
+		if (!/\$\(|`/.test(words[index] ?? "")) skipped.add(index);
+	};
 	for (let start = 0; start < words.length; start++) {
 		if (start > 0 && !/^[;&|()\n]$/.test(words[start - 1])) continue;
 		let i = start;
@@ -1184,21 +1265,39 @@ function accessesApprovalQueue(command: string): boolean {
 		let positionalOnly = false;
 		for (i++; i < words.length && !/^[;&|()\n]$/.test(words[i]); i++) {
 			const word = words[i];
-			if (/^[<>]$/.test(word)) { i++; continue; }
-			if (!positionalOnly && word === "--") { positionalOnly = true; continue; }
+			if (/^[<>]$/.test(word)) {
+				i++;
+				continue;
+			}
+			if (!positionalOnly && word === "--") {
+				positionalOnly = true;
+				continue;
+			}
 			if (!positionalOnly && /^(?:-e|--regexp)$/.test(word)) {
 				if (words[i + 1] !== undefined) skipPattern(++i);
 				patternFound = true;
 				continue;
 			}
-			if (!positionalOnly && /^(?:--regexp=|-e.+)/.test(word)) { skipPattern(i); patternFound = true; continue; }
-			if (!positionalOnly && /^(?:-[ABCmfgjt]|--(?:after-context|before-context|context|max-count|file|glob|iglob|type|type-not|threads|encoding|pre|include|exclude|exclude-dir))$/.test(word)) {
+			if (!positionalOnly && /^(?:--regexp=|-e.+)/.test(word)) {
+				skipPattern(i);
+				patternFound = true;
+				continue;
+			}
+			if (
+				!positionalOnly &&
+				/^(?:-[ABCmfgjt]|--(?:after-context|before-context|context|max-count|file|glob|iglob|type|type-not|threads|encoding|pre|include|exclude|exclude-dir))$/.test(
+					word,
+				)
+			) {
 				if (word === "-f" || word === "--file") patternFound = true;
 				i++;
 				continue;
 			}
 			if (!positionalOnly && word.startsWith("-")) continue;
-			if (!patternFound) { skipPattern(i); patternFound = true; }
+			if (!patternFound) {
+				skipPattern(i);
+				patternFound = true;
+			}
 		}
 	}
 	return words.some((word, i) => !skipped.has(i) && /approval-queue\.json|approval-history\.jsonl/i.test(word));
@@ -1206,8 +1305,13 @@ function accessesApprovalQueue(command: string): boolean {
 
 export function hardDenyReasons(command: string): string[] {
 	const resolved = resolveTemporaryVariables(command);
-	return unique(hardDenyPatterns.filter(({ name, pattern }) => name === "access to the approval queue"
-		? accessesApprovalQueue(command) : pattern.test(resolved)).map(({ name }) => name));
+	return unique(
+		hardDenyPatterns
+			.filter(({ name, pattern }) =>
+				name === "access to the approval queue" ? accessesApprovalQueue(command) : pattern.test(resolved),
+			)
+			.map(({ name }) => name),
+	);
 }
 
 function extractText(content: unknown): string {
@@ -1271,7 +1375,11 @@ function extractRecentConversation(
 			const text = truncate(extractText(message.content), MAX_RECENT_MESSAGE_LENGTH);
 			if (text) sections.push(`user: ${text}`);
 		} else if (message.role === "assistant" && Array.isArray(message.content)) {
-			for (const part of message.content as Array<{ type?: unknown; name?: unknown; arguments?: { command?: unknown } }>) {
+			for (const part of message.content as Array<{
+				type?: unknown;
+				name?: unknown;
+				arguments?: { command?: unknown };
+			}>) {
 				if (part?.type === "toolCall" && part.name === "bash" && typeof part.arguments?.command === "string") {
 					sections.push(`agent ran: ${truncate(part.arguments.command, 300)}`);
 				}
@@ -1343,13 +1451,7 @@ export function buildAutoModePrompt(preferences = "", historyMessages = DEFAULT_
 		preferences,
 		historyMessages,
 	);
-	return [
-		"SYSTEM PROMPT",
-		buildAutoModeSystemPrompt(preferences),
-		"",
-		"USER PROMPT TEMPLATE",
-		userPrompt,
-	].join("\n");
+	return ["SYSTEM PROMPT", buildAutoModeSystemPrompt(preferences), "", "USER PROMPT TEMPLATE", userPrompt].join("\n");
 }
 
 function createProviderComplete(provider: unknown): ClassifierComplete {
@@ -1358,13 +1460,15 @@ function createProviderComplete(provider: unknown): ClassifierComplete {
 			throw new Error("The configured classifier provider is not available.");
 		}
 
-		const streamSimple = (provider as {
-			streamSimple?: (
-				model: unknown,
-				context: unknown,
-				options: unknown,
-			) => { result: () => Promise<ClassifierResponse> };
-		}).streamSimple;
+		const streamSimple = (
+			provider as {
+				streamSimple?: (
+					model: unknown,
+					context: unknown,
+					options: unknown,
+				) => { result: () => Promise<ClassifierResponse> };
+			}
+		).streamSimple;
 		if (typeof streamSimple !== "function") {
 			throw new Error("The configured classifier provider cannot stream simple responses.");
 		}
@@ -1393,14 +1497,23 @@ async function requestClassifierDecision(
 	effectiveThinkingLevel: ClassifierThinkingLevel,
 	command: string,
 	reasons: string[],
-	ctx: { cwd: string; signal?: AbortSignal; sessionManager: { getBranch: () => unknown[] }; inspection?: CommandInspection },
+	ctx: {
+		cwd: string;
+		signal?: AbortSignal;
+		sessionManager: { getBranch: () => unknown[] };
+		inspection?: CommandInspection;
+	},
 	preferences: string,
 	historyMessages = DEFAULT_CLASSIFIER_HISTORY_MESSAGES,
 	skipFastPass = false,
 ): Promise<ClassifierOutcome> {
 	const failures: string[] = [];
 
-	const attempt = async ({ fastPass, reasoning, maxTokens }: ClassifierAttempt): Promise<ParsedAutoDecision | undefined> => {
+	const attempt = async ({
+		fastPass,
+		reasoning,
+		maxTokens,
+	}: ClassifierAttempt): Promise<ParsedAutoDecision | undefined> => {
 		if (ctx.signal?.aborted) return undefined;
 		try {
 			const response = await complete(
@@ -1620,25 +1733,31 @@ function parseModeState(value: unknown): ModeState | undefined {
 	const classifierModel =
 		candidate.classifierModel === undefined
 			? cloneClassifierModelReference(DEFAULT_CLASSIFIER_MODEL)
-			: parseClassifierModelReference(candidate.classifierModel) ?? null;
+			: (parseClassifierModelReference(candidate.classifierModel) ?? null);
 	const classifierThinkingLevel =
 		candidate.classifierThinkingLevel === undefined
 			? DEFAULT_CLASSIFIER_THINKING_LEVEL
-			: typeof candidate.classifierThinkingLevel === "string" && isClassifierThinkingLevel(candidate.classifierThinkingLevel)
+			: typeof candidate.classifierThinkingLevel === "string" &&
+					isClassifierThinkingLevel(candidate.classifierThinkingLevel)
 				? candidate.classifierThinkingLevel
 				: DEFAULT_CLASSIFIER_THINKING_LEVEL;
 	const classifierHistoryMessages =
 		candidate.classifierHistoryMessages === undefined
 			? DEFAULT_CLASSIFIER_HISTORY_MESSAGES
-			: parseClassifierHistoryMessages(candidate.classifierHistoryMessages) ?? DEFAULT_CLASSIFIER_HISTORY_MESSAGES;
+			: (parseClassifierHistoryMessages(candidate.classifierHistoryMessages) ?? DEFAULT_CLASSIFIER_HISTORY_MESSAGES);
 	return {
 		autoModeEnabled: candidate.autoModeEnabled,
 		classifierModel,
 		classifierThinkingLevel,
 		classifierHistoryMessages,
-		productionPatterns: Array.isArray(candidate.productionPatterns) && candidate.productionPatterns.every((p) => typeof p === "string" && p.trim())
-			? candidate.productionPatterns.map((pattern) => pattern.trim()) : [...DEFAULT_PRODUCTION_PATTERNS],
-		approvalWaitSeconds: APPROVAL_WAIT_CHOICES.includes(candidate.approvalWaitSeconds ?? 0) ? candidate.approvalWaitSeconds : DEFAULT_APPROVAL_WAIT_SECONDS,
+		productionPatterns:
+			Array.isArray(candidate.productionPatterns) &&
+			candidate.productionPatterns.every((p) => typeof p === "string" && p.trim())
+				? candidate.productionPatterns.map((pattern) => pattern.trim())
+				: [...DEFAULT_PRODUCTION_PATTERNS],
+		approvalWaitSeconds: APPROVAL_WAIT_CHOICES.includes(candidate.approvalWaitSeconds ?? 0)
+			? candidate.approvalWaitSeconds
+			: DEFAULT_APPROVAL_WAIT_SECONDS,
 	};
 }
 
@@ -1889,13 +2008,18 @@ async function initializeCommandRules(
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.warn("[permission-gate] Could not load command rules:", error);
-		notify(ctx, `Permission gate could not load command rules; using built-in defaults: ${truncate(message, 300)}`, "warning");
+		notify(
+			ctx,
+			`Permission gate could not load command rules; using built-in defaults: ${truncate(message, 300)}`,
+			"warning",
+		);
 		return { config: cloneDefaultCommandRuleConfig(), scope: "global" };
 	}
 }
 
 function formatCommandRules(config: CommandRuleConfig, scope: string): string {
-	const formatList = (patterns: string[]) => (patterns.length > 0 ? patterns.map((pattern) => `  - ${pattern}`).join("\n") : "  (none)");
+	const formatList = (patterns: string[]) =>
+		patterns.length > 0 ? patterns.map((pattern) => `  - ${pattern}`).join("\n") : "  (none)";
 	return [
 		`Permission gate command rules (${scope})`,
 		"",
@@ -1966,7 +2090,8 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 	let sessionGeneration = 0;
 	const pendingApprovals = new Set<AbortController>();
 	const lateApprovals: (DecisionMeasurements & { command: string; snapshot: string; historyId?: string })[] = [];
-	const snapshotKey = (inspection: CommandInspection): string => JSON.stringify([inspectionPrompt(inspection), [...inspection.fingerprints]]);
+	const snapshotKey = (inspection: CommandInspection): string =>
+		JSON.stringify([inspectionPrompt(inspection), [...inspection.fingerprints]]);
 	const clearSessionApprovals = () => {
 		sessionGeneration += 1;
 		intentStore.clear();
@@ -2017,7 +2142,11 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		syncAvailableClassifierModels(ctx);
 		refreshStatus(ctx);
 		await persistMode(ctx);
-		notify(ctx, `Permission gate: ${autoModeEnabled ? "ON" : "OFF"}. ${autoModeEnabled ? "Rules, classifier, and approvals are enabled." : "No checks, classifier, or approvals."}`, "info");
+		notify(
+			ctx,
+			`Permission gate: ${autoModeEnabled ? "ON" : "OFF"}. ${autoModeEnabled ? "Rules, classifier, and approvals are enabled." : "No checks, classifier, or approvals."}`,
+			"info",
+		);
 	};
 	const persistAutoModePreferences = async (
 		ctx: { hasUI: boolean; ui: { notify: (message: string, level: "info" | "warning" | "error") => void } },
@@ -2055,8 +2184,23 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 
 		const approved = data.status === "approved";
 		const title = `Permission Gate: ${(data.status ?? "blocked").toUpperCase()}`;
-		const source = data.source === "auto-model" ? "auto model" : data.source === "user-rule" ? "user rule" : data.source === "human" ? "you" : data.source === "intent-grant" ? "intent grant" : "hard deny";
-		const color = approved ? "success" : data.status === "redirected" ? "accent" : data.status === "expired" ? "warning" : "error";
+		const source =
+			data.source === "auto-model"
+				? "auto model"
+				: data.source === "user-rule"
+					? "user rule"
+					: data.source === "human"
+						? "you"
+						: data.source === "intent-grant"
+							? "intent grant"
+							: "hard deny";
+		const color = approved
+			? "success"
+			: data.status === "redirected"
+				? "accent"
+				: data.status === "expired"
+					? "warning"
+					: "error";
 		const lines = [
 			`${theme.fg(color, theme.bold(title))} ${theme.fg("dim", `via ${source}`)}`,
 			`${theme.fg("dim", `Command: ${data.command}`)}`,
@@ -2077,7 +2221,9 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		return new Text(lines.join("\n"), 0, 0);
 	});
 
-	const syncAvailableClassifierModels = (ctx: { modelRegistry: { getAvailable: () => readonly unknown[]; getProviderDisplayName: (provider: string) => string } }): void => {
+	const syncAvailableClassifierModels = (ctx: {
+		modelRegistry: { getAvailable: () => readonly unknown[]; getProviderDisplayName: (provider: string) => string };
+	}): void => {
 		try {
 			availableClassifierModels = cacheAvailableClassifierModels(ctx);
 		} catch {
@@ -2110,10 +2256,17 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		ctx.hasUI && (ctx.mode === "tui" || ctx.mode === "rpc");
 
 	const handleClassifierModelCommand = async (args: string, ctx: ExtensionContext): Promise<void> => {
-		const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
+		const parts = String(args ?? "")
+			.trim()
+			.split(/\s+/)
+			.filter(Boolean);
 		if (parts.length === 0) {
 			if (!canPromptForSelection(ctx)) {
-				notify(ctx, `Choosing a classifier model requires interactive mode. Use /${AUTO_MODE_SETTINGS_COMMAND} model provider/model-id instead.`, "warning");
+				notify(
+					ctx,
+					`Choosing a classifier model requires interactive mode. Use /${AUTO_MODE_SETTINGS_COMMAND} model provider/model-id instead.`,
+					"warning",
+				);
 				return;
 			}
 
@@ -2128,7 +2281,8 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			const choice = await ctx.ui.select("Select the auto-mode classifier model:", choices);
 			if (!choice) return;
 			const selectedIndex = choices.indexOf(choice);
-			const selected = selectedIndex >= 0 ? models[selectedIndex] : models.find((model) => model.canonicalId === choice);
+			const selected =
+				selectedIndex >= 0 ? models[selectedIndex] : models.find((model) => model.canonicalId === choice);
 			if (!selected) {
 				notify(ctx, "Permission gate: the selected classifier model is no longer available.", "warning");
 				return;
@@ -2137,10 +2291,10 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			await persistMode(ctx);
 			refreshStatus(ctx);
 			notify(
-			ctx,
-			`Permission gate classifier model set to ${formatClassifierModelLabel(classifierModel, selected, classifierThinkingLevel)}.`,
-			"info",
-		);
+				ctx,
+				`Permission gate classifier model set to ${formatClassifierModelLabel(classifierModel, selected, classifierThinkingLevel)}.`,
+				"info",
+			);
 			return;
 		}
 
@@ -2167,12 +2321,20 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		try {
 			models = await refreshAvailableClassifierModels(ctx);
 		} catch {
-			notify(ctx, "Permission gate could not discover classifier models after refreshing Pi's model registry.", "error");
+			notify(
+				ctx,
+				"Permission gate could not discover classifier models after refreshing Pi's model registry.",
+				"error",
+			);
 			return;
 		}
 		const selected = models.find((model) => model.canonicalId === modelArgument);
 		if (!selected) {
-			notify(ctx, `Permission gate classifier model ${modelArgument} is not an available authenticated text-capable model.`, "warning");
+			notify(
+				ctx,
+				`Permission gate classifier model ${modelArgument} is not an available authenticated text-capable model.`,
+				"warning",
+			);
 			return;
 		}
 		classifierModel = { provider: selected.model.provider, id: selected.model.id };
@@ -2186,9 +2348,16 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 	};
 
 	const handleClassifierThinkingCommand = async (args: string, ctx: ExtensionContext): Promise<void> => {
-		const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
+		const parts = String(args ?? "")
+			.trim()
+			.split(/\s+/)
+			.filter(Boolean);
 		if (parts.length === 0 && !canPromptForSelection(ctx)) {
-			notify(ctx, `Choosing a classifier thinking level requires interactive mode. Use /${AUTO_MODE_SETTINGS_COMMAND} thinking <level> instead.`, "warning");
+			notify(
+				ctx,
+				`Choosing a classifier thinking level requires interactive mode. Use /${AUTO_MODE_SETTINGS_COMMAND} thinking <level> instead.`,
+				"warning",
+			);
 			return;
 		}
 
@@ -2249,7 +2418,10 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 	};
 
 	const handleClassifierHistoryCommand = async (args: string, ctx: ExtensionContext): Promise<void> => {
-		const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
+		const parts = String(args ?? "")
+			.trim()
+			.split(/\s+/)
+			.filter(Boolean);
 		if (parts.length === 0 && !canPromptForSelection(ctx)) {
 			notify(
 				ctx,
@@ -2288,7 +2460,12 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				classifierHistoryMessages = DEFAULT_CLASSIFIER_HISTORY_MESSAGES;
 			} else {
 				const count = Number.parseInt(requested, 10);
-				if (Number.isNaN(count) || count < MIN_CLASSIFIER_HISTORY_MESSAGES || count > MAX_CLASSIFIER_HISTORY_MESSAGES || String(count) !== requested) {
+				if (
+					Number.isNaN(count) ||
+					count < MIN_CLASSIFIER_HISTORY_MESSAGES ||
+					count > MAX_CLASSIFIER_HISTORY_MESSAGES ||
+					String(count) !== requested
+				) {
 					notify(
 						ctx,
 						`Usage: /${AUTO_MODE_SETTINGS_COMMAND} history [0-${MAX_CLASSIFIER_HISTORY_MESSAGES}|reset]`,
@@ -2335,7 +2512,11 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			try {
 				edited = await ctx.ui.editor("Edit auto-mode classifier preference notes", autoModePreferences);
 			} catch (error) {
-				notify(ctx, `Permission gate: preference editor failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+				notify(
+					ctx,
+					`Permission gate: preference editor failed: ${error instanceof Error ? error.message : String(error)}`,
+					"error",
+				);
 				return;
 			}
 			if (edited === undefined) return;
@@ -2369,7 +2550,9 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		const first = parts[0]?.toLowerCase() ?? "";
 
 		if (first === "wait") {
-			const selected = parts[1] ?? (ctx.hasUI ? await ctx.ui.select("Approval wait (seconds)", APPROVAL_WAIT_CHOICES.map(String)) : undefined);
+			const selected =
+				parts[1] ??
+				(ctx.hasUI ? await ctx.ui.select("Approval wait (seconds)", APPROVAL_WAIT_CHOICES.map(String)) : undefined);
 			if (parts.length > 2 || !selected || !APPROVAL_WAIT_CHOICES.map(String).includes(selected)) {
 				notify(ctx, `Usage: /${AUTO_MODE_SETTINGS_COMMAND} wait [${APPROVAL_WAIT_CHOICES.join("|")}]`, "warning");
 				return;
@@ -2380,12 +2563,23 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			return;
 		}
 		if (first === "production") {
-			const edited = parts.length > 1 ? parts.slice(1).join(" ") : ctx.hasUI
-				? await ctx.ui.editor("Production patterns (one per line; * and ? wildcards)", productionPatterns.join("\n")) : undefined;
+			const edited =
+				parts.length > 1
+					? parts.slice(1).join(" ")
+					: ctx.hasUI
+						? await ctx.ui.editor(
+								"Production patterns (one per line; * and ? wildcards)",
+								productionPatterns.join("\n"),
+							)
+						: undefined;
 			if (edited === undefined) return;
 			productionPatterns = unique(edited.split(/[\s,]+/).filter(Boolean));
 			await persistMode(ctx);
-			notify(ctx, `Production patterns: ${productionPatterns.join(", ") || "(none; unknown targets remain critical)"}`, "info");
+			notify(
+				ctx,
+				`Production patterns: ${productionPatterns.join(", ") || "(none; unknown targets remain critical)"}`,
+				"info",
+			);
 			return;
 		}
 		if (first === "grants") {
@@ -2393,7 +2587,11 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			while (true) {
 				const grants = intentStore.list(gateSessionId);
 				const choices = grants.map((grant) => `${grant.id}: ${grant.label} — ${grant.targets.join(", ")}`);
-				const choice = await ctx.ui.select(`Session intent grants (${gateSessionId}) — select to revoke`, [...choices, "Revoke all", "Close"]);
+				const choice = await ctx.ui.select(`Session intent grants (${gateSessionId}) — select to revoke`, [
+					...choices,
+					"Revoke all",
+					"Close",
+				]);
 				if (!choice || choice === "Close") return;
 				if (choice === "Revoke all") intentStore.clear(gateSessionId);
 				else {
@@ -2463,7 +2661,6 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			);
 			return;
 		}
-
 	};
 
 	type PermissionRulesAction = "edit" | "list" | "reset";
@@ -2489,7 +2686,11 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			try {
 				await saveCommandRules(dependencies, scope, ctx.cwd, resetConfig);
 			} catch (error) {
-				notify(ctx, `Permission gate: could not reset ${scope} rules: ${error instanceof Error ? error.message : String(error)}`, "error");
+				notify(
+					ctx,
+					`Permission gate: could not reset ${scope} rules: ${error instanceof Error ? error.message : String(error)}`,
+					"error",
+				);
 				return;
 			}
 			ruleConfig = resetConfig;
@@ -2509,7 +2710,11 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				JSON.stringify(ruleConfig, null, 2),
 			);
 		} catch (error) {
-			notify(ctx, `Permission gate: rule editor failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+			notify(
+				ctx,
+				`Permission gate: rule editor failed: ${error instanceof Error ? error.message : String(error)}`,
+				"error",
+			);
 			return;
 		}
 		if (edited === undefined) return;
@@ -2518,11 +2723,19 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		try {
 			nextConfig = parseCommandRuleConfig(JSON.parse(edited));
 		} catch (error) {
-			notify(ctx, `Permission gate: invalid rules JSON: ${error instanceof Error ? error.message : String(error)}`, "error");
+			notify(
+				ctx,
+				`Permission gate: invalid rules JSON: ${error instanceof Error ? error.message : String(error)}`,
+				"error",
+			);
 			return;
 		}
 		if (!nextConfig) {
-			notify(ctx, "Permission gate: rules must contain string arrays named allowedCommands and disallowedCommands.", "error");
+			notify(
+				ctx,
+				"Permission gate: rules must contain string arrays named allowedCommands and disallowedCommands.",
+				"error",
+			);
 			return;
 		}
 
@@ -2546,7 +2759,11 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		try {
 			await saveCommandRules(dependencies, scope, ctx.cwd, nextConfig);
 		} catch (error) {
-			notify(ctx, `Permission gate: could not save ${scope} rules: ${error instanceof Error ? error.message : String(error)}`, "error");
+			notify(
+				ctx,
+				`Permission gate: could not save ${scope} rules: ${error instanceof Error ? error.message : String(error)}`,
+				"error",
+			);
 			return;
 		}
 		ruleConfig = nextConfig;
@@ -2625,22 +2842,32 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			allowedCommands: ruleConfig.allowedCommands,
 			disallowedCommands: ruleConfig.disallowedCommands,
 			preferences: autoModePreferences,
-			productionPatterns, approvalWaitSeconds, activeGrantCount: intentStore.list(gateSessionId).length,
+			productionPatterns,
+			approvalWaitSeconds,
+			activeGrantCount: intentStore.list(gateSessionId).length,
 		};
 	};
 
-	const handlePermissionSettingsAction = async (action: PermissionSettingsAction, ctx: ExtensionContext): Promise<void> => {
+	const handlePermissionSettingsAction = async (
+		action: PermissionSettingsAction,
+		ctx: ExtensionContext,
+	): Promise<void> => {
 		switch (action.type) {
 			case "gate":
-				await setGate(ctx, action.value); return;
+				await setGate(ctx, action.value);
+				return;
 			case "production-patterns":
-				await handleAutoModeSettingsCommand("production", ctx); return;
+				await handleAutoModeSettingsCommand("production", ctx);
+				return;
 			case "approval-wait":
-				await handleAutoModeSettingsCommand(`wait ${action.value}`, ctx); return;
+				await handleAutoModeSettingsCommand(`wait ${action.value}`, ctx);
+				return;
 			case "intent-grants":
-				await handleAutoModeSettingsCommand("grants", ctx); return;
+				await handleAutoModeSettingsCommand("grants", ctx);
+				return;
 			case "statistics":
-				await handleAutoModeSettingsCommand("statistics", ctx); return;
+				await handleAutoModeSettingsCommand("statistics", ctx);
+				return;
 			case "classifier-model":
 				await handleClassifierModelCommand(action.value, ctx);
 				return;
@@ -2664,7 +2891,10 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 					return;
 				}
 				if (action.value === "clear") {
-					const confirmed = await ctx.ui.confirm("Clear classifier preferences?", "All user-authored auto-mode preference notes will be removed.");
+					const confirmed = await ctx.ui.confirm(
+						"Clear classifier preferences?",
+						"All user-authored auto-mode preference notes will be removed.",
+					);
 					if (!confirmed) return;
 				}
 				await handleAutoModePreferencesCommand(action.value, ctx);
@@ -2691,8 +2921,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 
 	pi.registerCommand(AUTO_MODE_SETTINGS_COMMAND, {
 		description: "Open permission-gate settings or configure them directly",
-		getArgumentCompletions: (argumentPrefix) =>
-			getClassifierModelCompletions(argumentPrefix, scopedClassifierModels),
+		getArgumentCompletions: (argumentPrefix) => getClassifierModelCompletions(argumentPrefix, scopedClassifierModels),
 		handler: async (args, ctx) => {
 			const value = String(args ?? "").trim();
 			if (!value) {
@@ -2706,9 +2935,13 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 	pi.registerCommand(GATE_COMMAND, {
 		description: "Turn the permission gate on or off globally: /permission-gate on|off|status",
 		getArgumentCompletions: (prefix) =>
-			["on", "off", "status"].filter((v) => v.startsWith(prefix.trim().toLowerCase())).map((v) => ({ value: v, label: v })),
+			["on", "off", "status"]
+				.filter((v) => v.startsWith(prefix.trim().toLowerCase()))
+				.map((v) => ({ value: v, label: v })),
 		handler: async (args, ctx) => {
-			const action = String(args ?? "").trim().toLowerCase();
+			const action = String(args ?? "")
+				.trim()
+				.toLowerCase();
 			if (action === "on" || action === "off") {
 				await setGate(ctx, action);
 			} else if (!action || action === "status") {
@@ -2722,9 +2955,13 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 	pi.registerCommand("approvals", {
 		description: "Open the approval queue and decision history in the browser",
 		handler: async (_args, ctx) => {
-			const opened = process.env.PI_PERMISSION_GATE_BROWSER === "0"
-				? false
-				: await (dependencies.openApprovalPage ?? (() => openApprovalPage(join(getAgentConfigDirectory(), APPROVAL_STATE_FILENAME))))();
+			const opened =
+				process.env.PI_PERMISSION_GATE_BROWSER === "0"
+					? false
+					: await (
+							dependencies.openApprovalPage ??
+							(() => openApprovalPage(join(getAgentConfigDirectory(), APPROVAL_STATE_FILENAME)))
+						)();
 			notify(
 				ctx,
 				opened ? "Opened the approval queue and history in the browser." : "The approval queue is unavailable.",
@@ -2779,10 +3016,22 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		risk: entry.risk ?? "low",
 		tldr: entry.rationale,
 		status: entry.status === "blocked" ? "denied" : entry.status,
-		recommendation: entry.recommendation, shownAt: entry.shownAt, answeredAt: entry.answeredAt,
-		scope: entry.scope, grantId: entry.grantId, note: entry.note,
+		recommendation: entry.recommendation,
+		shownAt: entry.shownAt,
+		answeredAt: entry.answeredAt,
+		scope: entry.scope,
+		grantId: entry.grantId,
+		note: entry.note,
 		source:
-			entry.source === "auto-model" ? "auto" : entry.source === "user-rule" ? "rule" : entry.source === "human" ? "human" : entry.source === "intent-grant" ? "grant" : "hard-deny",
+			entry.source === "auto-model"
+				? "auto"
+				: entry.source === "user-rule"
+					? "rule"
+					: entry.source === "human"
+						? "human"
+						: entry.source === "intent-grant"
+							? "grant"
+							: "hard-deny",
 		...(entry.via ? { via: entry.via } : {}),
 		reasons: entry.reasons,
 		...(entry.paths ? { paths: entry.paths, pathNotes: entry.pathNotes } : {}),
@@ -2818,12 +3067,31 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 	// "unavailable", which the caller treats as a block.
 	const askHuman = (
 		ctx: ExtensionContext,
-		request: Pick<ApprovalRequest, "kind" | "command" | "risk" | "tldr" | "recommendation" | "reasons" | "model" | "paths" | "pathNotes" | "intentProposal" | "environment">,
+		request: Pick<
+			ApprovalRequest,
+			| "kind"
+			| "command"
+			| "risk"
+			| "tldr"
+			| "recommendation"
+			| "reasons"
+			| "model"
+			| "paths"
+			| "pathNotes"
+			| "intentProposal"
+			| "environment"
+		>,
 		onLateOutcome: (outcome: ApprovalOutcome, shownAt: number) => void,
 	): Promise<HumanDecision> => {
 		if (ctx.signal?.aborted) return Promise.resolve({ approved: false, cancelled: true });
 		const requester = ctx.hasUI ? getApprovalRequester() : undefined;
-		if (!ctx.hasUI) return Promise.resolve({ approved: false, unavailable: true, scope: "once", recommendation: request.recommendation });
+		if (!ctx.hasUI)
+			return Promise.resolve({
+				approved: false,
+				unavailable: true,
+				scope: "once",
+				recommendation: request.recommendation,
+			});
 
 		const terminal = new AbortController();
 		const browser = new AbortController();
@@ -2846,8 +3114,10 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				ctx.signal?.removeEventListener("abort", onOuterAbort);
 				clearTimeout(timer);
 				terminal.abort();
-				if (decision.status !== "expired") { browser.abort(); cleanupBrowser(); }
-				else if (!requester) cleanupBrowser();
+				if (decision.status !== "expired") {
+					browser.abort();
+					cleanupBrowser();
+				} else if (!requester) cleanupBrowser();
 				resolve({
 					...decision,
 					shownAt,
@@ -2862,60 +3132,112 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				cleanupBrowser();
 			};
 			ctx.signal?.addEventListener("abort", onOuterAbort, { once: true });
-			browser.signal.addEventListener("abort", () => {
-				settle({ approved: false, cancelled: true });
-				cleanupBrowser();
-			}, { once: true });
+			browser.signal.addEventListener(
+				"abort",
+				() => {
+					settle({ approved: false, cancelled: true });
+					cleanupBrowser();
+				},
+				{ once: true },
+			);
 			const answererGone = () => {
 				answerers--;
 				if (!answerers) settle({ approved: false, unavailable: true });
 			};
 			const waitMs = dependencies.approvalWaitMs ?? approvalWaitSeconds * 1000;
 			timer = setTimeout(() => {
-				settle({ approved: false, status: "expired", note: browserAvailable
-					? "The user is away; continue with other work that does not need this command, or end the turn and ask in plain text. If the user answers later, a message follows."
-					: "The user is away; continue with other work that does not need this command, or end the turn and ask in plain text. Without the browser channel, late answers are not possible." });
+				settle({
+					approved: false,
+					status: "expired",
+					note: browserAvailable
+						? "The user is away; continue with other work that does not need this command, or end the turn and ask in plain text. If the user answers later, a message follows."
+						: "The user is away; continue with other work that does not need this command, or end the turn and ask in plain text. Without the browser channel, late answers are not possible.",
+				});
 				park.abort();
 			}, waitMs);
 
 			if (requester) {
 				answerers++;
-				void requester({
-					...request, ttlMs: waitMs + LATE_ANSWER_WINDOW_MS, tldr: request.environment ? `${request.tldr} Environment: ${request.environment}.` : request.tldr,
-					sessionId: gateSessionId, sessionLabel: basename(ctx.cwd) || ctx.cwd, cwd: ctx.cwd,
-				}, browser.signal, {
-					parkSignal: park.signal,
-					onLateOutcome: (outcome) => {
-						if (park.signal.aborted && generation === sessionGeneration && !browser.signal.aborted) onLateOutcome(outcome, shownAt);
+				void requester(
+					{
+						...request,
+						ttlMs: waitMs + LATE_ANSWER_WINDOW_MS,
+						tldr: request.environment ? `${request.tldr} Environment: ${request.environment}.` : request.tldr,
+						sessionId: gateSessionId,
+						sessionLabel: basename(ctx.cwd) || ctx.cwd,
+						cwd: ctx.cwd,
 					},
-				}).then((outcome) => {
-					if (settled) return;
-					if (!outcome) { browserAvailable = false; return answererGone(); }
-					if (outcome.status === "cancelled") return settle({ approved: false, cancelled: true, via: "browser" });
-					if (outcome.status === "expired") return settle({ approved: false, status: "expired", note: "The user is away; continue with other work or end the turn and ask in plain text.", via: "browser" });
-					const note = outcome.note?.trim();
-					// Invalid redirects fail closed, never count as a useful steering answer.
-					if (outcome.status === "redirected" && !note) return settle({ approved: false, note: "Redirect needs an instruction.", via: "browser" });
-					settle({
-						approved: outcome.status === "approved",
-						status: outcome.status === "redirected" ? "redirected" : undefined,
-						note, scope: outcome.scope === "intent" ? "intent" : "once", intent: outcome.intent, historyId: outcome.historyId,
-						liftLockdown: outcome.scope === "session" && request.kind === "lockdown", via: "browser",
-					});
-				}).catch(() => { browserAvailable = false; if (!settled) answererGone(); }).finally(cleanupBrowser);
+					browser.signal,
+					{
+						parkSignal: park.signal,
+						onLateOutcome: (outcome) => {
+							if (park.signal.aborted && generation === sessionGeneration && !browser.signal.aborted)
+								onLateOutcome(outcome, shownAt);
+						},
+					},
+				)
+					.then((outcome) => {
+						if (settled) return;
+						if (!outcome) {
+							browserAvailable = false;
+							return answererGone();
+						}
+						if (outcome.status === "cancelled") return settle({ approved: false, cancelled: true, via: "browser" });
+						if (outcome.status === "expired")
+							return settle({
+								approved: false,
+								status: "expired",
+								note: "The user is away; continue with other work or end the turn and ask in plain text.",
+								via: "browser",
+							});
+						const note = outcome.note?.trim();
+						// Invalid redirects fail closed, never count as a useful steering answer.
+						if (outcome.status === "redirected" && !note)
+							return settle({ approved: false, note: "Redirect needs an instruction.", via: "browser" });
+						settle({
+							approved: outcome.status === "approved",
+							status: outcome.status === "redirected" ? "redirected" : undefined,
+							note,
+							scope: outcome.scope === "intent" ? "intent" : "once",
+							intent: outcome.intent,
+							historyId: outcome.historyId,
+							liftLockdown: outcome.scope === "session" && request.kind === "lockdown",
+							via: "browser",
+						});
+					})
+					.catch(() => {
+						browserAvailable = false;
+						if (!settled) answererGone();
+					})
+					.finally(cleanupBrowser);
 			}
 
 			answerers++;
-			const intentOption = request.intentProposal ? `Yes, for this session: ${request.intentProposal.label}` : undefined;
-			const options = ["No", "Yes", ...(request.kind === "lockdown" ? ["Yes, and lift lockdown"] : []), ...(intentOption ? [intentOption] : []), "Redirect…"];
+			const intentOption = request.intentProposal
+				? `Yes, for this session: ${request.intentProposal.label}`
+				: undefined;
+			const options = [
+				"No",
+				"Yes",
+				...(request.kind === "lockdown" ? ["Yes, and lift lockdown"] : []),
+				...(intentOption ? [intentOption] : []),
+				"Redirect…",
+			];
 			const title = [
 				`Execution summary: ${request.tldr}`,
 				`Recommended: ${request.recommendation}`,
 				`Permission gate: ${request.risk.toUpperCase()} risk`,
 				...(request.environment ? [`Environment: ${request.environment}`] : []),
-				"", `Project: ${basename(ctx.cwd)} — ${ctx.cwd}`, "", "Files and paths:",
-				formatPaths(request.paths), "Static references only; runtime code can construct additional paths.",
-				...(request.pathNotes ?? []), "", preview(request.command), "",
+				"",
+				`Project: ${basename(ctx.cwd)} — ${ctx.cwd}`,
+				"",
+				"Files and paths:",
+				formatPaths(request.paths),
+				"Static references only; runtime code can construct additional paths.",
+				...(request.pathNotes ?? []),
+				"",
+				preview(request.command),
+				"",
 				"Allow this command to run? (You can also answer in the browser queue.)",
 			].join("\n");
 			void (async () => {
@@ -2924,19 +3246,27 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 					if (settled) return;
 					if (terminal.signal.aborted) return settle({ approved: false, cancelled: true });
 					if (choice === "Redirect…") {
-						const note = await ctx.ui.input("Redirect: what should the agent do instead?", "", { signal: terminal.signal });
+						const note = await ctx.ui.input("Redirect: what should the agent do instead?", "", {
+							signal: terminal.signal,
+						});
 						if (settled) return;
 						if (note === undefined) return settle({ approved: false, via: "terminal" });
 						if (!note.trim()) continue;
 						return settle({ approved: false, status: "redirected", note: note.trim(), via: "terminal" });
 					}
 					return settle({
-						approved: choice === "Yes" || choice === "Yes, and lift lockdown" || (intentOption !== undefined && choice === intentOption),
+						approved:
+							choice === "Yes" ||
+							choice === "Yes, and lift lockdown" ||
+							(intentOption !== undefined && choice === intentOption),
 						scope: intentOption !== undefined && choice === intentOption ? "intent" : "once",
-						liftLockdown: choice === "Yes, and lift lockdown", via: "terminal",
+						liftLockdown: choice === "Yes, and lift lockdown",
+						via: "terminal",
 					});
 				}
-			})().catch(() => { if (!settled) answererGone(); });
+			})().catch(() => {
+				if (!settled) answererGone();
+			});
 			if (ctx.signal?.aborted) onOuterAbort();
 		});
 	};
@@ -2994,7 +3324,10 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				timestamp: now(),
 			});
 			const started = registerDenial(ctx);
-			return { block: true, reason: `${rationale} The command was blocked. ${NO_RETRY_NOTICE}${started ? " Every command now needs the user's approval." : ""}` };
+			return {
+				block: true,
+				reason: `${rationale} The command was blocked. ${NO_RETRY_NOTICE}${started ? " Every command now needs the user's approval." : ""}`,
+			};
 		}
 
 		if (userRule?.decision === "deny") {
@@ -3009,17 +3342,27 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				timestamp: now(),
 			});
 			const started = registerDenial(ctx);
-			return { block: true, reason: `${rationale} The command was blocked. ${NO_RETRY_NOTICE}${started ? " Every command now needs the user's approval." : ""}` };
+			return {
+				block: true,
+				reason: `${rationale} The command was blocked. ${NO_RETRY_NOTICE}${started ? " Every command now needs the user's approval." : ""}`,
+			};
 		}
 
 		// Inspect every invocation, including commands covered by a human grant.
 		if (reasons.length === 0 && !lockdown) return undefined;
 		for (let review = 0; review < 3; review++) {
-			if (ctx.signal?.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
+			if (ctx.signal?.aborted)
+				return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 			const inspection = await inspectCommand(command, ctx.cwd);
 			if (signal.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 			const display = { paths: inspection.paths, pathNotes: inspection.notes };
-			const reviewContext = { cwd: ctx.cwd, signal: ctx.signal, modelRegistry: ctx.modelRegistry, sessionManager: ctx.sessionManager, inspection };
+			const reviewContext = {
+				cwd: ctx.cwd,
+				signal: ctx.signal,
+				modelRegistry: ctx.modelRegistry,
+				sessionManager: ctx.sessionManager,
+				inspection,
+			};
 			const recordReviewed = (entry: DecisionEntry, historyId?: string) => {
 				if (!cancelled()) record(ctx, { ...display, ...entry }, historyId);
 			};
@@ -3031,11 +3374,25 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				// Consume before an await so concurrent calls cannot use one approval twice.
 				const [approval] = lateApprovals.splice(lateIndex, 1);
 				if (!(await inspectionIsFresh(inspection))) continue;
-				if (signal.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
-				recordReviewed({ command: preview(command), reasons, status: "approved", source: "human",
-					rationale: "The user approved this exact command and inspection snapshot after the short wait.",
-					scope: "once", note: "late approval", via: "browser", recommendation: approval.recommendation,
-					shownAt: approval.shownAt, answeredAt: approval.answeredAt, timestamp: now() }, approval.historyId);
+				if (signal.aborted)
+					return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
+				recordReviewed(
+					{
+						command: preview(command),
+						reasons,
+						status: "approved",
+						source: "human",
+						rationale: "The user approved this exact command and inspection snapshot after the short wait.",
+						scope: "once",
+						note: "late approval",
+						via: "browser",
+						recommendation: approval.recommendation,
+						shownAt: approval.shownAt,
+						answeredAt: approval.answeredAt,
+						timestamp: now(),
+					},
+					approval.historyId,
+				);
 				registerApproval();
 				return undefined;
 			}
@@ -3043,9 +3400,18 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				const grant = intentStore.match(gateSessionId, { command, reasons, paths: inspection.paths });
 				if (grant) {
 					if (!(await inspectionIsFresh(inspection))) continue;
-					if (signal.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
-					recordReviewed({ command: preview(command), reasons, status: "approved", source: "intent-grant",
-						rationale: `Covered by your session intent: ${grant.label}`, scope: "intent", grantId: grant.id, timestamp: now() });
+					if (signal.aborted)
+						return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
+					recordReviewed({
+						command: preview(command),
+						reasons,
+						status: "approved",
+						source: "intent-grant",
+						rationale: `Covered by your session intent: ${grant.label}`,
+						scope: "intent",
+						grantId: grant.id,
+						timestamp: now(),
+					});
 					registerApproval();
 					return undefined;
 				}
@@ -3060,31 +3426,60 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			let failed = false;
 			if (!locked) {
 				await refreshAutoModePreferences(ctx);
-				if (signal.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
-				const result = await classifyWithModel(command, reasons, reviewContext, dependencies,
-					classifierModel, classifierThinkingLevel, autoModePreferences, classifierHistoryMessages, policy.critical);
+				if (signal.aborted)
+					return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
+				const result = await classifyWithModel(
+					command,
+					reasons,
+					reviewContext,
+					dependencies,
+					classifierModel,
+					classifierThinkingLevel,
+					autoModePreferences,
+					classifierHistoryMessages,
+					policy.critical,
+				);
 				failed = Boolean(result.failed);
 				model = result.model;
 				rationale = result.rationale;
 				recommendation = failed ? "review" : result.decision === "allow" ? "approve" : "deny";
-				risk = policy.critical ? "critical" : result.risk ?? "medium";
+				risk = policy.critical ? "critical" : (result.risk ?? "medium");
 				if (ctx.signal?.aborted) {
-					recordReviewed({ command: preview(command), reasons, status: "blocked", source: "auto-model",
-						rationale: "The request was cancelled before the command ran.", model, recommendation, timestamp: now() });
+					recordReviewed({
+						command: preview(command),
+						reasons,
+						status: "blocked",
+						source: "auto-model",
+						rationale: "The request was cancelled before the command ran.",
+						model,
+						recommendation,
+						timestamp: now(),
+					});
 					return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 				}
 				if (!(await inspectionIsFresh(inspection))) continue;
-				if (signal.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
+				if (signal.aborted)
+					return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 				if (!failed && result.decision === "allow" && risk !== "critical") {
-					recordReviewed({ command: preview(command), reasons, status: "approved", source: "auto-model",
-						rationale, model, risk, recommendation, timestamp: now() });
+					recordReviewed({
+						command: preview(command),
+						reasons,
+						status: "approved",
+						source: "auto-model",
+						rationale,
+						model,
+						risk,
+						recommendation,
+						timestamp: now(),
+					});
 					registerApproval();
 					return undefined;
 				}
 			}
-			const proposal = !locked && !policy.critical && risk !== "critical" && !reasons.includes(CLASSIFIER_REQUIRED_REASON)
-				? proposeIntent({ command, cwd: ctx.cwd, grantableReasons: policy.grantableReasons, paths: inspection.paths })
-				: undefined;
+			const proposal =
+				!locked && !policy.critical && risk !== "critical" && !reasons.includes(CLASSIFIER_REQUIRED_REASON)
+					? proposeIntent({ command, cwd: ctx.cwd, grantableReasons: policy.grantableReasons, paths: inspection.paths })
+					: undefined;
 			const generation = sessionGeneration;
 			let lateDelivered = false;
 			const onLateOutcome = (outcome: ApprovalOutcome, shownAt: number) => {
@@ -3092,20 +3487,42 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				lateDelivered = true;
 				let content: string;
 				if (outcome.status === "approved") {
-					lateApprovals.push({ command, snapshot, recommendation, shownAt, answeredAt: now(), scope: "once", historyId: outcome.historyId });
+					lateApprovals.push({
+						command,
+						snapshot,
+						recommendation,
+						shownAt,
+						answeredAt: now(),
+						scope: "once",
+						historyId: outcome.historyId,
+					});
 					content = `The user approved this command after the wait: ${command}\nYou may run the exact command again. This is a single-use approval for the same inspection snapshot; changed code needs a new assessment.`;
 				} else if (outcome.status === "redirected" && outcome.note?.trim()) {
 					content = `The user redirected you: ${outcome.note.trim()}. Follow this instruction instead of running the command.`;
 				} else if (outcome.status === "denied") {
 					content = `The user denied the command: ${command}. ${NO_RETRY_NOTICE}`;
 				} else return;
-				pi.sendMessage({ customType: "permission-gate-late-answer", content, display: true },
-					{ triggerTurn: true, deliverAs: "followUp" });
+				pi.sendMessage(
+					{ customType: "permission-gate-late-answer", content, display: true },
+					{ triggerTurn: true, deliverAs: "followUp" },
+				);
 			};
-			const human = await askHuman(ctx, { ...display, kind: locked ? "lockdown" : "command",
-				command, risk, tldr: failed ? `${rationale} Please review the command yourself.` : rationale,
-				recommendation, reasons: reasons.length ? reasons : ["lockdown"], model,
-				intentProposal: proposal, environment: policy.environment }, onLateOutcome);
+			const human = await askHuman(
+				ctx,
+				{
+					...display,
+					kind: locked ? "lockdown" : "command",
+					command,
+					risk,
+					tldr: failed ? `${rationale} Please review the command yourself.` : rationale,
+					recommendation,
+					reasons: reasons.length ? reasons : ["lockdown"],
+					model,
+					intentProposal: proposal,
+					environment: policy.environment,
+				},
+				onLateOutcome,
+			);
 			if (ctx.signal?.aborted || human.cancelled || generation !== sessionGeneration)
 				return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 			if (human.approved && !(await inspectionIsFresh(inspection))) continue;
@@ -3123,40 +3540,92 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				}
 			}
 			const status = human.status ?? (human.approved ? "approved" : "blocked");
-			recordReviewed({
-				command: preview(command), reasons: reasons.length ? reasons : ["lockdown"], status, source: "human",
-				rationale: [rationale, human.unavailable ? "No approver was reachable, so the command was blocked."
-					: status === "expired" ? human.note : status === "redirected" ? `You redirected the agent: ${human.note}`
-					: `You ${human.approved ? "approved" : "denied"} the command ${human.via === "browser" ? "in the browser" : "in the terminal"}.`,
-					human.fallbackNote].filter(Boolean).join(" "),
-				model, risk, via: human.via, timestamp: now(), recommendation, shownAt: human.shownAt,
-				answeredAt: human.answeredAt, scope: human.scope ?? "once", grantId, note: human.note,
-			}, human.historyId);
+			recordReviewed(
+				{
+					command: preview(command),
+					reasons: reasons.length ? reasons : ["lockdown"],
+					status,
+					source: "human",
+					rationale: [
+						rationale,
+						human.unavailable
+							? "No approver was reachable, so the command was blocked."
+							: status === "expired"
+								? human.note
+								: status === "redirected"
+									? `You redirected the agent: ${human.note}`
+									: `You ${human.approved ? "approved" : "denied"} the command ${human.via === "browser" ? "in the browser" : "in the terminal"}.`,
+						human.fallbackNote,
+					]
+						.filter(Boolean)
+						.join(" "),
+					model,
+					risk,
+					via: human.via,
+					timestamp: now(),
+					recommendation,
+					shownAt: human.shownAt,
+					answeredAt: human.answeredAt,
+					scope: human.scope ?? "once",
+					grantId,
+					note: human.note,
+				},
+				human.historyId,
+			);
 			if (human.approved) {
-				if (human.liftLockdown) { lockdown = false; totalDenials = 0; }
+				if (human.liftLockdown) {
+					lockdown = false;
+					totalDenials = 0;
+				}
 				registerApproval();
 				return undefined;
 			}
-			if (status === "redirected") return { block: true, reason: `The user redirected you: ${human.note}. Follow this instruction instead of running the command.` };
-			if (status === "expired") return { block: true, reason: human.note ?? "The user is away; continue with other work or end the turn and ask in plain text." };
+			if (status === "redirected")
+				return {
+					block: true,
+					reason: `The user redirected you: ${human.note}. Follow this instruction instead of running the command.`,
+				};
+			if (status === "expired")
+				return {
+					block: true,
+					reason: human.note ?? "The user is away; continue with other work or end the turn and ask in plain text.",
+				};
 			const started = locked ? false : registerDenial(ctx);
-			return { block: true, reason: denialMessage(human.unavailable
-				? `no approver was reachable (${reasons.join(", ")})`
-				: locked ? "lockdown is active" : `the user did not approve this action (${reasons.join(", ")})`, human.note, started) };
+			return {
+				block: true,
+				reason: denialMessage(
+					human.unavailable
+						? `no approver was reachable (${reasons.join(", ")})`
+						: locked
+							? "lockdown is active"
+							: `the user did not approve this action (${reasons.join(", ")})`,
+					human.note,
+					started,
+				),
+			};
 		}
 		if (signal.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 		const rationale = "Inspected files kept changing during review; the command was not run.";
-		record(ctx, { command: preview(command), reasons, status: "blocked", source: "auto-model", rationale, timestamp: now() });
+		record(ctx, {
+			command: preview(command),
+			reasons,
+			status: "blocked",
+			source: "auto-model",
+			rationale,
+			timestamp: now(),
+		});
 		const started = registerDenial(ctx);
-		return { block: true, reason: `${rationale} ${NO_RETRY_NOTICE}${started ? " Every command now needs the user's approval." : ""}` };
+		return {
+			block: true,
+			reason: `${rationale} ${NO_RETRY_NOTICE}${started ? " Every command now needs the user's approval." : ""}`,
+		};
 	};
 
 	pi.on("tool_call", async (event, outerContext) => {
 		if (!autoModeEnabled || event.toolName !== "bash") return undefined;
 		const controller = new AbortController();
 		activeReviews.add(controller);
-		const signal = outerContext.signal
-			? AbortSignal.any([outerContext.signal, controller.signal]) : controller.signal;
+		const signal = outerContext.signal ? AbortSignal.any([outerContext.signal, controller.signal]) : controller.signal;
 		const ctx: ExtensionContext & { signal: AbortSignal } = { ...outerContext, signal };
 		const disabled = () => controller.signal.reason === disabledReason;
 
@@ -3167,8 +3636,11 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		});
 		try {
 			const result = await Promise.race([reviewBash(event, ctx, () => controller.signal.aborted), cancelled]);
-			return disabled() ? undefined : signal.aborted
-				? { block: true, reason: "Blocked by the permission gate: the request was cancelled." } : result;
+			return disabled()
+				? undefined
+				: signal.aborted
+					? { block: true, reason: "Blocked by the permission gate: the request was cancelled." }
+					: result;
 		} finally {
 			controller.signal.removeEventListener("abort", onDisabled);
 			activeReviews.delete(controller);

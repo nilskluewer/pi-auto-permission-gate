@@ -1,12 +1,12 @@
-import { getSettingsListTheme, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
+import { type ExtensionContext, getSettingsListTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import {
+	type Component,
 	Container,
+	type SelectItem,
 	SelectList,
+	type SettingItem,
 	SettingsList,
 	Text,
-	type Component,
-	type SelectItem,
-	type SettingItem,
 } from "@earendil-works/pi-tui";
 
 export type PermissionSettingsAction =
@@ -127,7 +127,13 @@ function createSettingsComponent(
 			description: `View and edit user-defined allow and deny patterns (${state.ruleScope} scope).`,
 			currentValue: `${state.allowedCommands.length} allowed / ${state.disallowedCommands.length} denied`,
 			submenu: (_currentValue, submenuDone) =>
-				createRulesComponent(tui, theme, state, (value) => submenuDone(value), () => submenuDone()),
+				createRulesComponent(
+					tui,
+					theme,
+					state,
+					(value) => submenuDone(value),
+					() => submenuDone(),
+				),
 		},
 		{
 			id: "preferences",
@@ -135,12 +141,42 @@ function createSettingsComponent(
 			description: "Add user-authored policy notes that refine soft-deny decisions without overriding hard denies.",
 			currentValue: formatPreferenceCount(state.preferences),
 			submenu: (_currentValue, submenuDone) =>
-				createPreferencesComponent(tui, theme, state, (value) => submenuDone(value), () => submenuDone()),
+				createPreferencesComponent(
+					tui,
+					theme,
+					state,
+					(value) => submenuDone(value),
+					() => submenuDone(),
+				),
 		},
-		{ id: "production-patterns", label: "Production patterns", description: "Project, bucket, and context patterns. Unknown targets stay critical.", currentValue: (state.productionPatterns ?? []).join(", "), values: ["edit"] },
-		{ id: "approval-wait", label: "Approval wait", description: "Stop waiting and leave the browser request open for a late answer.", currentValue: String(state.approvalWaitSeconds ?? 300), values: ["60", "120", "300", "600", "900", "1800"] },
-		{ id: "intent-grants", label: "Session intent grants", description: "List or revoke human-approved grants for this session.", currentValue: `${state.activeGrantCount ?? 0} active`, values: ["open"] },
-		{ id: "statistics", label: "Approval statistics", description: "Show prompt rates and grant savings over the last 14 days.", currentValue: "open", values: ["open"] },
+		{
+			id: "production-patterns",
+			label: "Production patterns",
+			description: "Project, bucket, and context patterns. Unknown targets stay critical.",
+			currentValue: (state.productionPatterns ?? []).join(", "),
+			values: ["edit"],
+		},
+		{
+			id: "approval-wait",
+			label: "Approval wait",
+			description: "Stop waiting and leave the browser request open for a late answer.",
+			currentValue: String(state.approvalWaitSeconds ?? 300),
+			values: ["60", "120", "300", "600", "900", "1800"],
+		},
+		{
+			id: "intent-grants",
+			label: "Session intent grants",
+			description: "List or revoke human-approved grants for this session.",
+			currentValue: `${state.activeGrantCount ?? 0} active`,
+			values: ["open"],
+		},
+		{
+			id: "statistics",
+			label: "Approval statistics",
+			description: "Show prompt rates and grant savings over the last 14 days.",
+			currentValue: "open",
+			values: ["open"],
+		},
 		{
 			id: "prompt",
 			label: "View classifier prompt",
@@ -154,10 +190,7 @@ function createSettingsComponent(
 	container.addChild(new Text(theme.fg("accent", theme.bold("Permission Gate Settings")), 1, 0));
 	container.addChild(
 		new Text(
-			theme.fg(
-				"muted",
-				"Configure the safety gate from one place. Select a row to change it or open its subpage.",
-			),
+			theme.fg("muted", "Configure the safety gate from one place. Select a row to change it or open its subpage."),
 			1,
 			0,
 		),

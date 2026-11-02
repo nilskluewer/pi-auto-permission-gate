@@ -1,58 +1,69 @@
 {
-  "name": "@nilskluewer/pi-auto-permission-gate",
-  "version": "0.10.0",
-  "description": "Confirm or block dangerous bash commands before the Pi coding agent executes them.",
-  "type": "module",
-  "keywords": [
-    "pi-package",
-    "pi",
-    "pi-coding-agent",
-    "pi-extension",
-    "permission",
-    "safety",
-    "guardrail",
-    "bash",
-    "security",
-    "auto-mode",
-    "command-approval"
-  ],
-  "author": {
-    "name": "Nils Klüwer",
-    "url": "https://github.com/nilskluewer"
-  },
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/nilskluewer/pi-auto-permission-gate.git"
-  },
-  "bugs": {
-    "url": "https://github.com/nilskluewer/pi-auto-permission-gate/issues"
-  },
-  "homepage": "https://github.com/nilskluewer/pi-auto-permission-gate#readme",
-  "files": [
-    "extensions",
-    "permission-gate-settings.ts",
-    "README.md",
-    "GLOSSARY.md",
-    "LICENSE"
-  ],
-  "pi": {
-    "extensions": [
-      "./extensions/permission-gate.ts"
-    ]
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.83.0",
-    "@earendil-works/pi-tui": ">=0.83.0"
-  },
-  "scripts": {
-    "pack:dry": "npm pack --dry-run",
-    "test": "node --experimental-strip-types --test tests/*.test.mjs",
-    "smoke": "node scripts/smoke.mjs",
-    "prepublishOnly": "npm run smoke"
-  },
-  "publishConfig": {
-    "access": "public",
-    "registry": "https://registry.npmjs.org/"
-  }
+	"name": "@nilskluewer/pi-auto-permission-gate",
+	"version": "0.10.0",
+	"description": "Confirm or block dangerous bash commands before the Pi coding agent executes them.",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"pi-coding-agent",
+		"pi-extension",
+		"permission",
+		"safety",
+		"guardrail",
+		"bash",
+		"security",
+		"auto-mode",
+		"command-approval"
+	],
+	"author": {
+		"name": "Nils Klüwer",
+		"url": "https://github.com/nilskluewer"
+	},
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/nilskluewer/pi-auto-permission-gate.git"
+	},
+	"bugs": {
+		"url": "https://github.com/nilskluewer/pi-auto-permission-gate/issues"
+	},
+	"homepage": "https://github.com/nilskluewer/pi-auto-permission-gate#readme",
+	"files": [
+		"src",
+		"README.md",
+		"GLOSSARY.md",
+		"LICENSE"
+	],
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": ">=0.83.0",
+		"@earendil-works/pi-tui": ">=0.83.0"
+	},
+	"scripts": {
+		"test": "node --test \"tests/**/*.test.mjs\"",
+		"typecheck": "tsc -p .",
+		"lint": "biome check .",
+		"lint:fix": "biome check --write .",
+		"check": "npm run typecheck && npm run lint && npm test",
+		"smoke": "node scripts/smoke.mjs",
+		"pack:dry": "npm pack --dry-run",
+		"prepublishOnly": "npm run check && npm run smoke"
+	},
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.6.4",
+		"@types/node": "^24.19.2",
+		"typescript": "^7.0.2"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
 }

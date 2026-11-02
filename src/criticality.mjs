@@ -2,7 +2,21 @@ import { basename } from "node:path";
 import { shellWords } from "./command-inspection.mjs";
 
 export const DEFAULT_PRODUCTION_PATTERNS = ["prod", "prd", "production"];
-export const NON_PRODUCTION_MARKERS = ["dev", "development", "test", "testing", "sandbox", "sbx", "stage", "staging", "stg", "int", "qa", "local", "demo"];
+export const NON_PRODUCTION_MARKERS = [
+	"dev",
+	"development",
+	"test",
+	"testing",
+	"sandbox",
+	"sbx",
+	"stage",
+	"staging",
+	"stg",
+	"int",
+	"qa",
+	"local",
+	"demo",
+];
 export const ALWAYS_CRITICAL_REASONS = ["sudo", "disk shred/wipe", "partition editor"];
 
 const ENVIRONMENT_FLAG = /^--(?:project|project-id|context|namespace|profile|subscription|resource-group)(?:=(.*))?$/;
@@ -26,10 +40,15 @@ export function environmentIdentifiers(command) {
 		if (word.startsWith("-") || word.includes("=") || /\s/.test(word)) continue;
 		// These names can also occur without an environment flag.
 		if (/^[a-z\d][a-z\d_.:/@-]*$/.test(word)) {
-			if (NON_PRODUCTION_MARKERS.includes(word) || DEFAULT_PRODUCTION_PATTERNS.includes(word) || /[-_.:/@]/.test(word)) identifiers.add(word);
+			if (NON_PRODUCTION_MARKERS.includes(word) || DEFAULT_PRODUCTION_PATTERNS.includes(word) || /[-_.:/@]/.test(word))
+				identifiers.add(word);
 			if (words.includes("bq") && /[.:]/.test(word)) identifiers.add(word.split(/[.:]/)[0]);
 		}
-		if ((words[i - 1] === "use-context" || (words[i - 2] === "workspace" && /^(?:select|new|delete)$/.test(words[i - 1]))) && word)
+		if (
+			(words[i - 1] === "use-context" ||
+				(words[i - 2] === "workspace" && /^(?:select|new|delete)$/.test(words[i - 1]))) &&
+			word
+		)
 			identifiers.add(word);
 	}
 	return [...identifiers];
@@ -53,20 +72,50 @@ export function classifyEnvironment(command, productionPatterns = DEFAULT_PRODUC
 	return "unknown";
 }
 
-const GLOBAL_VALUE_FLAGS = new Set(["--project", "--project-id", "--context", "--namespace", "--profile", "--subscription", "--resource-group", "--region", "--zone", "--account", "--configuration", "--output", "--query", "--format", "--endpoint-url", "--verbosity"]);
+const GLOBAL_VALUE_FLAGS = new Set([
+	"--project",
+	"--project-id",
+	"--context",
+	"--namespace",
+	"--profile",
+	"--subscription",
+	"--resource-group",
+	"--region",
+	"--zone",
+	"--account",
+	"--configuration",
+	"--output",
+	"--query",
+	"--format",
+	"--endpoint-url",
+	"--verbosity",
+]);
 
 export function isAccessChange(command) {
 	const raw = shellWords(command.toLowerCase());
-	if (raw.some((word) => /^(?:set-iam-policy|add-iam-policy-binding|remove-iam-policy-binding)$/.test(word))) return true;
+	if (raw.some((word) => /^(?:set-iam-policy|add-iam-policy-binding|remove-iam-policy-binding)$/.test(word)))
+		return true;
 	if (raw.some((word) => /^--impersonate-service-account(?:=|$)/.test(word))) return true;
 	const words = [];
 	for (let i = 0; i < raw.length; i++) {
-		if (GLOBAL_VALUE_FLAGS.has(raw[i])) { i++; continue; }
-		if (raw[i].startsWith("--") && (raw[i].includes("=") || /^(?:--quiet|--debug|--no-cli-pager|--no-paginate)$/.test(raw[i]))) continue;
+		if (GLOBAL_VALUE_FLAGS.has(raw[i])) {
+			i++;
+			continue;
+		}
+		if (
+			raw[i].startsWith("--") &&
+			(raw[i].includes("=") || /^(?:--quiet|--debug|--no-cli-pager|--no-paginate)$/.test(raw[i]))
+		)
+			continue;
 		words.push(raw[i]);
 	}
 	const text = words.join(" ");
-	if (/\biam service-accounts (?:create|keys create)\b|\biam roles (?!list\b|describe\b)\S+|\bauth (?:application-default )?print-(?:access|identity)-token\b/.test(text)) return true;
+	if (
+		/\biam service-accounts (?:create|keys create)\b|\biam roles (?!list\b|describe\b)\S+|\bauth (?:application-default )?print-(?:access|identity)-token\b/.test(
+			text,
+		)
+	)
+		return true;
 	if (/\baz role assignment (?:create|delete)\b/.test(text)) return true;
 	for (let i = 0; i < words.length; i++) {
 		if (basename(words[i]) === "aws") {
@@ -80,13 +129,24 @@ export function isAccessChange(command) {
 }
 
 export function assessCriticality(command, reasons, options = {}) {
-	const environment = reasons.includes("cloud or infrastructure change") ? classifyEnvironment(command, options.productionPatterns) : undefined;
+	const environment = reasons.includes("cloud or infrastructure change")
+		? classifyEnvironment(command, options.productionPatterns)
+		: undefined;
 	const accessChange = isAccessChange(command);
-	const criticalReasons = [], grantableReasons = [];
+	const criticalReasons = [],
+		grantableReasons = [];
 	for (const reason of reasons) {
-		const critical = ALWAYS_CRITICAL_REASONS.includes(reason) || reason === "Pi or gate configuration write" ||
+		const critical =
+			ALWAYS_CRITICAL_REASONS.includes(reason) ||
+			reason === "Pi or gate configuration write" ||
 			(reason === "cloud or infrastructure change" && (accessChange || environment !== "non-production"));
 		(critical ? criticalReasons : grantableReasons).push(reason);
 	}
-	return { critical: criticalReasons.length > 0, criticalReasons, grantableReasons, ...(environment === undefined ? {} : { environment }), accessChange };
+	return {
+		critical: criticalReasons.length > 0,
+		criticalReasons,
+		grantableReasons,
+		...(environment === undefined ? {} : { environment }),
+		accessChange,
+	};
 }

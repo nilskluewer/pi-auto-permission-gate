@@ -13,34 +13,34 @@ It does not intercept Pi's direct `!` or `!!` shell commands, and it does not in
 
 When the permission gate is enabled, each `bash` tool call follows this order:
 
-| Order | Match | Result |
-| --- | --- | --- |
-| 1 | Hard-deny rule | Block immediately, without the model or a prompt |
-| 2 | User `disallowedCommands` pattern | Block immediately |
-| 3 | User `allowedCommands` pattern, or no matched rule | Run, except mandatory checks such as recursive `rm`, IAM, and configuration writes |
-| 4 | Lockdown | Ask the user for every command |
-| 5 | Exact single-use late approval, or a matching non-critical session intent | Run after a fresh inspection |
-| 6 | Built-in soft rule | Ask the classifier; a clear non-critical allow runs |
-| 7 | Critical, uncertain, or denied by classifier | Ask the user in a UI, or block when no approver exists |
+| Order | Match                                                                     | Result                                                                             |
+| ----- | ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| 1     | Hard-deny rule                                                            | Block immediately, without the model or a prompt                                   |
+| 2     | User `disallowedCommands` pattern                                         | Block immediately                                                                  |
+| 3     | User `allowedCommands` pattern, or no matched rule                        | Run, except mandatory checks such as recursive `rm`, IAM, and configuration writes |
+| 4     | Lockdown                                                                  | Ask the user for every command                                                     |
+| 5     | Exact single-use late approval, or a matching non-critical session intent | Run after a fresh inspection                                                       |
+| 6     | Built-in soft rule                                                        | Ask the classifier; a clear non-critical allow runs                                |
+| 7     | Critical, uncertain, or denied by classifier                              | Ask the user in a UI, or block when no approver exists                             |
 
 ### Command coverage
 
-| Command group | Examples | Default treatment |
-| --- | --- | --- |
-| Local checks | `uv run pytest`, `rtk uv run ruff check .`, `uv run mypy` | Allowed |
-| Package installation, update, removal | `npm install`, `uv pip install`, `cargo add` | Allowed |
-| Scoped local deletion | `find build -type f -delete` | Allowed when explicit relative targets stay below the current working directory |
-| Recursive rm | `rm -rf build`, `rm -rf /tmp/x`, `rm -rf "$tmp"` after `tmp=$(mktemp -d)` | Always checked by the classifier, with human fallback when critical, uncertain, or denied. Allow patterns cannot skip this check |
-| Other deletion | `.git` deletion, parent paths, roots, broad `find . -delete`, `xargs rm` | Checked or hard-blocked |
-| Package execution and publishing | `npm run`, `npm exec`, `npx`, `uvx`, `uv run python`, `npm publish` | Checked |
-| Privilege and permissions | `sudo`, `chmod 777`, recursive `chmod` or `chown` | Checked |
-| Filesystems and disks | `mkfs`, `wipefs`, `shred`, `diskutil`, `dd ... of=/dev/...` | Checked, with catastrophic cases hard-blocked |
-| Destructive Git operations | `reset --hard`, `clean -f`, force push, `branch -D`, `tag -d`, `git rm`, aggressive prune | Checked, with protected force pushes hard-blocked |
-| Docker state removal | `docker system prune`, volume removal, `compose down -v` | Checked |
-| Downloaded scripts | `curl ... \| sh`, `wget ... \| bash` | Checked |
-| Interpreter and script execution | `python script.py`, `node -e '...'`, `bash cleanup.sh`, `./cleanup` | Classifier assessment with human fallback unless an explicit user allow rule applies |
-| Unsupported shell syntax | Command substitutions, heredocs, complex redirects, malformed quoting | Classifier assessment, not mandatory human approval merely because local parsing is incomplete |
-| Other bash commands | `git status`, `printf`, ordinary project commands | Allowed unless a user rule matches |
+| Command group                         | Examples                                                                                  | Default treatment                                                                                                                |
+| ------------------------------------- | ----------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Local checks                          | `uv run pytest`, `rtk uv run ruff check .`, `uv run mypy`                                 | Allowed                                                                                                                          |
+| Package installation, update, removal | `npm install`, `uv pip install`, `cargo add`                                              | Allowed                                                                                                                          |
+| Scoped local deletion                 | `find build -type f -delete`                                                              | Allowed when explicit relative targets stay below the current working directory                                                  |
+| Recursive rm                          | `rm -rf build`, `rm -rf /tmp/x`, `rm -rf "$tmp"` after `tmp=$(mktemp -d)`                 | Always checked by the classifier, with human fallback when critical, uncertain, or denied. Allow patterns cannot skip this check |
+| Other deletion                        | `.git` deletion, parent paths, roots, broad `find . -delete`, `xargs rm`                  | Checked or hard-blocked                                                                                                          |
+| Package execution and publishing      | `npm run`, `npm exec`, `npx`, `uvx`, `uv run python`, `npm publish`                       | Checked                                                                                                                          |
+| Privilege and permissions             | `sudo`, `chmod 777`, recursive `chmod` or `chown`                                         | Checked                                                                                                                          |
+| Filesystems and disks                 | `mkfs`, `wipefs`, `shred`, `diskutil`, `dd ... of=/dev/...`                               | Checked, with catastrophic cases hard-blocked                                                                                    |
+| Destructive Git operations            | `reset --hard`, `clean -f`, force push, `branch -D`, `tag -d`, `git rm`, aggressive prune | Checked, with protected force pushes hard-blocked                                                                                |
+| Docker state removal                  | `docker system prune`, volume removal, `compose down -v`                                  | Checked                                                                                                                          |
+| Downloaded scripts                    | `curl ... \| sh`, `wget ... \| bash`                                                      | Checked                                                                                                                          |
+| Interpreter and script execution      | `python script.py`, `node -e '...'`, `bash cleanup.sh`, `./cleanup`                       | Classifier assessment with human fallback unless an explicit user allow rule applies                                             |
+| Unsupported shell syntax              | Command substitutions, heredocs, complex redirects, malformed quoting                     | Classifier assessment, not mandatory human approval merely because local parsing is incomplete                                   |
+| Other bash commands                   | `git status`, `printf`, ordinary project commands                                         | Allowed unless a user rule matches                                                                                               |
 
 Open `/automode-settings` without arguments for the interactive Permission Gate Settings page.
 It provides one entry point for the permission gate switch, classifier settings and preferences, command rules, production patterns, the approval wait, active intent grants, and approval statistics.
@@ -102,13 +102,8 @@ The editor starts with the built-in local verification allowlist, and saving rep
 
 ```json
 {
-  "allowedCommands": [
-    "make clean",
-    "uv run python -m mypy*"
-  ],
-  "disallowedCommands": [
-    "npm publish*"
-  ]
+	"allowedCommands": ["make clean", "uv run python -m mypy*"],
+	"disallowedCommands": ["npm publish*"]
 }
 ```
 
@@ -339,7 +334,7 @@ pi install /path/to/pi-auto-permission-gate
 
 ## Development
 
-The extension source is in `extensions/permission-gate.ts`.
+The extension entry point is `src/index.ts`.
 
 Run the unit tests with:
 

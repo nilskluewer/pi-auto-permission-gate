@@ -1,13 +1,13 @@
-import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import http from "node:http";
+import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-const SERVER = fileURLToPath(new URL("../extensions/approval-server.mjs", import.meta.url));
+const SERVER = fileURLToPath(new URL("../src/approval-server/server.mjs", import.meta.url));
 const APPROVER = "test-approver-token";
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "approval-server-test-"));
 const children = new Set();
@@ -70,7 +70,11 @@ async function startServer(env, existingDir) {
 			if (token) headers.authorization = `Bearer ${token}`;
 			if (approver) headers["x-approver-token"] = approver;
 			if (body !== undefined || raw !== undefined) headers["content-type"] = "application/json";
-			const res = await fetch(base + p, { method, headers, body: raw ?? (body === undefined ? undefined : JSON.stringify(body)) });
+			const res = await fetch(base + p, {
+				method,
+				headers,
+				body: raw ?? (body === undefined ? undefined : JSON.stringify(body)),
+			});
 			const text = await res.text();
 			let json;
 			try {
@@ -158,7 +162,12 @@ function rawStatus(port, host, extra = {}) {
 }
 
 // Contract oracle: reject silent redirects, lost intent edits, resolved parking, and expiry-as-denial.
-const intentProposal = { label: "read via cat in /tmp/demo/", access: "read", reasons: ["rule:ls"], targets: ["exec:cat", "path:/tmp/demo/"] };
+const intentProposal = {
+	label: "read via cat in /tmp/demo/",
+	access: "read",
+	reasons: ["rule:ls"],
+	targets: ["exec:cat", "path:/tmp/demo/"],
+};
 
 test("redirect requires a trimmed note and delivers steering plus history", async () => {
 	const s = await startServer();
@@ -179,7 +188,9 @@ test("redirect requires a trimmed note and delivers steering plus history", asyn
 		assert.equal(history.scope, "once");
 		assert.equal(history.recommendation, "approve");
 		assert.ok(history.answeredAt >= history.shownAt);
-	} finally { await s.stop(); }
+	} finally {
+		await s.stop();
+	}
 });
 
 test("intent is command-only and non-critical, validates shape and clips display bounds", async () => {
@@ -188,10 +199,23 @@ test("intent is command-only and non-critical, validates shape and clips display
 		for (const over of [{ risk: "critical" }, { kind: "lockdown" }]) {
 			assert.equal((await s.create({ ...over, intentProposal })).status, 400);
 		}
-		for (const bad of [null, [], {}, { ...intentProposal, access: "execute" }, { ...intentProposal, label: 1 }, { ...intentProposal, reasons: [1] }, { ...intentProposal, targets: [null] }]) {
+		for (const bad of [
+			null,
+			[],
+			{},
+			{ ...intentProposal, access: "execute" },
+			{ ...intentProposal, label: 1 },
+			{ ...intentProposal, reasons: [1] },
+			{ ...intentProposal, targets: [null] },
+		]) {
 			assert.equal((await s.create({ intentProposal: bad })).status, 400, JSON.stringify(bad));
 		}
-		const long = { ...intentProposal, label: "l".repeat(200), targets: ["p".repeat(4100), ...Array(33).fill("path:/tmp/")], reasons: Array(22).fill("reason") };
+		const long = {
+			...intentProposal,
+			label: "l".repeat(200),
+			targets: ["p".repeat(4100), ...Array(33).fill("path:/tmp/")],
+			reasons: Array(22).fill("reason"),
+		};
 		const created = await s.create({ intentProposal: long });
 		assert.equal(created.status, 200);
 		const events = await openSse(s.base, APPROVER);
@@ -202,8 +226,12 @@ test("intent is command-only and non-critical, validates shape and clips display
 			assert.equal(request.intentProposal.targets.length, 32);
 			assert.equal(request.intentProposal.targets[0].length, 4096);
 			assert.equal(request.intentProposal.reasons.length, 20);
-		} finally { events.close(); }
-	} finally { await s.stop(); }
+		} finally {
+			events.close();
+		}
+	} finally {
+		await s.stop();
+	}
 });
 
 test("intent decisions preserve default and edited payloads without semantic narrowing", async () => {
@@ -211,15 +239,28 @@ test("intent decisions preserve default and edited payloads without semantic nar
 	try {
 		const plain = (await s.create()).json.id;
 		assert.equal((await s.decide(plain, { decision: "approve", scope: "intent" })).status, 400);
-		for (const edited of [undefined, { ...intentProposal, label: "Custom intent", access: "write", targets: ["path:/tmp/elsewhere/"] }]) {
+		for (const edited of [
+			undefined,
+			{ ...intentProposal, label: "Custom intent", access: "write", targets: ["path:/tmp/elsewhere/"] },
+		]) {
 			const { id } = (await s.create({ intentProposal })).json;
-			assert.equal((await s.decide(id, { decision: "approve", scope: "intent", intent: { ...intentProposal, targets: [4] } })).status, 400);
+			assert.equal(
+				(await s.decide(id, { decision: "approve", scope: "intent", intent: { ...intentProposal, targets: [4] } }))
+					.status,
+				400,
+			);
 			assert.equal((await s.decide(id, { decision: "approve", scope: "session" })).status, 400);
 			assert.equal((await s.decide(id, { decision: "approve", scope: "intent", intent: edited })).status, 200);
-			assert.deepEqual((await s.call("GET", `/api/requests/${id}/wait`)).json, { status: "approved", scope: "intent", intent: edited ?? intentProposal });
+			assert.deepEqual((await s.call("GET", `/api/requests/${id}/wait`)).json, {
+				status: "approved",
+				scope: "intent",
+				intent: edited ?? intentProposal,
+			});
 			assert.equal((await s.getHistory()).json.history[0].scope, "intent");
 		}
-	} finally { await s.stop(); }
+	} finally {
+		await s.stop();
+	}
 });
 
 test("parking is session-authenticated, stays pending, broadcasts and delivers late approval", async () => {
@@ -239,13 +280,20 @@ test("parking is session-authenticated, stays pending, broadcasts and delivers l
 		assert.deepEqual(await events.next("parked"), { id });
 		assert.deepEqual((await s.call("GET", `/api/requests/${id}/wait?timeoutMs=0`)).json, { status: "pending" });
 		const snapshot = await openSse(s.base, APPROVER);
-		try { assert.equal((await snapshot.next("snapshot")).pending[0].parked, true); } finally { snapshot.close(); }
+		try {
+			assert.equal((await snapshot.next("snapshot")).pending[0].parked, true);
+		} finally {
+			snapshot.close();
+		}
 		const waiting = s.call("GET", `/api/requests/${id}/wait?timeoutMs=5000`);
 		await s.decide(id, { decision: "approve" });
 		assert.deepEqual((await waiting).json, { status: "approved", scope: "once" });
 		assert.equal((await s.call("POST", park)).status, 409);
 		assert.equal((await s.getHistory()).json.history.length, 1);
-	} finally { events?.close(); await s.stop(); }
+	} finally {
+		events?.close();
+		await s.stop();
+	}
 });
 
 test("parked requests still expire and history distinguishes no answer", async () => {
@@ -259,17 +307,43 @@ test("parked requests still expire and history distinguishes no answer", async (
 		assert.equal(history.note, "Timed out without an answer.");
 		assert.equal(history.answeredAt, undefined);
 		assert.equal(typeof history.shownAt, "number");
-	} finally { await s.stop(); }
+	} finally {
+		await s.stop();
+	}
 });
 
 test("history keeps fatigue metadata and drops unknown optional values across restart", async () => {
 	const s = await startServer();
 	try {
-		const metadata = { status: "redirected", source: "grant", recommendation: "review", scope: "intent", grantId: "g".repeat(110), note: "n".repeat(510), shownAt: 123, answeredAt: 456 };
+		const metadata = {
+			status: "redirected",
+			source: "grant",
+			recommendation: "review",
+			scope: "intent",
+			grantId: "g".repeat(110),
+			note: "n".repeat(510),
+			shownAt: 123,
+			answeredAt: 456,
+		};
 		assert.equal((await s.postHistory(metadata)).status, 200);
-		assert.equal((await s.postHistory({ status: "cancelled", source: "robot", note: 5, recommendation: "bogus", scope: "forever", grantId: 7, shownAt: "123", answeredAt: null })).status, 200);
+		assert.equal(
+			(
+				await s.postHistory({
+					status: "cancelled",
+					source: "robot",
+					note: 5,
+					recommendation: "bogus",
+					scope: "forever",
+					grantId: 7,
+					shownAt: "123",
+					answeredAt: null,
+				})
+			).status,
+			200,
+		);
 		const entries = (await s.getHistory()).json.history;
-		for (const key of ["status", "source", "note", "recommendation", "scope", "grantId", "shownAt", "answeredAt"]) assert.equal(entries[0][key], undefined, key);
+		for (const key of ["status", "source", "note", "recommendation", "scope", "grantId", "shownAt", "answeredAt"])
+			assert.equal(entries[0][key], undefined, key);
 		assert.equal(entries[1].grantId.length, 100);
 		assert.equal(entries[1].note.length, 500);
 		await s.stop();
@@ -277,17 +351,32 @@ test("history keeps fatigue metadata and drops unknown optional values across re
 		try {
 			const saved = (await restarted.getHistory()).json.history[1];
 			assert.deepEqual(saved, entries[1]);
-		} finally { await restarted.stop(); }
-	} finally { await s.stop(); }
+		} finally {
+			await restarted.stop();
+		}
+	} finally {
+		await s.stop();
+	}
 });
 
 test("page provides intent editing, redirect, parking, and distinct history states", async () => {
 	const s = await startServer();
 	try {
-		const html = await (await fetch(s.base + "/")).text();
-		for (const label of ["Approve once", "Approve for session…", "Redirect…", "Intent targets (one per line)", "Agent stopped waiting — your answer is still delivered", "Redirected", "Expired"]) assert.ok(html.includes(label), label);
+		const html = await (await fetch(`${s.base}/`)).text();
+		for (const label of [
+			"Approve once",
+			"Approve for session…",
+			"Redirect…",
+			"Intent targets (one per line)",
+			"Agent stopped waiting — your answer is still delivered",
+			"Redirected",
+			"Expired",
+		])
+			assert.ok(html.includes(label), label);
 		assert.ok(html.includes("es.addEventListener('parked'"));
-	} finally { await s.stop(); }
+	} finally {
+		await s.stop();
+	}
 });
 
 test("prints one line, writes state file with mode 0600 and no approver token", async () => {
@@ -333,7 +422,7 @@ test("stale state file is overwritten", async () => {
 test("security headers on the page and host header check", async () => {
 	const s = await startServer();
 	try {
-		const res = await fetch(s.base + "/");
+		const res = await fetch(`${s.base}/`);
 		assert.equal(res.status, 200);
 		const html = await res.text();
 		assert.match(html, /Permission Gate/);
@@ -363,7 +452,10 @@ test("token separation", async () => {
 		assert.equal((await s.call("POST", "/api/requests", { token: APPROVER, body: {} })).status, 401);
 		// session token on approver endpoints
 		const { json: created } = await s.create();
-		const asSession = await s.call("POST", `/api/requests/${created.id}/decision`, { approver: s.state.sessionToken, body: { decision: "approve" } });
+		const asSession = await s.call("POST", `/api/requests/${created.id}/decision`, {
+			approver: s.state.sessionToken,
+			body: { decision: "approve" },
+		});
 		assert.equal(asSession.status, 401);
 		assert.equal((await fetch(`${s.base}/api/events?a=${s.state.sessionToken}`)).status, 401);
 		assert.equal((await fetch(`${s.base}/api/events`)).status, 401);
@@ -514,7 +606,10 @@ test("client disconnect during wait does not break the server", async () => {
 		const { id } = (await s.create()).json;
 		for (let i = 0; i < 5; i++) {
 			const ctrl = new AbortController();
-			const p = fetch(`${s.base}/api/requests/${id}/wait?timeoutMs=20000`, { headers: { authorization: `Bearer ${s.state.sessionToken}` }, signal: ctrl.signal });
+			const p = fetch(`${s.base}/api/requests/${id}/wait?timeoutMs=20000`, {
+				headers: { authorization: `Bearer ${s.state.sessionToken}` },
+				signal: ctrl.signal,
+			});
 			await sleep(50);
 			ctrl.abort();
 			await p.catch(() => {});
@@ -532,14 +627,30 @@ test("SSE: snapshot, added, resolved", async () => {
 		const first = (await s.create({ tldr: "first" })).json.id;
 		const events = await openSse(s.base, APPROVER);
 		const snap = await events.next("snapshot");
-		assert.deepEqual(snap.pending.map((p) => p.id), [first]);
+		assert.deepEqual(
+			snap.pending.map((p) => p.id),
+			[first],
+		);
 
 		const second = (await s.create({ tldr: "second", risk: "medium" })).json.id;
 		const added = await events.next("added");
 		assert.equal(added.id, second);
 		assert.equal(added.tldr, "second");
 		assert.deepEqual(Object.keys(added).sort(), [
-			"command", "createdAt", "cwd", "expiresAt", "id", "kind", "model", "parked", "reasons", "recommendation", "risk", "sessionId", "sessionLabel", "tldr",
+			"command",
+			"createdAt",
+			"cwd",
+			"expiresAt",
+			"id",
+			"kind",
+			"model",
+			"parked",
+			"reasons",
+			"recommendation",
+			"risk",
+			"sessionId",
+			"sessionLabel",
+			"tldr",
 		]);
 
 		await s.decide(first, { decision: "deny" });
@@ -560,7 +671,13 @@ test("body too large returns 413", async () => {
 		// chunked body without content-length
 		const status = await new Promise((resolve, reject) => {
 			const r = http.request(
-				{ host: "127.0.0.1", port: s.state.port, path: "/api/requests", method: "POST", headers: { authorization: `Bearer ${s.state.sessionToken}`, "transfer-encoding": "chunked" } },
+				{
+					host: "127.0.0.1",
+					port: s.state.port,
+					path: "/api/requests",
+					method: "POST",
+					headers: { authorization: `Bearer ${s.state.sessionToken}`, "transfer-encoding": "chunked" },
+				},
 				(rs) => {
 					rs.resume();
 					resolve(rs.statusCode);
@@ -624,7 +741,15 @@ test("history: POST validation", async () => {
 			assert.equal((await s.postHistory(bad)).status, 400, JSON.stringify(bad));
 		}
 		assert.equal((await s.call("POST", "/api/history", { raw: "{nope" })).status, 400);
-		const ok = await s.postHistory({ command: "x".repeat(9000), tldr: "t".repeat(900), model: "m", note: "n", via: "terminal", source: "human", status: "denied" });
+		const ok = await s.postHistory({
+			command: "x".repeat(9000),
+			tldr: "t".repeat(900),
+			model: "m",
+			note: "n",
+			via: "terminal",
+			source: "human",
+			status: "denied",
+		});
 		assert.equal(ok.status, 200);
 		assert.match(ok.json.id, /^[0-9a-f-]{36}$/);
 		const h = (await s.getHistory()).json.history;
@@ -663,12 +788,15 @@ test("history: persists across restart (newest first, limit, bad lines ignored)"
 	for (let i = 0; i < 5; i++) await s1.postHistory({ tldr: `entry ${i}` });
 	assert.equal(fs.statSync(s1.historyFile).mode & 0o777, 0o600);
 	await s1.stop();
-	fs.appendFileSync(s1.historyFile, "this is not json\n{\"id\":1}\n");
+	fs.appendFileSync(s1.historyFile, 'this is not json\n{"id":1}\n');
 
 	const s2 = await startServer({}, dir);
 	try {
 		const h = (await s2.getHistory()).json.history;
-		assert.deepEqual(h.map((e) => e.tldr), ["entry 4", "entry 3", "entry 2", "entry 1", "entry 0"]);
+		assert.deepEqual(
+			h.map((e) => e.tldr),
+			["entry 4", "entry 3", "entry 2", "entry 1", "entry 0"],
+		);
 		assert.equal((await s2.getHistory("?limit=2")).json.history.length, 2);
 		assert.equal((await s2.getHistory("?limit=99999")).json.history.length, 5);
 		assert.equal((await s2.getHistory("?limit=abc")).json.history.length, 5);
@@ -690,7 +818,10 @@ test("history: browser decisions and expiry are recorded, cancel is not", async 
 		assert.equal((await s.call("GET", `/api/requests/${x}/wait?timeoutMs=5000`)).json.status, "expired");
 
 		const h = (await s.getHistory()).json.history;
-		assert.deepEqual(h.map((e) => e.tldr), ["expire me", "deny me", "approve me"]);
+		assert.deepEqual(
+			h.map((e) => e.tldr),
+			["expire me", "deny me", "approve me"],
+		);
 		const [expired, denied, approved] = h;
 		assert.equal(approved.status, "approved");
 		assert.equal(approved.source, "human");
@@ -720,7 +851,10 @@ test("history: SSE snapshot contains history and a history event arrives live", 
 		const events = await openSse(s.base, APPROVER);
 		const snap = await events.next("snapshot");
 		assert.deepEqual(snap.pending, []);
-		assert.deepEqual(snap.history.map((e) => e.tldr), ["second", "first"]);
+		assert.deepEqual(
+			snap.history.map((e) => e.tldr),
+			["second", "first"],
+		);
 
 		const posted = await s.postHistory({ tldr: "third", source: "rule", status: "denied" });
 		const live = await events.next("history");
@@ -744,8 +878,15 @@ test("history: snapshot is limited to 200 entries", async () => {
 	fs.mkdirSync(path.join(dir, "sub"), { recursive: true });
 	const seedFile = path.join(dir, "sub", "approval-history.jsonl");
 	const lines = [];
-	for (let i = 0; i < 205; i++) lines.push(JSON.stringify({ id: `id${i}`, ts: Date.now() - (205 - i) * 1000, ...entry({ tldr: `e${i}`, status: "approved", source: "auto" }) }));
-	fs.writeFileSync(seedFile, lines.join("\n") + "\n");
+	for (let i = 0; i < 205; i++)
+		lines.push(
+			JSON.stringify({
+				id: `id${i}`,
+				ts: Date.now() - (205 - i) * 1000,
+				...entry({ tldr: `e${i}`, status: "approved", source: "auto" }),
+			}),
+		);
+	fs.writeFileSync(seedFile, `${lines.join("\n")}\n`);
 	const s = await startServer({}, dir);
 	try {
 		const events = await openSse(s.base, APPROVER);
@@ -764,7 +905,10 @@ test("history: token separation", async () => {
 	try {
 		assert.equal((await s.call("POST", "/api/history", { token: null, body: entry() })).status, 401);
 		assert.equal((await s.call("POST", "/api/history", { token: APPROVER, body: entry() })).status, 401);
-		assert.equal((await s.call("POST", "/api/history", { token: null, approver: APPROVER, body: entry() })).status, 401);
+		assert.equal(
+			(await s.call("POST", "/api/history", { token: null, approver: APPROVER, body: entry() })).status,
+			401,
+		);
 		// session token cannot read history
 		assert.equal((await s.call("GET", "/api/history")).status, 401);
 		assert.equal((await s.call("GET", "/api/history", { token: null, approver: s.state.sessionToken })).status, 401);
@@ -796,12 +940,21 @@ test("history: file is rotated and the memory ring is limited", async () => {
 		// the 11th line passes the limit and triggers a rewrite with the last 4
 		const lines = fs.readFileSync(s.historyFile, "utf8").split("\n").filter(Boolean);
 		assert.equal(lines.length, 4);
-		assert.deepEqual(lines.map((l) => JSON.parse(l).tldr), ["n7", "n8", "n9", "n10"]);
+		assert.deepEqual(
+			lines.map((l) => JSON.parse(l).tldr),
+			["n7", "n8", "n9", "n10"],
+		);
 		assert.equal(fs.statSync(s.historyFile).mode & 0o777, 0o600);
-		assert.equal(fs.readdirSync(path.dirname(s.historyFile)).some((f) => f.endsWith(".tmp")), false);
+		assert.equal(
+			fs.readdirSync(path.dirname(s.historyFile)).some((f) => f.endsWith(".tmp")),
+			false,
+		);
 		await s.postHistory({ tldr: "n11" });
 		const h = (await s.getHistory()).json.history;
-		assert.deepEqual(h.map((e) => e.tldr), ["n11", "n10", "n9", "n8"]);
+		assert.deepEqual(
+			h.map((e) => e.tldr),
+			["n11", "n10", "n9", "n8"],
+		);
 	} finally {
 		await s.stop();
 	}
@@ -822,7 +975,7 @@ test("history: posting does not need a browser and counts as activity", async ()
 test("page contains the history tab UI", async () => {
 	const s = await startServer();
 	try {
-		const html = await (await fetch(s.base + "/")).text();
+		const html = await (await fetch(`${s.base}/`)).text();
 		for (const needle of ['role="tablist"', 'role="tabpanel"', "History (0)", "No decisions yet", "Showing 0 of 0"]) {
 			assert.ok(html.includes(needle), needle);
 		}
@@ -843,74 +996,100 @@ test("open: needs the session token and answers 200 (no browser in tests)", asyn
 });
 
 test("inspection metadata survives queue and history without persisting source contents", async () => {
-  const s = await startServer();
-  try {
-    const paths = [
-      { path: "/project/scripts/cleanup.py", role: "script", inspected: true, unresolved: false },
-      { path: "/project/scripts/helper.py", role: "local dependency", inspected: true, unresolved: false },
-      { path: "$OUT/report.json", role: "output target", inspected: false, unresolved: true },
-    ];
-    const pathNotes = ["One output path depends on the environment."];
-    const cwd = "/project/" + "long-directory/".repeat(20);
-    const created = await s.create({ cwd, paths, pathNotes, files: [{ path: "cleanup.py", content: "SOURCE-MUST-NOT-PERSIST" }], fingerprints: { secret: "SOURCE-MUST-NOT-PERSIST" } });
-    assert.equal(created.status, 200);
-    const events = await openSse(s.base, APPROVER);
-    const pending = await events.next("snapshot");
-    events.close();
-    const request = pending.pending.find((r) => r.id === created.json.id);
-    assert.deepEqual(request.paths, paths);
-    assert.deepEqual(request.pathNotes, pathNotes);
-    assert.equal(request.cwd, cwd);
-    assert.doesNotMatch(JSON.stringify(request), /SOURCE-MUST-NOT-PERSIST/);
-    assert.equal((await s.decide(created.json.id, { decision: "approve" })).status, 200);
-    const history = (await s.getHistory()).json.history[0];
-    assert.deepEqual(history.paths, paths);
-    assert.deepEqual(history.pathNotes, pathNotes);
-    assert.equal(history.cwd, cwd);
-    assert.doesNotMatch(fs.readFileSync(s.historyFile, "utf8"), /SOURCE-MUST-NOT-PERSIST/);
-  } finally { await s.stop(); }
+	const s = await startServer();
+	try {
+		const paths = [
+			{ path: "/project/scripts/cleanup.py", role: "script", inspected: true, unresolved: false },
+			{ path: "/project/scripts/helper.py", role: "local dependency", inspected: true, unresolved: false },
+			{ path: "$OUT/report.json", role: "output target", inspected: false, unresolved: true },
+		];
+		const pathNotes = ["One output path depends on the environment."];
+		const cwd = `/project/${"long-directory/".repeat(20)}`;
+		const created = await s.create({
+			cwd,
+			paths,
+			pathNotes,
+			files: [{ path: "cleanup.py", content: "SOURCE-MUST-NOT-PERSIST" }],
+			fingerprints: { secret: "SOURCE-MUST-NOT-PERSIST" },
+		});
+		assert.equal(created.status, 200);
+		const events = await openSse(s.base, APPROVER);
+		const pending = await events.next("snapshot");
+		events.close();
+		const request = pending.pending.find((r) => r.id === created.json.id);
+		assert.deepEqual(request.paths, paths);
+		assert.deepEqual(request.pathNotes, pathNotes);
+		assert.equal(request.cwd, cwd);
+		assert.doesNotMatch(JSON.stringify(request), /SOURCE-MUST-NOT-PERSIST/);
+		assert.equal((await s.decide(created.json.id, { decision: "approve" })).status, 200);
+		const history = (await s.getHistory()).json.history[0];
+		assert.deepEqual(history.paths, paths);
+		assert.deepEqual(history.pathNotes, pathNotes);
+		assert.equal(history.cwd, cwd);
+		assert.doesNotMatch(fs.readFileSync(s.historyFile, "utf8"), /SOURCE-MUST-NOT-PERSIST/);
+	} finally {
+		await s.stop();
+	}
 });
 
 test("inspection metadata validates types and limits rather than silently dropping paths", async () => {
-  const s = await startServer();
-  try {
-    for (const over of [
-      { paths: "not an array" },
-      { paths: Array.from({ length: 257 }, () => ({ path: "/x", role: "input" })) },
-      { paths: [{ path: "/x", role: "input", inspected: "yes" }] },
-      { paths: [{ path: "/x", role: "input", unresolved: 1 }] },
-      { paths: [{ path: 4, role: "input" }] },
-      { paths: [{ path: "x".repeat(4097), role: "input" }] },
-      { pathNotes: "not an array" },
-      { pathNotes: [42] },
-      { pathNotes: Array(65).fill("note") },
-    ]) assert.equal((await s.create(over)).status, 400, JSON.stringify(over).slice(0, 100));
-    const legacy = await s.create();
-    assert.equal(legacy.status, 200, "old clients remain supported");
-    assert.equal((await s.postHistory({ paths: [{ path: "/x", role: "input", inspected: "yes" }] })).status, 400);
-  } finally { await s.stop(); }
+	const s = await startServer();
+	try {
+		for (const over of [
+			{ paths: "not an array" },
+			{ paths: Array.from({ length: 257 }, () => ({ path: "/x", role: "input" })) },
+			{ paths: [{ path: "/x", role: "input", inspected: "yes" }] },
+			{ paths: [{ path: "/x", role: "input", unresolved: 1 }] },
+			{ paths: [{ path: 4, role: "input" }] },
+			{ paths: [{ path: "x".repeat(4097), role: "input" }] },
+			{ pathNotes: "not an array" },
+			{ pathNotes: [42] },
+			{ pathNotes: Array(65).fill("note") },
+		])
+			assert.equal((await s.create(over)).status, 400, JSON.stringify(over).slice(0, 100));
+		const legacy = await s.create();
+		assert.equal(legacy.status, 200, "old clients remain supported");
+		assert.equal((await s.postHistory({ paths: [{ path: "/x", role: "input", inspected: "yes" }] })).status, 400);
+	} finally {
+		await s.stop();
+	}
 });
 
 test("inspection metadata persists across server restart and history posts", async () => {
-  const s = await startServer();
-  const metadata = { paths: [{ path: "/project/main.py", role: "script", inspected: true, unresolved: false }], pathNotes: [] };
-  await s.postHistory(metadata);
-  await s.stop();
-  const restarted = await startServer(undefined, s.dir);
-  try {
-    const history = (await restarted.getHistory()).json.history[0];
-    assert.deepEqual(history.paths, metadata.paths);
-    assert.deepEqual(history.pathNotes, []);
-  } finally { await restarted.stop(); }
+	const s = await startServer();
+	const metadata = {
+		paths: [{ path: "/project/main.py", role: "script", inspected: true, unresolved: false }],
+		pathNotes: [],
+	};
+	await s.postHistory(metadata);
+	await s.stop();
+	const restarted = await startServer(undefined, s.dir);
+	try {
+		const history = (await restarted.getHistory()).json.history[0];
+		assert.deepEqual(history.paths, metadata.paths);
+		assert.deepEqual(history.pathNotes, []);
+	} finally {
+		await restarted.stop();
+	}
 });
 
 test("page provides native collapsible paths, project, and execution summary labels", async () => {
-  const s = await startServer();
-  try {
-    const html = await (await fetch(s.base + "/")).text();
-    for (const label of ["Execution summary", "Files and paths", "Unresolved paths", "Code inspected", "Static references only", "Project"]) assert.ok(html.includes(label), label);
-    assert.ok(html.includes("h('details', 'path-details')"));
-    assert.ok(html.includes("h('summary'"));
-    assert.ok(!html.includes("innerHTML ="), "path metadata must not be injected as HTML");
-  } finally { await s.stop(); }
+	const s = await startServer();
+	try {
+		const html = await (await fetch(`${s.base}/`)).text();
+		for (const label of [
+			"Execution summary",
+			"Files and paths",
+			"Unresolved paths",
+			"Code inspected",
+			"Static references only",
+			"Project",
+		])
+			assert.ok(html.includes(label), label);
+		assert.ok(html.includes("h('details', 'path-details')"));
+		assert.ok(html.includes("h('summary'"));
+		assert.ok(!html.includes("innerHTML ="), "path metadata must not be injected as HTML");
+	} finally {
+		await s.stop();
+	}
 });
