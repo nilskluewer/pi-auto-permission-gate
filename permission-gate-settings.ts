@@ -11,7 +11,6 @@ import {
 
 export type PermissionSettingsAction =
 	| { type: "gate"; value: "on" | "off" }
-	| { type: "auto-mode"; value: "on" | "off" }
 	| { type: "classifier-model"; value: string }
 	| { type: "classifier-thinking"; value: string }
 	| { type: "history-messages"; value: number }
@@ -26,7 +25,6 @@ export type PermissionSettingsAction =
 export type PermissionSettingsOption = SelectItem;
 
 export interface PermissionSettingsView {
-	gateOff?: boolean;
 	autoModeEnabled: boolean;
 	classifierModel: string;
 	classifierModelOptions: readonly PermissionSettingsOption[];
@@ -46,8 +44,7 @@ export interface PermissionSettingsView {
 type Tui = { requestRender: () => void };
 
 const MAX_VISIBLE_SETTINGS = 12;
-const GATE_OFF_DESCRIPTION =
-	"Off: no checks at all (no hard denies, command rules, classifier, or approvals) until pi exits.";
+const GATE_OFF_DESCRIPTION = "Off: no checks, classifier, or approvals.";
 
 export async function openPermissionSettings(
 	ctx: Pick<ExtensionContext, "mode" | "hasUI" | "ui">,
@@ -75,14 +72,7 @@ function createSettingsComponent(
 		{
 			id: "gate",
 			label: "Permission gate",
-			description: `${GATE_OFF_DESCRIPTION} Same as /permission-gate on|off.`,
-			currentValue: state.gateOff ? "off" : "on",
-			values: ["on", "off"],
-		},
-		{
-			id: "auto-mode",
-			label: "Automatic safety decisions",
-			description: "Let the configured classifier decide whether soft-deny bash commands may run. Off: soft-deny commands ask for your approval; hard denies stay.",
+			description: GATE_OFF_DESCRIPTION,
 			currentValue: state.autoModeEnabled ? "on" : "off",
 			values: ["on", "off"],
 		},
@@ -180,8 +170,6 @@ function createSettingsComponent(
 		(id, value) => {
 			if (id === "gate" && (value === "on" || value === "off")) {
 				done({ type: "gate", value });
-			} else if (id === "auto-mode" && (value === "on" || value === "off")) {
-				done({ type: "auto-mode", value });
 			} else if (id === "classifier-model" && value !== "info:no-models") {
 				done({ type: "classifier-model", value });
 			} else if (id === "classifier-thinking") {
@@ -384,10 +372,9 @@ async function openPermissionSettingsWithDialogs(
 	state: PermissionSettingsView,
 ): Promise<PermissionSettingsAction | undefined> {
 	const cancel = "Cancel";
-	const gateOption = `Permission gate - ${state.gateOff ? "off" : "on"}`;
+	const gateOption = `Permission gate - ${state.autoModeEnabled ? "on" : "off"}`;
 	const mainOptions = [
 		gateOption,
-		`Automatic safety decisions - ${state.autoModeEnabled ? "on" : "off"}`,
 		`Classifier model - ${state.classifierModel}`,
 		`Classifier thinking - ${state.classifierThinking}`,
 		`Context history messages - ${state.classifierHistoryMessages}`,
@@ -405,24 +392,14 @@ async function openPermissionSettingsWithDialogs(
 	if (!choice || choice === cancel) return undefined;
 	if (choice === gateOption) {
 		const selected = await ctx.ui.select(`Permission gate. ${GATE_OFF_DESCRIPTION}`, [
-			state.gateOff ? "off" : "on",
-			state.gateOff ? "on" : "off",
-			cancel,
-		]);
-		if (!selected || selected === cancel) return undefined;
-		return { type: "gate", value: selected as "on" | "off" };
-	}
-	// Indexes below count the rows after the permission gate row.
-	const index = mainOptions.indexOf(choice) - 1;
-	if (index === 0) {
-		const selected = await ctx.ui.select("Automatic safety decisions", [
 			state.autoModeEnabled ? "on" : "off",
 			state.autoModeEnabled ? "off" : "on",
 			cancel,
 		]);
 		if (!selected || selected === cancel) return undefined;
-		return { type: "auto-mode", value: selected as "on" | "off" };
+		return { type: "gate", value: selected as "on" | "off" };
 	}
+	const index = mainOptions.indexOf(choice);
 	if (index === 1) {
 		const selected = await ctx.ui.select("Select the auto-mode classifier model", [
 			...state.classifierModelOptions.map((option) => option.label),
@@ -457,7 +434,7 @@ async function openPermissionSettingsWithDialogs(
 	if (index === 6) return { type: "prompt" };
 	if (index === 7) return { type: "production-patterns" };
 	if (index === 8) {
-		const seconds = await ctx.ui.select("Approval wait (seconds)", ["30", "60", "120", "300", "600", cancel]);
+		const seconds = await ctx.ui.select("Approval wait (seconds)", ["60", "120", "300", "600", "900", "1800", cancel]);
 		return seconds && seconds !== cancel ? { type: "approval-wait", value: Number(seconds) } : undefined;
 	}
 	if (index === 9) return { type: "intent-grants" };

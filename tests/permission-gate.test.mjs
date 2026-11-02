@@ -303,7 +303,7 @@ test("/permission-gate off and on change the gate at runtime", async () => {
 
   await gate.handler("on", harness.context);
   assert.equal((await harness.invoke(HARD_DENY))?.block, true);
-  assert.equal(harness.statuses.get("permission-gate")?.startsWith("auto mode: ON"), true);
+  assert.equal(harness.statuses.get("permission-gate")?.startsWith("permission gate: ON"), true);
 });
 
 test("the default export registers --no-permission-gate", async () => {
@@ -312,6 +312,166 @@ test("the default export registers --no-permission-gate", async () => {
   register({ registerFlag: (name) => flags.push(name), getFlag: () => false, on() {}, registerCommand() {}, registerEntryRenderer() {} });
   assert.deepEqual(flags, ["no-permission-gate"]);
   assert.equal(NO_GATE_FLAG, "no-permission-gate");
+});
+
+// Off bypasses every rule and cancels all remaining stages of an active review.
+for (const commandName of ["permission-gate", "automode-settings"]) {
+  test(`${commandName} off disables the full gate and shares persisted status`, async () => {
+    const globalModeState = { current: undefined };
+    const h = createHarness({ hasUI: true, globalModeState, fastPass: true,
+      globalRules: { current: { allowedCommands: [], disallowedCommands: ["git status"] } } });
+    await h.startSession();
+    await h.commands.get(commandName).handler("off", h.context);
+    for (const command of [HARD_DENY.input.command, "git status", "npm run build"]) {
+      assert.equal(await h.invoke({ toolName: "bash", input: { command } }), undefined);
+    }
+    assert.equal(h.classifierCalls.length, 0);
+    assert.equal(h.decisionEntries().length, 0);
+    assert.equal(h.approvalRequests.length, 0);
+    assert.equal(globalModeState.current.autoModeEnabled, false);
+    for (const name of ["permission-gate", "automode-settings"]) {
+      await h.commands.get(name).handler("status", h.context);
+      assert.match(h.notifications.at(-1).message, /Permission gate: OFF/);
+    }
+    const resumed = createHarness({ hasUI: true, globalModeState });
+    await resumed.startSession();
+    assert.equal(await resumed.invoke(HARD_DENY), undefined);
+    await resumed.commands.get(commandName).handler("on", resumed.context);
+    assert.equal(globalModeState.current.autoModeEnabled, true);
+    assert.equal((await resumed.invoke(HARD_DENY)).block, true);
+    assert.equal((await resumed.invoke({ toolName: "bash", input: { command: "npm run build" } })).block, true);
+    assert.ok(resumed.classifierCalls.length > 0);
+  });
+
+  test(`${commandName} off cancels an active classifier without waiting or starting another pass`, async () => {
+    let release, entered;
+    const paused = new Promise(resolve => { release = resolve; });
+    const started = new Promise(resolve => { entered = resolve; });
+    const h = createHarness({ hasUI: true, fastPass: true,
+      beforeClassifier: async () => { entered(); await paused; } });
+    await h.startSession();
+    const pending = h.invoke({ toolName: "bash", input: { command: "npm run build" } });
+    await started;
+    await h.commands.get(commandName).handler("off", h.context);
+    assert.equal(h.classifierCalls[0].options.signal.aborted, true);
+    const timeout = Symbol("timeout");
+    const outcome = await Promise.race([pending, new Promise(resolve => setTimeout(() => resolve(timeout), 100))]);
+    release();
+    assert.notEqual(outcome, timeout, "off releases the tool even if the provider ignores abort");
+    assert.equal(outcome, undefined);
+    await h.commands.get(commandName).handler("on", h.context);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.classifierCalls.length, 1, "no deep pass or retry after off, even after re-enable");
+    assert.equal(h.decisionEntries().length, 0);
+    assert.equal(h.approvalRequests.length, 0);
+    assert.equal(h.historyPosts.length, 0);
+  });
+
+  test(`${commandName} off cancels terminal and browser approvals`, async () => {
+    let requested, late;
+    const started = new Promise(resolve => { requested = resolve; });
+    const h = createHarness({ hasUI: true, terminalWaits: true,
+      approval: async (request, signal, lifecycle) => {
+        late = lifecycle.onLateOutcome;
+        requested();
+        return new Promise(resolve => signal.addEventListener("abort", () => resolve({ status: "cancelled" }), { once: true }));
+      } });
+    await h.startSession();
+    const pending = h.invoke({ toolName: "bash", input: { command: "npm run build" } });
+    await started;
+    await h.commands.get(commandName).handler("off", h.context);
+    assert.equal(await pending, undefined);
+    assert.equal(h.selectCalls.at(-1).signal.aborted, true);
+    await h.commands.get(commandName).handler("on", h.context);
+    late({ status: "approved" });
+    assert.equal(h.messages.length, 0);
+    assert.equal(h.decisionEntries().length, 0);
+  });
+}
+
+test("startup flag overrides the switch without persisting and explicit toggles survive session changes", async () => {
+  const globalModeState = { current: { autoModeEnabled: true } };
+  const h = createHarness({ hasUI: true, globalModeState, startOff: () => true });
+  await h.startSession();
+  assert.equal(await h.invoke(HARD_DENY), undefined);
+  assert.equal(globalModeState.current.autoModeEnabled, true);
+  await h.startSession({ type: "session_start", reason: "new" });
+  assert.equal(await h.invoke(HARD_DENY), undefined);
+  await h.commands.get("permission-gate").handler("on", h.context);
+  await h.startSession({ type: "session_start", reason: "new" });
+  assert.equal((await h.invoke(HARD_DENY)).block, true);
+  await h.commands.get("automode-settings").handler("off", h.context);
+  assert.equal(globalModeState.current.autoModeEnabled, false);
+});
+
+test("off during provider auth does not start request auth or classification", async () => {
+  let release, entered, requestAuthCalls = 0;
+  const paused = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  const h = createHarness({ hasUI: true, fastPass: true });
+  await h.startSession();
+  h.context.modelRegistry.getProviderAuth = async () => {
+    entered();
+    await paused;
+    return { auth: { apiKey: "test-token" }, env: {} };
+  };
+  h.context.modelRegistry.getApiKeyAndHeaders = async () => { requestAuthCalls++; return { ok: true }; };
+  const pending = h.invoke({ toolName: "bash", input: { command: "npm run build" } });
+  await started;
+  await h.commands.get("permission-gate").handler("off", h.context);
+  release();
+  assert.equal(await pending, undefined);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requestAuthCalls, 0);
+  assert.equal(h.classifierCalls.length, 0);
+});
+
+test("session replacement cancels an ignored-abort provider without recording into the new session", async () => {
+  let release, entered;
+  const paused = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  const h = createHarness({ hasUI: true, fastPass: true,
+    beforeClassifier: async () => { entered(); await paused; } });
+  await h.startSession();
+  const pending = h.invoke({ toolName: "bash", input: { command: "npm run build" } });
+  await started;
+  await h.startSession({ type: "session_start", reason: "new" });
+  assert.equal((await pending).block, true);
+  release();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.classifierCalls.length, 1);
+  assert.equal(h.decisionEntries().length, 0);
+  assert.equal(h.historyPosts.length, 0);
+});
+
+test("off invalidates expired browser approvals, including after re-enable", async () => {
+  let lifecycle;
+  const h = createHarness({ hasUI: true, terminalWaits: true, approvalWaitMs: 1,
+    approval: async (_request, signal, callbacks) => {
+      lifecycle = callbacks;
+      return new Promise(resolve => signal.addEventListener("abort", () => resolve({ status: "cancelled" }), { once: true }));
+    } });
+  await h.startSession();
+  const event = { toolName: "bash", input: { command: "npm run build" } };
+  assert.equal((await h.invoke(event)).block, true);
+  assert.equal(lifecycle.parkSignal.aborted, true);
+  await h.commands.get("permission-gate").handler("off", h.context);
+  await h.commands.get("permission-gate").handler("on", h.context);
+  const count = h.classifierCalls.length;
+  lifecycle.onLateOutcome({ status: "approved" });
+  assert.equal(h.messages.length, 0);
+  assert.equal((await h.invoke(event)).block, true, "the expired approval cannot authorize a retry");
+  assert.ok(h.classifierCalls.length > count);
+});
+
+test("dialog approval waits offer the same supported values as direct settings", async () => {
+  const h = createHarness({ hasUI: true, mode: "rpc",
+    selectResponses: ["Approval wait - 300 seconds", "1800", "Cancel"] });
+  await h.startSession();
+  await h.commands.get("automode-settings").handler("", h.context);
+  assert.deepEqual(h.selectCalls.find(call => call.title === "Approval wait (seconds)").options,
+    ["60", "120", "300", "600", "900", "1800", "Cancel"]);
+  assert.equal(h.modeEntries().at(-1).data.approvalWaitSeconds, 1800);
 });
 
 test("recognizes soft and hard permission rules", () => {
@@ -547,7 +707,7 @@ test("allows local verification commands without the classifier", async () => {
   assert.equal(harness.decisionEntries().length, 0);
 });
 
-test("blocks dangerous commands without a UI when auto mode is off", async () => {
+test("blocks classifier-denied commands without an approver", async () => {
   const harness = createHarness({ hasUI: false });
 
   const result = await harness.invoke({
@@ -557,7 +717,7 @@ test("blocks dangerous commands without a UI when auto mode is off", async () =>
 
   assert.equal(result.block, true);
   assert.match(result.reason, /recursive\/forced rm/);
-  assert.match(result.reason, /no UI for confirmation/);
+  assert.match(result.reason, /no approver was reachable/);
 });
 
 test("blocks a dangerous command when the user selects No", async () => {
@@ -568,7 +728,8 @@ test("blocks a dangerous command when the user selects No", async () => {
     input: { command: "git reset --hard HEAD" },
   });
 
-  assert.deepEqual(result, { block: true, reason: "Blocked by user" });
+  assert.equal(result.block, true);
+  assert.match(result.reason, /the user did not approve/);
 });
 
 test("allows a dangerous command when the user selects Yes", async () => {
@@ -670,7 +831,7 @@ test("auto mode approves a soft-deny command with the configured model", async (
   assert.equal(harness.decisionEntries()[0].data.status, "approved");
   assert.equal(harness.decisionEntries()[0].data.source, "auto-model");
   assert.match(harness.decisionEntries()[0].data.model, /github-copilot\/gpt-6-luna \(thinking high\)/);
-  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-6-luna, thinking high)");
+  assert.equal(harness.statuses.get("permission-gate"), "permission gate: ON (github-copilot/gpt-6-luna, thinking high)");
 });
 
 test("auto mode blocks a denied soft-deny command and records the rationale", async () => {
@@ -730,7 +891,7 @@ test("loads persisted auto-mode state with default classifier settings", async (
   });
 
   assert.equal(result, undefined);
-  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-6-luna, thinking high)");
+  assert.equal(harness.statuses.get("permission-gate"), "permission gate: ON (github-copilot/gpt-6-luna, thinking high)");
   assert.deepEqual(globalModeState.current, { autoModeEnabled: true });
 });
 
@@ -745,9 +906,9 @@ test("preserves malformed classifier state without default substitution", async 
   const harness = createHarness({ hasUI: true, globalModeState });
 
   await harness.startSession();
-  assert.equal(harness.statuses.get("permission-gate"), undefined);
+  assert.equal(harness.statuses.get("permission-gate"), "permission gate: OFF");
   await harness.commands.get("automode-settings").handler("status", harness.context);
-  assert.match(harness.notifications.at(-1).message, /auto mode is OFF/);
+  assert.match(harness.notifications.at(-1).message, /Permission gate: OFF/);
   assert.match(harness.notifications.at(-1).message, /unavailable classifier model/);
   assert.doesNotMatch(harness.notifications.at(-1).message, /github-copilot\/gpt-6-luna/);
   assert.deepEqual(globalModeState.current, {
@@ -770,20 +931,20 @@ test("keeps the global auto-mode state across new sessions, forks, reloads, and 
   const firstSession = createHarness({ hasUI: true, globalModeState });
 
   await firstSession.startSession({ type: "session_start", reason: "startup" });
-  assert.equal(firstSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-6-luna, thinking high)");
+  assert.equal(firstSession.statuses.get("permission-gate"), "permission gate: ON (github-copilot/gpt-6-luna, thinking high)");
 
   const nextSession = createHarness({ hasUI: true, globalModeState });
   await nextSession.startSession({ type: "session_start", reason: "fork" });
-  assert.equal(nextSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-6-luna, thinking high)");
+  assert.equal(nextSession.statuses.get("permission-gate"), "permission gate: ON (github-copilot/gpt-6-luna, thinking high)");
 
   await nextSession.startSession({ type: "session_start", reason: "reload" });
   nextSession.handlers.get("session_tree")({}, nextSession.context);
-  assert.equal(nextSession.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-6-luna, thinking high)");
+  assert.equal(nextSession.statuses.get("permission-gate"), "permission gate: ON (github-copilot/gpt-6-luna, thinking high)");
 
   await nextSession.commands.get("automode-settings").handler("off", nextSession.context);
   const resumedSession = createHarness({ hasUI: true, globalModeState });
   await resumedSession.startSession({ type: "session_start", reason: "resume" });
-  assert.equal(resumedSession.statuses.get("permission-gate"), undefined);
+  assert.equal(resumedSession.statuses.get("permission-gate"), "permission gate: OFF");
 });
 
 test("automode toggles and reports its state", async () => {
@@ -802,11 +963,11 @@ test("automode toggles and reports its state", async () => {
   });
 
   await command.handler("status", harness.context);
-  assert.match(harness.notifications.at(-1).message, /is ON/);
+  assert.match(harness.notifications.at(-1).message, /Permission gate: ON/);
 
   await command.handler("off", harness.context);
-  assert.match(harness.notifications.at(-1).message, /disabled/);
-  assert.equal(harness.statuses.get("permission-gate"), undefined);
+  assert.match(harness.notifications.at(-1).message, /Permission gate: OFF/);
+  assert.equal(harness.statuses.get("permission-gate"), "permission gate: OFF");
 });
 
 test("discovers text models for picker and autocomplete, supports slash-containing IDs, and resets", async () => {
@@ -882,7 +1043,7 @@ test("central auto-mode settings command groups configuration", async () => {
 
   await harness.startSession();
   await command.handler("status", harness.context);
-  assert.match(harness.notifications.at(-1).message, /auto mode is ON/);
+  assert.match(harness.notifications.at(-1).message, /Permission gate: ON/);
 
   await command.handler("preferences Prefer bounded changes", harness.context);
   assert.match(harness.notifications.at(-1).message, /preference note/);
@@ -945,14 +1106,14 @@ test("opens the unified settings entry point and exposes active command patterns
   assert.match(harness.notifications.at(-1).message, /session only/);
 });
 
-test("toggles auto mode from the unified settings page", async () => {
+test("toggles the single gate from the unified settings page", async () => {
   const globalModeState = { current: { autoModeEnabled: false } };
   const harness = createHarness({
     hasUI: true,
     mode: "rpc",
     globalModeState,
     selectResponses: [
-      "Automatic safety decisions - off",
+      "Permission gate - off",
       "on",
       "Cancel",
     ],
@@ -964,10 +1125,10 @@ test("toggles auto mode from the unified settings page", async () => {
   assert.equal(globalModeState.current.autoModeEnabled, true);
   assert.deepEqual(harness.selectCalls.map((call) => call.title), [
     "Permission Gate Settings",
-    "Automatic safety decisions",
+    "Permission gate. Off: no checks, classifier, or approvals.",
     "Permission Gate Settings",
   ]);
-  assert.match(harness.notifications.at(-1).message, /auto mode enabled/);
+  assert.match(harness.notifications.at(-1).message, /Permission gate: ON/);
 });
 
 test("turns the permission gate fully off from the unified settings page", async () => {
@@ -982,6 +1143,7 @@ test("turns the permission gate fully off from the unified settings page", async
   await harness.commands.get("automode-settings").handler("", harness.context);
 
   assert.equal(harness.selectCalls[0].options[0], "Permission gate - on");
+  assert.equal(harness.selectCalls[0].options.some(option => /Automatic safety decisions/.test(option)), false);
   assert.equal(harness.selectCalls[2].options[0], "Permission gate - off");
   assert.equal(await harness.invoke(HARD_DENY), undefined);
   assert.equal(harness.statuses.get("permission-gate"), "permission gate: OFF");
@@ -1151,7 +1313,7 @@ test("configures, reports, validates, persists, and resets classifier thinking",
   assert.equal(globalModeState.current.classifierThinkingLevel, "max");
   assert.equal(harness.modeEntries().at(-1).data.classifierThinkingLevel, "max");
   assert.match(harness.notifications.at(-1).message, /thinking max -> high/);
-  assert.equal(harness.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-6-luna, thinking max -> high)");
+  assert.equal(harness.statuses.get("permission-gate"), "permission gate: ON (github-copilot/gpt-6-luna, thinking max -> high)");
 
   const persistedAfterSet = { ...globalModeState.current };
   await command.handler("status", harness.context);
@@ -1264,7 +1426,7 @@ test("persists classifier thinking across sessions", async () => {
     classifierText: '{"decision":"allow","rationale":"The persisted level was used."}',
   });
   await next.startSession();
-  assert.equal(next.statuses.get("permission-gate"), "auto mode: ON (github-copilot/gpt-6-luna, thinking medium)");
+  assert.equal(next.statuses.get("permission-gate"), "permission gate: ON (github-copilot/gpt-6-luna, thinking medium)");
   await next.invoke({ toolName: "bash", input: { command: "git reset --hard HEAD~1" } });
   assert.equal(next.classifierCalls[0].options.reasoning, "medium");
 });
@@ -1468,7 +1630,7 @@ test("selects a direct model without changing Pi's active model and persists acr
 
   const next = createHarness({ hasUI: true, models, activeModel, globalModeState });
   await next.startSession();
-  assert.equal(next.statuses.get("permission-gate"), "auto mode: ON (vertex/gemini/flash, thinking high -> off)");
+  assert.equal(next.statuses.get("permission-gate"), "permission gate: ON (vertex/gemini/flash, thinking high -> off)");
   await next.invoke({ toolName: "bash", input: { command: "git reset --hard HEAD~1" } });
   assert.equal(next.classifierCalls[0].model.provider, "vertex");
   assert.equal(next.classifierCalls[0].model.id, "gemini/flash");
@@ -2103,7 +2265,7 @@ test("hard blocks and mandatory-human critical rules remain ahead of automatic s
   assert.equal(harness.approvalRequests[0].risk, "critical");
 });
 
-test("auto-mode-off approval also rechecks files after waiting", async (t) => {
+test("disabled gate skips script inspection and confirmation", async (t) => {
   const dir = await scriptProject(t);
   const harness = createHarness({ hasUI: true, choice: "Yes", globalModeState: { current: { autoModeEnabled: false } } });
   harness.context.cwd = dir;
@@ -2114,7 +2276,7 @@ test("auto-mode-off approval also rechecks files after waiting", async (t) => {
   };
   await harness.startSession();
   assert.equal(await run(harness, "python main.py"), undefined);
-  assert.equal(calls, 2);
+  assert.equal(calls, 0);
   assert.equal(harness.classifierCalls.length, 0);
 });
 

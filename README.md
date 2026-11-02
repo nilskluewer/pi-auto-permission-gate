@@ -11,6 +11,8 @@ It does not intercept Pi's direct `!` or `!!` shell commands, and it does not in
 
 ### Decision flow
 
+When the permission gate is enabled, each `bash` tool call follows this order:
+
 | Order | Match | Result |
 | --- | --- | --- |
 | 1 | Hard-deny rule | Block immediately, without the model or a prompt |
@@ -18,8 +20,8 @@ It does not intercept Pi's direct `!` or `!!` shell commands, and it does not in
 | 3 | User `allowedCommands` pattern, or no matched rule | Run, except mandatory checks such as recursive `rm`, IAM, and configuration writes |
 | 4 | Lockdown | Ask the user for every command |
 | 5 | Exact single-use late approval, or a matching non-critical session intent | Run after a fresh inspection |
-| 6 | Built-in soft rule with auto mode on | Ask the classifier; a clear non-critical allow runs |
-| 7 | Critical, uncertain, denied by classifier, or auto mode off | Ask the user in a UI, or block when no approver exists |
+| 6 | Built-in soft rule | Ask the classifier; a clear non-critical allow runs |
+| 7 | Critical, uncertain, or denied by classifier | Ask the user in a UI, or block when no approver exists |
 
 ### Command coverage
 
@@ -28,7 +30,7 @@ It does not intercept Pi's direct `!` or `!!` shell commands, and it does not in
 | Local checks | `uv run pytest`, `rtk uv run ruff check .`, `uv run mypy` | Allowed |
 | Package installation, update, removal | `npm install`, `uv pip install`, `cargo add` | Allowed |
 | Scoped local deletion | `find build -type f -delete` | Allowed when explicit relative targets stay below the current working directory |
-| Recursive rm | `rm -rf build`, `rm -rf /tmp/x`, `rm -rf "$tmp"` after `tmp=$(mktemp -d)` | Always checked by the classifier, or by the user when auto mode is off. Allow patterns cannot skip this check |
+| Recursive rm | `rm -rf build`, `rm -rf /tmp/x`, `rm -rf "$tmp"` after `tmp=$(mktemp -d)` | Always checked by the classifier, with human fallback when critical, uncertain, or denied. Allow patterns cannot skip this check |
 | Other deletion | `.git` deletion, parent paths, roots, broad `find . -delete`, `xargs rm` | Checked or hard-blocked |
 | Package execution and publishing | `npm run`, `npm exec`, `npx`, `uvx`, `uv run python`, `npm publish` | Checked |
 | Privilege and permissions | `sudo`, `chmod 777`, recursive `chmod` or `chown` | Checked |
@@ -36,14 +38,14 @@ It does not intercept Pi's direct `!` or `!!` shell commands, and it does not in
 | Destructive Git operations | `reset --hard`, `clean -f`, force push, `branch -D`, `tag -d`, `git rm`, aggressive prune | Checked, with protected force pushes hard-blocked |
 | Docker state removal | `docker system prune`, volume removal, `compose down -v` | Checked |
 | Downloaded scripts | `curl ... \| sh`, `wget ... \| bash` | Checked |
-| Interpreter and script execution | `python script.py`, `node -e '...'`, `bash cleanup.sh`, `./cleanup` | Classifier assessment in auto mode; human review otherwise, unless an explicit user allow rule applies |
-| Unsupported shell syntax | Command substitutions, heredocs, complex redirects, malformed quoting | Classifier assessment in auto mode, not mandatory human approval merely because local parsing is incomplete |
+| Interpreter and script execution | `python script.py`, `node -e '...'`, `bash cleanup.sh`, `./cleanup` | Classifier assessment with human fallback unless an explicit user allow rule applies |
+| Unsupported shell syntax | Command substitutions, heredocs, complex redirects, malformed quoting | Classifier assessment, not mandatory human approval merely because local parsing is incomplete |
 | Other bash commands | `git status`, `printf`, ordinary project commands | Allowed unless a user rule matches |
 
 Open `/automode-settings` without arguments for the interactive Permission Gate Settings page.
-It provides one entry point for auto mode, classifier settings and preferences, command rules, production patterns, the approval wait, active intent grants, and approval statistics.
+It provides one entry point for the permission gate switch, classifier settings and preferences, command rules, production patterns, the approval wait, active intent grants, and approval statistics.
 The command-rules subpage lists the active allowed and disallowed patterns before opening the editor, so user-defined commands are visible instead of being hidden in a separate command.
-Hard-deny rules cannot be overridden by an allow pattern.
+While the gate is enabled, hard-deny rules cannot be overridden by an allow pattern.
 
 ## What it protects
 
@@ -55,7 +57,7 @@ The gate checks bash tool calls for common destructive or high-impact operations
 
 Scoped `find -delete` is allowed by default when explicit relative targets stay below the current working directory.
 For example, `find build -type f -delete` passes without confirmation.
-Recursive `rm` is never allowed without a check: the classifier, or the user when auto mode is off, must approve every `rm -r` or `rm -rf`.
+Recursive `rm` is never allowed without a check while the gate is enabled: the classifier, or the user when human review is required, must approve every `rm -r` or `rm -rf`.
 Variables assigned once from `$(mktemp ...)` and `$TMPDIR` are not hard-blocked, so the classifier can approve temp-directory cleanup.
 Parent paths, filesystem roots, `.git` metadata, shell expansions, globs, and broad `find . -delete` remain protected.
 - Package execution and publishing commands such as `npm run`, `npm publish`, and `npx`.
@@ -85,9 +87,9 @@ A command that matches a pattern is shown to the user for review, but confirmati
 
 In interactive mode, the extension displays the matched reasons and a truncated command preview.
 When human review is required, the command runs only after an explicit approval, either once or under a session intent grant.
-Hard-deny operations are blocked before this confirmation flow, even when auto mode is off.
+When the permission gate is enabled, hard-deny operations are blocked before the classifier or human confirmation flow. When the permission gate is off, no checks run.
 
-In non-interactive, JSON, and print modes, matching commands are blocked because confirmation is unavailable.
+In non-interactive, JSON, and print modes, commands that require human confirmation are blocked because confirmation is unavailable.
 
 Safe commands and non-bash tool calls pass through unchanged.
 Intent grants and single-use late approvals stay in memory only. They end on session replacement or shutdown. Every matching tool call gets a fresh inspection.
@@ -120,12 +122,12 @@ Project rules are stored in `.pi/permission-gate-rules.json` and override the gl
 
 Use the command-rules page in `/automode-settings` to inspect or reset the active rules.
 
-## Auto mode
+## Auto mode and settings
 
-Auto mode adds a model-backed decision layer for matching commands that are not in the non-negotiable hard-deny list.
+When the permission gate is enabled, it runs rule checks, a model-backed classifier for soft-deny commands, and human approval fallback.
 
-Auto mode is enabled by default.
-The first session after installation initializes the global setting as enabled.
+The permission gate is enabled by default.
+The first session after installation initializes the global setting (`autoModeEnabled` in `~/.pi/agent/permission-gate.json`) as enabled.
 
 Use `/automode-settings` as the central settings command.
 With no arguments it opens the interactive settings page.
@@ -145,6 +147,8 @@ The same command also supports direct forms:
 /automode-settings grants
 /automode-settings statistics
 ```
+
+`/permission-gate on|off|status` and `/automode-settings on|off|status` control the same globally persisted permission gate switch.
 
 Auto-mode preferences are stored as a user-editable Markdown note file at `~/.pi/agent/automode-preferences.md`, or below `PI_CODING_AGENT_DIR` when that environment variable is set.
 Each non-empty note is injected into the classifier's system and user prompts as trusted user-authored policy.
@@ -208,7 +212,7 @@ Pi's model support metadata controls clamping: non-reasoning models use `off`, s
 Clamping follows Pi's thinking-level ordering and the effective non-off level is passed to the classifier provider.
 Selecting a classifier or classifier thinking level does not change Pi's active model or conversation thinking level, and the extension never calls `pi.setModel()`.
 
-When auto mode is enabled, each soft-deny command is evaluated by the selected classifier in two stages, like Claude Code auto mode.
+When the permission gate is enabled, each soft-deny command is evaluated by the selected classifier in two stages, like Claude Code auto mode.
 Stage 1 is a fast pass without reasoning that errs toward "deny". Only an "allow" ends there.
 Everything else goes to stage 2 with the configured thinking level. Commands that always need a human skip stage 1.
 The classifier is reasoning-blind. It receives the command, matched rules, working directory, the user's own recent messages, the bash commands the agent already ran, and available script-inspection evidence.
@@ -243,7 +247,7 @@ In an interactive session the request is sent to one shared local approval queue
 The queue is a small local web server (`127.0.0.1`, random port) that all pi sessions on the machine share, so you watch one browser tab.
 The first request starts the server and opens the tab.
 Each card shows the project name and full working directory, a visible **Execution summary**, risk, recommendation, exact command, matched rules, and session. The summary describes the execution and its important effects, not just why review was requested.
-A collapsed **Files and paths** section groups filenames under each full directory, with roles and code-inspection status. It includes identified inputs, scripts, directories, outputs, and deletion targets. Dynamic references and incomplete inspection are marked explicitly: this is a static list, not a claim to show every runtime access. History details retain the same grouping. Terminal approvals show the project, explanation, and grouped paths as text; when auto mode is off, no model-generated explanation is available.
+A collapsed **Files and paths** section groups filenames under each full directory, with roles and code-inspection status. It includes identified inputs, scripts, directories, outputs, and deletion targets. Dynamic references and incomplete inspection are marked explicitly: this is a static list, not a claim to show every runtime access. History details retain the same grouping. Terminal approvals show the project, explanation, and grouped paths as text.
 Critical cards are red and need a second click to approve. You can add a note for the agent when you deny.
 The wait defaults to **300 seconds** (5 minutes). If you do not answer, the gate records **expired**, cancels the terminal dialog, and parks the browser request. The command does not run. The agent is told to continue with other work that does not need the command, or end its turn and ask in plain text. The browser request stays answerable for 10 more minutes after the wait ends.
 
@@ -285,7 +289,7 @@ Open **Approval statistics** or run `/automode-settings statistics` for the last
 
 ### Hard-deny rules
 
-The following catastrophic operations are blocked without asking the model or you:
+When the permission gate is enabled, the following catastrophic operations are blocked immediately without asking the model or you:
 
 - Accessing the approval queue or history files, or calling the queue API. Searching for their filenames with `grep`, `rg`, `ag`, or `git grep` is allowed; actual file operands and redirect targets remain hard-denied.
 
@@ -305,15 +309,13 @@ Do not enable it when the process must be prevented from making any autonomous c
 
 ## Turn the gate off
 
-The gate can be turned fully off. Then it checks nothing: no hard denies, no command rules, no classifier, no approvals.
+The permission gate has one switch. When it is on, it runs full rule checks, the classifier, and human approval fallback. When it is off, it performs no checks at all: no hard denies, no command rules, no classifier, and no approvals.
 
-- `pi --no-permission-gate` starts pi with the gate off, for example for scheduled automations.
-- `/permission-gate off` turns it off in a running pi; `/permission-gate on` turns it on again; `/permission-gate status` shows the state.
-- The first row of `/automode-settings`, "Permission gate", does the same.
-
-"Automatic safety decisions: off" is different: it turns off only the classifier. Hard denies and command rules stay, and soft-deny commands then ask for your approval.
-
-The state is for the pi process only; it is not saved. While the gate is off, the footer shows `permission gate: OFF`.
+- `/permission-gate off` and `/automode-settings off` turn the gate off; `on` turns it on again; `status` shows the state.
+- The first row of `/automode-settings` ("Permission gate", values `on` / `off`, description `Off: no checks, classifier, or approvals.`) toggles the same switch.
+- Explicit toggles are persisted globally in `~/.pi/agent/permission-gate.json` (`autoModeEnabled`).
+- `pi --no-permission-gate` overrides this state for the current Pi process on startup without persisting the flag by itself; any explicit toggle afterward persists the new state.
+- Turning the gate off cancels pending model or human review, starts no new review stages, and suppresses late approval messages. While the gate is off, the footer shows `permission gate: OFF`.
 
 ## Install
 

@@ -1,10 +1,8 @@
 /**
  * Permission Gate Extension
  *
- * Prompts for confirmation before running potentially dangerous bash commands.
- * In non-interactive mode, matching commands are blocked by default.
- *
- * Auto mode can delegate soft-deny decisions to the configured text-capable Pi model.
+ * When enabled, checks bash commands with rules, a classifier, and human approval.
+ * When disabled, passes every tool call through without inspection.
  */
 
 import { spawn } from "node:child_process";
@@ -15,7 +13,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext, type ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { Text, type AutocompleteItem } from "@earendil-works/pi-tui";
 import { codeReviewReasons, inspectCommand, inspectionIsFresh, inspectionPrompt, formatPaths, shellWords } from "./command-inspection.mjs";
 import { assessCriticality, DEFAULT_PRODUCTION_PATTERNS, isAccessChange } from "./criticality.mjs";
@@ -1511,7 +1509,9 @@ async function classifyWithModel(
 	let auth: ClassifierAuth;
 	try {
 		// The public registry API exposes provider auth and request auth separately, so merge both resolutions here.
+		ctx.signal?.throwIfAborted();
 		const providerAuth = await registry.getProviderAuth(classifierModel.provider);
+		ctx.signal?.throwIfAborted();
 		if (!providerAuth) {
 			return {
 				decision: "deny",
@@ -1524,6 +1524,7 @@ async function classifyWithModel(
 		const modelRequestAuth = await registry.getApiKeyAndHeaders(
 			model as Parameters<typeof registry.getApiKeyAndHeaders>[0],
 		);
+		ctx.signal?.throwIfAborted();
 		if (!modelRequestAuth.ok) {
 			return {
 				decision: "deny",
@@ -1919,7 +1920,7 @@ function persistModeState(pi: ExtensionAPI, state: ModeState): void {
 	pi.appendEntry(MODE_ENTRY_TYPE, state);
 }
 
-function setAutoModeStatus(
+function setGateStatus(
 	ctx: { hasUI: boolean; ui: { setStatus: (id: string, text: string | undefined) => void } },
 	enabled: boolean,
 	classifierModel: ClassifierModelReference | null,
@@ -1932,8 +1933,8 @@ function setAutoModeStatus(
 	ctx.ui.setStatus(
 		STATUS_ID,
 		enabled
-			? `auto mode: ON (${classifierModelDisplayId(classifierModel)}, ${thinking})`
-			: undefined,
+			? `permission gate: ON (${classifierModelDisplayId(classifierModel)}, ${thinking})`
+			: "permission gate: OFF",
 	);
 }
 
@@ -1946,29 +1947,19 @@ function notify(
 }
 
 export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionGateDependencies = {}): void {
-	// The extension is initialized before session_start, so keep the pre-session
-	// value conservative and load the globally persisted preference at startup.
-	let autoModeEnabled = false;
+	// autoModeEnabled is the persisted name of the single permission-gate switch.
+	let autoModeEnabled = true;
 	let classifierModel = cloneClassifierModelReference(DEFAULT_CLASSIFIER_MODEL);
 	let classifierThinkingLevel = DEFAULT_CLASSIFIER_THINKING_LEVEL;
 	let classifierHistoryMessages = DEFAULT_CLASSIFIER_HISTORY_MESSAGES;
 	let autoModePreferences = "";
 	let productionPatterns = [...DEFAULT_PRODUCTION_PATTERNS];
 	let approvalWaitSeconds = DEFAULT_APPROVAL_WAIT_SECONDS;
-	// Fully off: tool_call does nothing. Set by --no-permission-gate or /permission-gate off.
-	let gateOff: boolean | undefined;
-	// One footer slot: "permission gate: OFF" replaces the auto-mode status while the gate is off.
+	let initialized = false;
+	const disabledReason = Symbol("permission gate disabled");
+	const activeReviews = new Set<AbortController>();
 	const refreshStatus = (ctx: ExtensionContext): void => {
-		if (gateOff) {
-			if (ctx.hasUI) ctx.ui.setStatus(STATUS_ID, "permission gate: OFF");
-			return;
-		}
-		setAutoModeStatus(ctx, autoModeEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
-	};
-	const setGate = (ctx: ExtensionContext, value: "on" | "off"): void => {
-		gateOff = value === "off";
-		refreshStatus(ctx);
-		notify(ctx, `Permission gate: ${gateOff ? "OFF" : "ON"}.`, "info");
+		setGateStatus(ctx, autoModeEnabled, classifierModel, classifierThinkingLevel, availableClassifierModels);
 	};
 	const now = dependencies.now ?? Date.now;
 	const intentStore = createIntentStore({ now });
@@ -1980,6 +1971,8 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		sessionGeneration += 1;
 		intentStore.clear();
 		lateApprovals.length = 0;
+		for (const controller of activeReviews) controller.abort();
+		activeReviews.clear();
 		for (const controller of pendingApprovals) controller.abort();
 		pendingApprovals.clear();
 	};
@@ -1993,6 +1986,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 	let totalDenials = 0;
 	let lockdown = false;
 	const gateSessionId = randomUUID();
+	let modeSave: Promise<boolean> = Promise.resolve(true);
 	const persistMode = async (ctx: {
 		hasUI: boolean;
 		ui: { notify: (message: string, level: "info" | "warning" | "error") => void };
@@ -2006,9 +2000,24 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			approvalWaitSeconds,
 		};
 		persistModeState(pi, state);
-		if (!(await persistGlobalModeState(dependencies, state))) {
+		modeSave = modeSave.then(() => persistGlobalModeState(dependencies, state));
+		if (!(await modeSave)) {
 			notify(ctx, "Permission gate mode could not be persisted globally.", "warning");
 		}
+	};
+	const setGate = async (ctx: ExtensionContext, value: "on" | "off"): Promise<void> => {
+		autoModeEnabled = value === "on";
+		if (!autoModeEnabled) {
+			for (const controller of activeReviews) controller.abort(disabledReason);
+			clearSessionApprovals();
+			consecutiveDenials = 0;
+			totalDenials = 0;
+			lockdown = false;
+		}
+		syncAvailableClassifierModels(ctx);
+		refreshStatus(ctx);
+		await persistMode(ctx);
+		notify(ctx, `Permission gate: ${autoModeEnabled ? "ON" : "OFF"}. ${autoModeEnabled ? "Rules, classifier, and approvals are enabled." : "No checks, classifier, or approvals."}`, "info");
 	};
 	const persistAutoModePreferences = async (
 		ctx: { hasUI: boolean; ui: { notify: (message: string, level: "info" | "warning" | "error") => void } },
@@ -2431,15 +2440,17 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 
 		const value = rawValue.toLowerCase();
 		if (value === "on" || value === "enable" || value === "enabled") {
-			autoModeEnabled = true;
+			await setGate(ctx, "on");
+			return;
 		} else if (value === "off" || value === "disable" || value === "disabled") {
-			autoModeEnabled = false;
+			await setGate(ctx, "off");
+			return;
 		} else if (value === "status" || !value) {
 			syncAvailableClassifierModels(ctx);
 			const selected = findAvailableClassifierModel(availableClassifierModels, classifierModel);
 			notify(
 				ctx,
-				`Permission gate auto mode is ${autoModeEnabled ? "ON" : "OFF"}; classifier model is ${formatClassifierModelLabel(classifierModel, selected, classifierThinkingLevel)}; context history: ${classifierHistoryMessages} message${classifierHistoryMessages === 1 ? "" : "s"}; approval wait: ${approvalWaitSeconds}s; production patterns: ${productionPatterns.join(", ")}; active grants: ${intentStore.list(gateSessionId).length}.`,
+				`Permission gate: ${autoModeEnabled ? "ON" : "OFF"}; classifier model is ${formatClassifierModelLabel(classifierModel, selected, classifierThinkingLevel)}; context history: ${classifierHistoryMessages} message${classifierHistoryMessages === 1 ? "" : "s"}; approval wait: ${approvalWaitSeconds}s; production patterns: ${productionPatterns.join(", ")}; active grants: ${intentStore.list(gateSessionId).length}.`,
 				"info",
 			);
 			refreshStatus(ctx);
@@ -2453,16 +2464,6 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			return;
 		}
 
-		syncAvailableClassifierModels(ctx);
-		await persistMode(ctx);
-		refreshStatus(ctx);
-		notify(
-			ctx,
-			autoModeEnabled
-				? `Permission gate auto mode enabled globally. Classifier ${formatClassifierModelLabel(classifierModel, findAvailableClassifierModel(availableClassifierModels, classifierModel), classifierThinkingLevel)} will decide soft-deny commands.`
-				: `Permission gate auto mode disabled globally. Classifier is ${formatClassifierModelLabel(classifierModel, findAvailableClassifierModel(availableClassifierModels, classifierModel), classifierThinkingLevel)}. Dangerous commands require manual confirmation.`,
-			"info",
-		);
 	};
 
 	type PermissionRulesAction = "edit" | "list" | "reset";
@@ -2613,7 +2614,6 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		syncScopedClassifierModels(ctx);
 		const selected = findAvailableClassifierModel(availableClassifierModels, classifierModel);
 		return {
-			gateOff: gateOff === true,
 			autoModeEnabled,
 			classifierModel: formatClassifierModelLabel(classifierModel, selected, classifierThinkingLevel),
 			classifierModelOptions: getPermissionSettingsModelOptions(),
@@ -2632,7 +2632,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 	const handlePermissionSettingsAction = async (action: PermissionSettingsAction, ctx: ExtensionContext): Promise<void> => {
 		switch (action.type) {
 			case "gate":
-				setGate(ctx, action.value); return;
+				await setGate(ctx, action.value); return;
 			case "production-patterns":
 				await handleAutoModeSettingsCommand("production", ctx); return;
 			case "approval-wait":
@@ -2641,9 +2641,6 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				await handleAutoModeSettingsCommand("grants", ctx); return;
 			case "statistics":
 				await handleAutoModeSettingsCommand("statistics", ctx); return;
-			case "auto-mode":
-				await handleAutoModeSettingsCommand(action.value, ctx);
-				return;
 			case "classifier-model":
 				await handleClassifierModelCommand(action.value, ctx);
 				return;
@@ -2707,15 +2704,15 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 	});
 
 	pi.registerCommand(GATE_COMMAND, {
-		description: "Turn the permission gate fully on or off for this pi process: /permission-gate on|off|status",
+		description: "Turn the permission gate on or off globally: /permission-gate on|off|status",
 		getArgumentCompletions: (prefix) =>
 			["on", "off", "status"].filter((v) => v.startsWith(prefix.trim().toLowerCase())).map((v) => ({ value: v, label: v })),
 		handler: async (args, ctx) => {
 			const action = String(args ?? "").trim().toLowerCase();
 			if (action === "on" || action === "off") {
-				setGate(ctx, action);
+				await setGate(ctx, action);
 			} else if (!action || action === "status") {
-				notify(ctx, `Permission gate: ${gateOff ? "OFF" : "ON"}.`, "info");
+				await handleAutoModeSettingsCommand("status", ctx);
 			} else {
 				notify(ctx, "Usage: /permission-gate on|off|status", "warning");
 			}
@@ -2738,14 +2735,16 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 
 	pi.on("session_shutdown", clearSessionApprovals);
 	pi.on("session_start", async (_event, ctx) => {
-		gateOff ??= dependencies.startOff?.() ?? false;
 		clearSessionApprovals();
 		const [restored, loadedRules, loadedPreferences] = await Promise.all([
 			initializeModeState(dependencies, ctx),
 			initializeCommandRules(dependencies, ctx),
 			initializeAutoModePreferences(dependencies, ctx),
 		]);
-		autoModeEnabled = restored.autoModeEnabled;
+		if (!initialized) {
+			autoModeEnabled = dependencies.startOff?.() ? false : restored.autoModeEnabled;
+			initialized = true;
+		}
 		classifierModel = cloneClassifierModelReference(restored.classifierModel);
 		classifierThinkingLevel = restored.classifierThinkingLevel;
 		classifierHistoryMessages = restored.classifierHistoryMessages ?? DEFAULT_CLASSIFIER_HISTORY_MESSAGES;
@@ -2822,6 +2821,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		request: Pick<ApprovalRequest, "kind" | "command" | "risk" | "tldr" | "recommendation" | "reasons" | "model" | "paths" | "pathNotes" | "intentProposal" | "environment">,
 		onLateOutcome: (outcome: ApprovalOutcome, shownAt: number) => void,
 	): Promise<HumanDecision> => {
+		if (ctx.signal?.aborted) return Promise.resolve({ approved: false, cancelled: true });
 		const requester = ctx.hasUI ? getApprovalRequester() : undefined;
 		if (!ctx.hasUI) return Promise.resolve({ approved: false, unavailable: true, scope: "once", recommendation: request.recommendation });
 
@@ -2971,10 +2971,12 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			.filter(Boolean)
 			.join(" ");
 
-	pi.on("tool_call", async (event, ctx) => {
-		if (gateOff) return undefined;
-		if (event.toolName !== "bash") return undefined;
-
+	const reviewBash = async (
+		event: ToolCallEvent,
+		ctx: ExtensionContext & { signal: AbortSignal },
+		cancelled: () => boolean,
+	) => {
+		const signal = ctx.signal;
 		const command = typeof event.input.command === "string" ? event.input.command : "";
 		const hardReasons = hardDenyReasons(command);
 		const userRule = evaluateUserCommandRules(command, ruleConfig);
@@ -3011,21 +3013,25 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 		}
 
 		// Inspect every invocation, including commands covered by a human grant.
-		if (reasons.length === 0 && !(autoModeEnabled && lockdown)) return undefined;
+		if (reasons.length === 0 && !lockdown) return undefined;
 		for (let review = 0; review < 3; review++) {
 			if (ctx.signal?.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 			const inspection = await inspectCommand(command, ctx.cwd);
+			if (signal.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 			const display = { paths: inspection.paths, pathNotes: inspection.notes };
 			const reviewContext = { cwd: ctx.cwd, signal: ctx.signal, modelRegistry: ctx.modelRegistry, sessionManager: ctx.sessionManager, inspection };
-			const recordReviewed = (entry: DecisionEntry, historyId?: string) => record(ctx, { ...display, ...entry }, historyId);
+			const recordReviewed = (entry: DecisionEntry, historyId?: string) => {
+				if (!cancelled()) record(ctx, { ...display, ...entry }, historyId);
+			};
 			const policy = assessCriticality(command, reasons, { productionPatterns });
-			const locked = autoModeEnabled && lockdown;
+			const locked = lockdown;
 			const snapshot = snapshotKey(inspection);
 			const lateIndex = lateApprovals.findIndex((a) => a.command === command && a.snapshot === snapshot);
 			if (!locked && lateIndex >= 0) {
 				// Consume before an await so concurrent calls cannot use one approval twice.
 				const [approval] = lateApprovals.splice(lateIndex, 1);
 				if (!(await inspectionIsFresh(inspection))) continue;
+				if (signal.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 				recordReviewed({ command: preview(command), reasons, status: "approved", source: "human",
 					rationale: "The user approved this exact command and inspection snapshot after the short wait.",
 					scope: "once", note: "late approval", via: "browser", recommendation: approval.recommendation,
@@ -3037,6 +3043,7 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				const grant = intentStore.match(gateSessionId, { command, reasons, paths: inspection.paths });
 				if (grant) {
 					if (!(await inspectionIsFresh(inspection))) continue;
+					if (signal.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 					recordReviewed({ command: preview(command), reasons, status: "approved", source: "intent-grant",
 						rationale: `Covered by your session intent: ${grant.label}`, scope: "intent", grantId: grant.id, timestamp: now() });
 					registerApproval();
@@ -3049,10 +3056,11 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			let model: string | undefined;
 			let rationale = locked
 				? `Lockdown: the agent was blocked ${consecutiveDenials} times in a row. Review this command before it runs.`
-				: `Needs confirmation: ${reasons.join(", ")}. Auto mode is off; review the command and its effects.`;
+				: `Review the command and its effects: ${reasons.join(", ")}.`;
 			let failed = false;
-			if (autoModeEnabled && !locked) {
+			if (!locked) {
 				await refreshAutoModePreferences(ctx);
+				if (signal.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 				const result = await classifyWithModel(command, reasons, reviewContext, dependencies,
 					classifierModel, classifierThinkingLevel, autoModePreferences, classifierHistoryMessages, policy.critical);
 				failed = Boolean(result.failed);
@@ -3066,15 +3074,13 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 					return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 				}
 				if (!(await inspectionIsFresh(inspection))) continue;
+				if (signal.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 				if (!failed && result.decision === "allow" && risk !== "critical") {
 					recordReviewed({ command: preview(command), reasons, status: "approved", source: "auto-model",
 						rationale, model, risk, recommendation, timestamp: now() });
 					registerApproval();
 					return undefined;
 				}
-			}
-			if (!ctx.hasUI && !autoModeEnabled) {
-				return { block: true, reason: `Potentially dangerous command blocked/needs confirmation: ${reasons.join(", ")} (no UI for confirmation)` };
 			}
 			const proposal = !locked && !policy.critical && risk !== "critical" && !reasons.includes(CLASSIFIER_REQUIRED_REASON)
 				? proposeIntent({ command, cwd: ctx.cwd, grantableReasons: policy.grantableReasons, paths: inspection.paths })
@@ -3100,8 +3106,10 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 				command, risk, tldr: failed ? `${rationale} Please review the command yourself.` : rationale,
 				recommendation, reasons: reasons.length ? reasons : ["lockdown"], model,
 				intentProposal: proposal, environment: policy.environment }, onLateOutcome);
-			if (human.approved && !(await inspectionIsFresh(inspection))) continue;
 			if (ctx.signal?.aborted || human.cancelled || generation !== sessionGeneration)
+				return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
+			if (human.approved && !(await inspectionIsFresh(inspection))) continue;
+			if (ctx.signal?.aborted || generation !== sessionGeneration)
 				return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 
 			let grantId: string | undefined;
@@ -3131,16 +3139,40 @@ export function createPermissionGate(pi: ExtensionAPI, dependencies: PermissionG
 			}
 			if (status === "redirected") return { block: true, reason: `The user redirected you: ${human.note}. Follow this instruction instead of running the command.` };
 			if (status === "expired") return { block: true, reason: human.note ?? "The user is away; continue with other work or end the turn and ask in plain text." };
-			if (!autoModeEnabled) return { block: true, reason: "Blocked by user" };
 			const started = locked ? false : registerDenial(ctx);
 			return { block: true, reason: denialMessage(human.unavailable
 				? `no approver was reachable (${reasons.join(", ")})`
 				: locked ? "lockdown is active" : `the user did not approve this action (${reasons.join(", ")})`, human.note, started) };
 		}
+		if (signal.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 		const rationale = "Inspected files kept changing during review; the command was not run.";
-		record(ctx, { command: preview(command), reasons, status: "blocked", source: autoModeEnabled ? "auto-model" : "human", rationale, timestamp: now() });
+		record(ctx, { command: preview(command), reasons, status: "blocked", source: "auto-model", rationale, timestamp: now() });
 		const started = registerDenial(ctx);
 		return { block: true, reason: `${rationale} ${NO_RETRY_NOTICE}${started ? " Every command now needs the user's approval." : ""}` };
+	};
+
+	pi.on("tool_call", async (event, outerContext) => {
+		if (!autoModeEnabled || event.toolName !== "bash") return undefined;
+		const controller = new AbortController();
+		activeReviews.add(controller);
+		const signal = outerContext.signal
+			? AbortSignal.any([outerContext.signal, controller.signal]) : controller.signal;
+		const ctx: ExtensionContext & { signal: AbortSignal } = { ...outerContext, signal };
+		const disabled = () => controller.signal.reason === disabledReason;
+
+		let onDisabled: () => void = () => {};
+		const cancelled = new Promise<undefined>((resolve) => {
+			onDisabled = () => resolve(undefined);
+			controller.signal.addEventListener("abort", onDisabled, { once: true });
+		});
+		try {
+			const result = await Promise.race([reviewBash(event, ctx, () => controller.signal.aborted), cancelled]);
+			return disabled() ? undefined : signal.aborted
+				? { block: true, reason: "Blocked by the permission gate: the request was cancelled." } : result;
+		} finally {
+			controller.signal.removeEventListener("abort", onDisabled);
+			activeReviews.delete(controller);
+		}
 	});
 }
 
