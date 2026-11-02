@@ -4,13 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import {
-	buildAutoModePrompt,
-	createPermissionGate,
-	hardDenyReasons,
-	matchedReasons,
-	parseAutoModeDecision,
-} from "../src/index.ts";
+import { createPermissionGate } from "../src/gate.ts";
+import { hardDenyReasons, matchedReasons } from "../src/risk-patterns.ts";
+import { buildAutoModePrompt, parseAutoModeDecision } from "../src/classifier-prompt.ts";
 
 test("user command patterns match regex metacharacters literally", () => {
 	const rules = { allowedCommands: ["npx foo.bar+baz"], disallowedCommands: [] };
