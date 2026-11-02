@@ -5,13 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
-	codeReviewReasons,
 	groupPaths,
 	INSPECTION_LIMITS,
 	inspectCommand,
 	inspectionIsFresh,
 	inspectionPrompt,
 } from "../src/command-inspection.ts";
+import { codeReviewReasons } from "../src/shell-words.ts";
 
 async function project(t, files) {
 	const dir = await mkdtemp(join(tmpdir(), "gate-inspection-"));

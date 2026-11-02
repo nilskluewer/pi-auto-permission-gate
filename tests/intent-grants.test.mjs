@@ -1,13 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-	commandAccess,
-	commandExecutables,
-	createIntentStore,
-	grantCovers,
-	isNarrowerOrEqual,
-	proposeIntent,
-} from "../src/intent-grants.ts";
+import { commandAccess, commandExecutables } from "../src/command-access.ts";
+import { createIntentStore, grantCovers, isNarrowerOrEqual, proposeIntent } from "../src/intent-grants.ts";
 
 const entry = (path, role = "file") => ({ path, role });
 const proposal = {

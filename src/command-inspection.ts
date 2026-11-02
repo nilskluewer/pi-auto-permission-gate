@@ -14,8 +14,6 @@ import {
 	shellWords,
 } from "./shell-words.ts";
 
-export { codeReviewReasons, shellWords } from "./shell-words.ts";
-
 export interface InspectedPath {
 	path: string;
 	role: string;

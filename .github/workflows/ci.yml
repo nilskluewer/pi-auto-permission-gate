@@ -22,7 +22,7 @@ jobs:
       - name: Install Pi
         run: npm install -g @earendil-works/pi-coding-agent@latest
       - run: npm ci
-      - name: Typecheck, lint, and test
-        run: npm run lint && npm test
+      - name: Typecheck, lint, file size, and test
+        run: npm run check
       - name: Smoke test (load the packed tarball in Pi)
         run: npm run smoke

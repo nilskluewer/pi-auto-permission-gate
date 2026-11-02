@@ -4,8 +4,6 @@ import { dirname, resolve, sep } from "node:path";
 import { commandAccess, commandExecutables } from "./command-access.ts";
 import type { InspectedPath } from "./command-inspection.ts";
 
-export { commandAccess, commandExecutables } from "./command-access.ts";
-
 export interface IntentProposal {
 	label: string;
 	access: "read" | "write";
