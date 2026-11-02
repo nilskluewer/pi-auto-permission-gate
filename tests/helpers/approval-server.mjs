@@ -169,5 +169,4 @@ const intentProposal = {
 	targets: ["exec:cat", "path:/tmp/demo/"],
 };
 
-
-export { SERVER, APPROVER, tmpRoot, sleep, entry, spawnServer, startServer, openSse, rawStatus, intentProposal };
+export { APPROVER, entry, intentProposal, openSse, rawStatus, SERVER, sleep, spawnServer, startServer, tmpRoot };

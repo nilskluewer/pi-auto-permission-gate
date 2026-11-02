@@ -94,8 +94,8 @@ test("page provides native collapsible paths, project, and execution summary lab
 			"Project",
 		])
 			assert.ok(html.includes(label), label);
-		assert.ok(html.includes("h('details', 'path-details')"));
-		assert.ok(html.includes("h('summary'"));
+		assert.ok(html.includes('h("details", "path-details")'));
+		assert.ok(html.includes('h("summary"'));
 		assert.ok(!html.includes("innerHTML ="), "path metadata must not be injected as HTML");
 	} finally {
 		await s.stop();

@@ -1,16 +1,16 @@
-import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	classifierModelDisplayId,
 	findAvailableClassifierModel,
 	formatClassifierThinkingLevel,
 } from "./classifier-models.ts";
 import { DECISION_ENTRY_TYPE, MODE_ENTRY_TYPE, STATUS_ID } from "./constants.ts";
-import {
-	type AvailableClassifierModel,
-	type ClassifierModelReference,
-	type ClassifierThinkingLevel,
-	type DecisionEntry,
-	type ModeState,
+import type {
+	AvailableClassifierModel,
+	ClassifierModelReference,
+	ClassifierThinkingLevel,
+	DecisionEntry,
+	ModeState,
 } from "./types.ts";
 
 export function recordDecision(pi: ExtensionAPI, entry: DecisionEntry): void {

@@ -1,7 +1,7 @@
-import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { type AutocompleteItem } from "@earendil-works/pi-tui";
-import { type inspectCommand } from "./command-inspection.ts";
-import { type CLASSIFIER_THINKING_LEVELS } from "./constants.ts";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import type { inspectCommand } from "./command-inspection.ts";
+import type { CLASSIFIER_THINKING_LEVELS } from "./constants.ts";
 
 export type IntentProposal = { label: string; access: "read" | "write"; reasons: string[]; targets: string[] };
 export type DecisionMeasurements = {

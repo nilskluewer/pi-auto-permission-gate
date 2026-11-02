@@ -1,5 +1,5 @@
 import { DAY_MS, HISTORY_RATE_LIMIT, HISTORY_RATE_WINDOW_MS, HISTORY_SNAPSHOT, MAX_WAIT_MS } from "./config.mjs";
-import { HttpError, SECURITY_HEADERS, readJson, sendJson, tokenOk } from "./http.mjs";
+import { HttpError, readJson, SECURITY_HEADERS, sendJson, tokenOk } from "./http.mjs";
 
 /**
  * @param {import('./types.mjs').Runtime} runtime
@@ -25,7 +25,8 @@ export function createRouter(
 	version,
 	shutdown,
 ) {
-	const { requests, pendingList, publicRequest, result, broadcast, resolveRequest, createRequest, decide, isPending } = queue;
+	const { requests, pendingList, publicRequest, result, broadcast, resolveRequest, createRequest, decide, isPending } =
+		queue;
 	const { history, newestFirst, normalizeEntry, rewriteHistoryFile, addHistory } = historyStore;
 	/** @type {number[]} */
 	let historyCalls = [];

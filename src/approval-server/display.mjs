@@ -1,4 +1,4 @@
-import { HttpError, clip } from "./http.mjs";
+import { clip, HttpError } from "./http.mjs";
 /** @type {(keyof import('./types.mjs').Body)[]} */
 export const REQUIRED_STRINGS = ["sessionId", "sessionLabel", "cwd", "command", "tldr"];
 // Only display metadata crosses this boundary. Never accept source/file contents.
@@ -64,4 +64,3 @@ export function normalizeIntent(value) {
 		targets: value.targets.slice(0, 32).map((v) => clip(v, 4096)),
 	};
 }
-

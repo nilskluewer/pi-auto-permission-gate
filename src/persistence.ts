@@ -25,7 +25,7 @@ import { DEFAULT_PRODUCTION_PATTERNS } from "./criticality.ts";
 import { notify } from "./gate-display.ts";
 import { dangerousPatterns, hardDenyPatterns } from "./risk-patterns.ts";
 import { truncate, unique } from "./text.ts";
-import { type CommandRuleConfig, type ModeState, type PermissionGateDependencies } from "./types.ts";
+import type { CommandRuleConfig, ModeState, PermissionGateDependencies } from "./types.ts";
 
 function parseClassifierHistoryMessages(value: unknown): number | undefined {
 	if (typeof value !== "number" || !Number.isInteger(value)) return undefined;
@@ -105,7 +105,10 @@ async function saveConfiguredModeState(dependencies: PermissionGateDependencies,
 	await saver(state);
 }
 
-export async function persistGlobalModeState(dependencies: PermissionGateDependencies, state: ModeState): Promise<boolean> {
+export async function persistGlobalModeState(
+	dependencies: PermissionGateDependencies,
+	state: ModeState,
+): Promise<boolean> {
 	try {
 		await saveConfiguredModeState(dependencies, state);
 		return true;

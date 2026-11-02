@@ -116,7 +116,7 @@ body { margin: 0; color: var(--text); font: 15px/1.5 system-ui, -apple-system, "
 .wrap { max-width: 860px; margin: 0 auto; padding: 0 20px 64px; }
 .sticky { position: sticky; top: 0; background: var(--bg); z-index: 5; margin-bottom: 20px; }
 header { display: flex; align-items: center; gap: 12px; padding: 22px 0 14px; }
-[hidden] { display: none !important; }
+[hidden] { display: none; }
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); }
 .tab { background: none; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; color: var(--muted); font: inherit; font-size: 14px; font-weight: 600; padding: 8px 14px; cursor: pointer; border-radius: 0; }
 .tab:hover { color: var(--text); }
@@ -160,7 +160,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .field input, .field textarea, .field select { width: 100%; min-width: 0; border: 1px solid var(--line-strong); background: var(--card-cmd); color: var(--text); padding: 8px 10px; font: inherit; border-radius: 0; }
 .field textarea { resize: vertical; font: 12px/1.6 var(--mono); min-height: 100px; }
 .note-field { margin-bottom: 10px; }
-.note-field .note { flex: none; width: 100%; }
 .intent-session { margin: 0 0 12px; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 .time { margin-left: auto; color: var(--muted); font-size: 12.5px; white-space: nowrap; }
 .tldr { font-size: 15px; line-height: 1.6; font-weight: 400; color: var(--text); margin: 0 0 14px; overflow-wrap: anywhere; }
@@ -192,6 +191,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .note { flex: 1 1 200px; min-width: 160px; height: 36px; background: var(--card-cmd); color: var(--text); border: 1px solid var(--line); border-radius: 0; padding: 0 10px; font: inherit; font-size: 13.5px; }
 .note::placeholder { color: var(--muted); opacity: 0.75; }
+.note-field .note { flex: none; width: 100%; }
 .btn { height: 36px; padding: 0 16px; border-radius: 0; border: 1px solid var(--line); background: var(--card-2); color: var(--text); font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; }
 .btn:hover:not(:disabled) { border-color: var(--line-strong); background: var(--card); }
 .btn.primary { background: var(--green-btn); border-color: var(--green-border); color: var(--green-btn-text); }
@@ -204,7 +204,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .badge.b-critical { background: var(--red); color: #361010; }
 .cmd-text.scroll { max-height: 24em; overflow: auto; }
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 8px; }
-.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 0; overflow: hidden; }
+.seg { display: inline-flex; margin: 0; padding: 0; min-width: 0; border: 1px solid var(--line); border-radius: 0; overflow: hidden; }
 .seg button { background: var(--card); color: var(--muted); border: 0; border-right: 1px solid var(--line); font: inherit; font-size: 13px; font-weight: 600; height: 32px; padding: 0 14px; cursor: pointer; border-radius: 0; }
 .seg button:last-child { border-right: 0; }
 .seg button:hover { color: var(--text); }

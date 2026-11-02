@@ -1,10 +1,10 @@
-import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildAutoModePrompt } from "./classifier-prompt.ts";
 import { getAutoModePreferencesPath } from "./config-paths.ts";
 import { AUTO_MODE_SETTINGS_COMMAND } from "./constants.ts";
 import { persistAutoModePreferences, refreshAutoModePreferences } from "./gate-controls.ts";
 import { notify } from "./gate-display.ts";
-import { type GateState } from "./gate-state.ts";
+import type { GateState } from "./gate-state.ts";
 import { appendAutoModePreference } from "./persistence.ts";
 
 export async function handleAutoModePromptCommand(gate: GateState, ctx: ExtensionContext): Promise<void> {
@@ -17,7 +17,11 @@ export async function handleAutoModePromptCommand(gate: GateState, ctx: Extensio
 	notify(ctx, prompt, "info");
 }
 
-export async function handleAutoModePreferencesCommand(gate: GateState, args: string, ctx: ExtensionContext): Promise<void> {
+export async function handleAutoModePreferencesCommand(
+	gate: GateState,
+	args: string,
+	ctx: ExtensionContext,
+): Promise<void> {
 	await refreshAutoModePreferences(gate, ctx);
 	const rawValue = String(args ?? "").trim();
 	if (!rawValue) {

@@ -1,4 +1,4 @@
-import { type BashToolCallEvent, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { BashToolCallEvent, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { classifyWithModel } from "./classifier.ts";
 import { inspectCommand, inspectionIsFresh, inspectionPrompt } from "./command-inspection.ts";
 import { evaluateUserCommandRules } from "./command-rules.ts";
@@ -7,18 +7,12 @@ import { assessCriticality } from "./criticality.ts";
 import { refreshAutoModePreferences } from "./gate-controls.ts";
 import { notify } from "./gate-display.ts";
 import { record } from "./gate-history.ts";
-import { type GateState } from "./gate-state.ts";
+import type { GateState } from "./gate-state.ts";
 import { askHuman } from "./human-approval.ts";
 import { isNarrowerOrEqual, proposeIntent } from "./intent-grants.ts";
 import { CLASSIFIER_REQUIRED_REASON, hardDenyReasons, matchedReasons } from "./risk-patterns.ts";
 import { preview, unique } from "./text.ts";
-import {
-	type ApprovalOutcome,
-	type ApprovalRequest,
-	type ApprovalRisk,
-	type CommandInspection,
-	type DecisionEntry,
-} from "./types.ts";
+import type { ApprovalOutcome, ApprovalRequest, ApprovalRisk, CommandInspection, DecisionEntry } from "./types.ts";
 
 function snapshotKey(inspection: CommandInspection): string {
 	return JSON.stringify([inspectionPrompt(inspection), [...inspection.fingerprints]]);
@@ -28,7 +22,8 @@ function registerDenial(gate: GateState, ctx: ExtensionContext): boolean {
 	if (!gate.autoModeEnabled) return false;
 	gate.consecutiveDenials += 1;
 	gate.totalDenials += 1;
-	if (gate.lockdown || (gate.consecutiveDenials < MAX_CONSECUTIVE_DENIALS && gate.totalDenials < MAX_TOTAL_DENIALS)) return false;
+	if (gate.lockdown || (gate.consecutiveDenials < MAX_CONSECUTIVE_DENIALS && gate.totalDenials < MAX_TOTAL_DENIALS))
+		return false;
 	gate.lockdown = true;
 	notify(
 		ctx,
@@ -56,7 +51,8 @@ function denialMessage(what: string, note: string | undefined, lockdownStarted: 
 		.join(" ");
 }
 
-export async function reviewBash(gate: GateState,
+export async function reviewBash(
+	gate: GateState,
 	event: BashToolCallEvent,
 	ctx: ExtensionContext & { signal: AbortSignal },
 	cancelled: () => boolean,
@@ -129,8 +125,7 @@ export async function reviewBash(gate: GateState,
 			// Consume before an await so concurrent calls cannot use one approval twice.
 			const [approval] = gate.lateApprovals.splice(lateIndex, 1);
 			if (!(await inspectionIsFresh(inspection))) continue;
-			if (signal.aborted)
-				return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
+			if (signal.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 			recordReviewed(
 				{
 					command: preview(command),
@@ -181,8 +176,7 @@ export async function reviewBash(gate: GateState,
 		let failed = false;
 		if (!locked) {
 			await refreshAutoModePreferences(gate, ctx);
-			if (signal.aborted)
-				return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
+			if (signal.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 			const result = await classifyWithModel(
 				command,
 				reasons,
@@ -213,8 +207,7 @@ export async function reviewBash(gate: GateState,
 				return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 			}
 			if (!(await inspectionIsFresh(inspection))) continue;
-			if (signal.aborted)
-				return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
+			if (signal.aborted) return { block: true, reason: "Blocked by the permission gate: the request was cancelled." };
 			if (!failed && result.decision === "allow" && risk !== "critical") {
 				recordReviewed({
 					command: preview(command),
@@ -262,7 +255,8 @@ export async function reviewBash(gate: GateState,
 				{ triggerTurn: true, deliverAs: "followUp" },
 			);
 		};
-		const human = await askHuman(gate, 
+		const human = await askHuman(
+			gate,
 			ctx,
 			{
 				...display,

@@ -18,4 +18,3 @@ export const HISTORY_SNAPSHOT = 200;
 export const HISTORY_RATE_LIMIT = 200;
 export const HISTORY_RATE_WINDOW_MS = 10_000;
 export const DAY_MS = 24 * 60 * 60 * 1000;
-

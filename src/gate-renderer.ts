@@ -1,7 +1,7 @@
 import { Text } from "@earendil-works/pi-tui";
 import { DECISION_ENTRY_TYPE } from "./constants.ts";
-import { type GateState } from "./gate-state.ts";
-import { type DecisionEntry } from "./types.ts";
+import type { GateState } from "./gate-state.ts";
+import type { DecisionEntry } from "./types.ts";
 
 export function registerDecisionRenderer(gate: GateState): void {
 	gate.pi.registerEntryRenderer(DECISION_ENTRY_TYPE, (entry, { expanded }, theme) => {
@@ -46,5 +46,4 @@ export function registerDecisionRenderer(gate: GateState): void {
 		if (expanded && data.model) lines.push(theme.fg("dim", `Model: ${data.model}`));
 		return new Text(lines.join("\n"), 0, 0);
 	});
-
 }

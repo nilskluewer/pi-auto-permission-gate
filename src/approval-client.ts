@@ -1,17 +1,11 @@
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import {
-	type ApprovalOutcome,
-	type ApprovalRequester,
-	type HistoryReporter,
-	type IntentProposal,
-	type QueueState,
-} from "./types.ts";
+import { approvalServerVersion } from "./approval-server/version.mjs";
+import type { ApprovalOutcome, ApprovalRequester, HistoryReporter, IntentProposal, QueueState } from "./types.ts";
 
 // Client for the shared approval queue (approval-server/server.mjs). One local server serves all
 // pi sessions, so the user watches one browser tab. Every failure returns undefined so the
@@ -68,12 +62,15 @@ async function isQueueHealthy(state: QueueState): Promise<boolean> {
 	return (await queueVersion(state)) !== undefined;
 }
 
-let expectedServerVersion: Promise<string | undefined> | undefined;
-function serverFileVersion(): Promise<string | undefined> {
-	// Hash the file on disk, so an update replaces a server that still runs old code.
-	expectedServerVersion ??= readFile(SERVER_PATH)
-		.then((bytes) => createHash("sha256").update(bytes).digest("hex"))
-		.catch(() => undefined);
+let expectedServerVersion: string | undefined;
+function serverFileVersion(): string | undefined {
+	// Hash the files on disk, so an update replaces a server that still runs old code.
+	try {
+		expectedServerVersion ??= approvalServerVersion();
+	} catch {
+		// Unreadable server files: keep any running server instead of failing the request.
+		return undefined;
+	}
 	return expectedServerVersion;
 }
 
@@ -100,7 +97,7 @@ async function ensureQueueServer(statePath: string): Promise<QueueState | undefi
 	const existing = await readQueueState(statePath);
 	if (existing) {
 		const running = await queueVersion(existing);
-		const expected = await serverFileVersion();
+		const expected = serverFileVersion();
 		if (running !== undefined && (!expected || running === expected)) return existing;
 		if (running !== undefined) await stopQueueServer(existing);
 	}

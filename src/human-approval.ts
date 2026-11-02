@@ -1,12 +1,12 @@
 import { basename, join } from "node:path";
-import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createApprovalRequester } from "./approval-client.ts";
 import { formatPaths } from "./command-inspection.ts";
 import { getAgentConfigDirectory } from "./config-paths.ts";
 import { APPROVAL_STATE_FILENAME, LATE_ANSWER_WINDOW_MS } from "./constants.ts";
-import { type GateState } from "./gate-state.ts";
+import type { GateState } from "./gate-state.ts";
 import { preview } from "./text.ts";
-import { type ApprovalOutcome, type ApprovalRequest, type ApprovalRequester, type HumanDecision } from "./types.ts";
+import type { ApprovalOutcome, ApprovalRequest, ApprovalRequester, HumanDecision } from "./types.ts";
 
 function getApprovalRequester(gate: GateState): ApprovalRequester | undefined {
 	if (gate.dependencies.requestApproval) return gate.dependencies.requestApproval;
@@ -19,7 +19,8 @@ function getApprovalRequester(gate: GateState): ApprovalRequester | undefined {
 // The first answer wins and cancels the other. Without any reachable approver the result is
 // "unavailable", which the caller treats as a block.
 
-export function askHuman(gate: GateState,
+export function askHuman(
+	gate: GateState,
 	ctx: ExtensionContext,
 	request: Pick<
 		ApprovalRequest,
@@ -75,7 +76,9 @@ export function askHuman(gate: GateState,
 			resolve({
 				...decision,
 				shownAt,
-				...(decision.status === "expired" || decision.unavailable || decision.cancelled ? {} : { answeredAt: gate.now() }),
+				...(decision.status === "expired" || decision.unavailable || decision.cancelled
+					? {}
+					: { answeredAt: gate.now() }),
 				scope: decision.scope ?? "once",
 				recommendation: request.recommendation,
 			});
@@ -167,9 +170,7 @@ export function askHuman(gate: GateState,
 		}
 
 		answerers++;
-		const intentOption = request.intentProposal
-			? `Yes, for this session: ${request.intentProposal.label}`
-			: undefined;
+		const intentOption = request.intentProposal ? `Yes, for this session: ${request.intentProposal.label}` : undefined;
 		const options = [
 			"No",
 			"Yes",

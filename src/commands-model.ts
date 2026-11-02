@@ -1,4 +1,4 @@
-import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	classifierModelDisplayId,
 	cloneClassifierModelReference,
@@ -28,10 +28,14 @@ import {
 	syncScopedClassifierModels,
 } from "./gate-controls.ts";
 import { notify } from "./gate-display.ts";
-import { type GateState } from "./gate-state.ts";
-import { type AvailableClassifierModel } from "./types.ts";
+import type { GateState } from "./gate-state.ts";
+import type { AvailableClassifierModel } from "./types.ts";
 
-export async function handleClassifierModelCommand(gate: GateState, args: string, ctx: ExtensionContext): Promise<void> {
+export async function handleClassifierModelCommand(
+	gate: GateState,
+	args: string,
+	ctx: ExtensionContext,
+): Promise<void> {
 	const parts = String(args ?? "")
 		.trim()
 		.split(/\s+/)
@@ -57,8 +61,7 @@ export async function handleClassifierModelCommand(gate: GateState, args: string
 		const choice = await ctx.ui.select("Select the auto-mode classifier model:", choices);
 		if (!choice) return;
 		const selectedIndex = choices.indexOf(choice);
-		const selected =
-			selectedIndex >= 0 ? models[selectedIndex] : models.find((model) => model.canonicalId === choice);
+		const selected = selectedIndex >= 0 ? models[selectedIndex] : models.find((model) => model.canonicalId === choice);
 		if (!selected) {
 			notify(ctx, "Permission gate: the selected classifier model is no longer available.", "warning");
 			return;
@@ -97,11 +100,7 @@ export async function handleClassifierModelCommand(gate: GateState, args: string
 	try {
 		models = await refreshAvailableClassifierModels(gate, ctx);
 	} catch {
-		notify(
-			ctx,
-			"Permission gate could not discover classifier models after refreshing Pi's model registry.",
-			"error",
-		);
+		notify(ctx, "Permission gate could not discover classifier models after refreshing Pi's model registry.", "error");
 		return;
 	}
 	const selected = models.find((model) => model.canonicalId === modelArgument);
@@ -123,7 +122,11 @@ export async function handleClassifierModelCommand(gate: GateState, args: string
 	);
 }
 
-export async function handleClassifierThinkingCommand(gate: GateState, args: string, ctx: ExtensionContext): Promise<void> {
+export async function handleClassifierThinkingCommand(
+	gate: GateState,
+	args: string,
+	ctx: ExtensionContext,
+): Promise<void> {
 	const parts = String(args ?? "")
 		.trim()
 		.split(/\s+/)
@@ -193,7 +196,11 @@ export async function handleClassifierThinkingCommand(gate: GateState, args: str
 	);
 }
 
-export async function handleClassifierHistoryCommand(gate: GateState, args: string, ctx: ExtensionContext): Promise<void> {
+export async function handleClassifierHistoryCommand(
+	gate: GateState,
+	args: string,
+	ctx: ExtensionContext,
+): Promise<void> {
 	const parts = String(args ?? "")
 		.trim()
 		.split(/\s+/)

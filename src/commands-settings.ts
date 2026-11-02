@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { findAvailableClassifierModel, formatClassifierModelLabel } from "./classifier-models.ts";
 import {
 	handleClassifierHistoryCommand,
@@ -12,10 +12,14 @@ import { APPROVAL_WAIT_CHOICES, AUTO_MODE_SETTINGS_COMMAND } from "./constants.t
 import { formatFatigueSummary, readSessionDecisions, summarizeDecisions } from "./fatigue-summary.ts";
 import { persistMode, refreshStatus, setGate, syncAvailableClassifierModels } from "./gate-controls.ts";
 import { notify } from "./gate-display.ts";
-import { type GateState } from "./gate-state.ts";
+import type { GateState } from "./gate-state.ts";
 import { unique } from "./text.ts";
 
-export async function handleAutoModeSettingsCommand(gate: GateState, args: string, ctx: ExtensionContext): Promise<void> {
+export async function handleAutoModeSettingsCommand(
+	gate: GateState,
+	args: string,
+	ctx: ExtensionContext,
+): Promise<void> {
 	const rawValue = String(args ?? "").trim();
 	const parts = rawValue.split(/\s+/).filter(Boolean);
 	const first = parts[0]?.toLowerCase() ?? "";

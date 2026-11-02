@@ -1,10 +1,5 @@
 import { DEFAULT_PRODUCTION_PATTERNS } from "./criticality.ts";
-import {
-	type ClassifierModelReference,
-	type ClassifierThinkingLevel,
-	type CommandRuleConfig,
-	type ModeState,
-} from "./types.ts";
+import type { ClassifierModelReference, ClassifierThinkingLevel, CommandRuleConfig, ModeState } from "./types.ts";
 
 export const CLASSIFIER_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export const AUTO_MODE_SETTINGS_COMMAND = "automode-settings";

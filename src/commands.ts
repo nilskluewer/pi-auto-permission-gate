@@ -7,12 +7,13 @@ import { getAgentConfigDirectory } from "./config-paths.ts";
 import { APPROVAL_STATE_FILENAME, AUTO_MODE_SETTINGS_COMMAND, GATE_COMMAND } from "./constants.ts";
 import { setGate } from "./gate-controls.ts";
 import { notify } from "./gate-display.ts";
-import { type GateState } from "./gate-state.ts";
+import type { GateState } from "./gate-state.ts";
 
 export function registerCommands(gate: GateState): void {
 	gate.pi.registerCommand(AUTO_MODE_SETTINGS_COMMAND, {
 		description: "Open permission-gate settings or configure them directly",
-		getArgumentCompletions: (argumentPrefix) => getClassifierModelCompletions(argumentPrefix, gate.scopedClassifierModels),
+		getArgumentCompletions: (argumentPrefix) =>
+			getClassifierModelCompletions(argumentPrefix, gate.scopedClassifierModels),
 		handler: async (args, ctx) => {
 			const value = String(args ?? "").trim();
 			if (!value) {
@@ -60,5 +61,4 @@ export function registerCommands(gate: GateState): void {
 			);
 		},
 	});
-
 }

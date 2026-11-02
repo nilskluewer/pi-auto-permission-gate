@@ -1,4 +1,4 @@
-import { type CommandRuleConfig } from "./types.ts";
+import type { CommandRuleConfig } from "./types.ts";
 
 // User-editable command patterns use shell-style '*' and '?' wildcards.
 // Shell control syntax is never accepted by an allow pattern; hard-deny rules

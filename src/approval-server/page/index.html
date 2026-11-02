@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark light">
 <title>Permission Gate</title>
 <link id="icon" rel="icon" href="data:,">
-<style>{{STYLES}}</style>
+<style>/* STYLES */</style>
 </head>
 <body>
 <div class="wrap">
@@ -31,13 +31,13 @@
   </section>
   <section id="panel-history" role="tabpanel" aria-labelledby="tab-history" hidden>
     <div class="toolbar">
-      <div class="seg" role="group" aria-label="Filter by result">
+      <fieldset class="seg" aria-label="Filter by result">
         <button type="button" data-f="all" aria-pressed="true">All</button>
         <button type="button" data-f="approved" aria-pressed="false">Approved</button>
         <button type="button" data-f="denied" aria-pressed="false">Denied</button>
         <button type="button" data-f="redirected" aria-pressed="false">Redirected</button>
         <button type="button" data-f="expired" aria-pressed="false">Expired</button>
-      </div>
+      </fieldset>
       <input id="search" class="search" type="search" placeholder="Search history" aria-label="Search command, summary, project, paths, session and reasons" autocomplete="off">
     </div>
     <p id="showing" class="showing">Showing 0 of 0</p>
@@ -45,7 +45,7 @@
     <ul id="hlist" class="hlist" hidden></ul>
   </section>
 </div>
-<script>{{SCRIPTS}}</script>
+<script>/* SCRIPTS */</script>
 </body>
 </html>
 

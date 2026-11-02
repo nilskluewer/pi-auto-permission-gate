@@ -1,9 +1,11 @@
 import crypto from "node:crypto";
 import { MAX_BODY } from "./config.mjs";
+
 /** @param {unknown} s */
 const sha = (s) => crypto.createHash("sha256").update(String(s)).digest();
 /** @param {unknown} given @param {string} expected */
-export const tokenOk = (given, expected) => typeof given === "string" && crypto.timingSafeEqual(sha(given), sha(expected));
+export const tokenOk = (given, expected) =>
+	typeof given === "string" && crypto.timingSafeEqual(sha(given), sha(expected));
 /** @param {unknown} v @param {number} n */
 export const clip = (v, n) => String(v).slice(0, n);
 
@@ -69,4 +71,3 @@ export function readJson(req) {
 		req.on("error", reject);
 	});
 }
-

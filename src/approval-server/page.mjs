@@ -6,6 +6,6 @@ export function loadPage() {
 	const read = (name) => fs.readFileSync(new URL(`./page/${name}`, import.meta.url), "utf8");
 	return read("index.html")
 		.trimEnd()
-		.replace("{{STYLES}}", read("styles.css"))
-		.replace("{{SCRIPTS}}", ["cards.js", "history.js", "app.js"].map(read).join("\n"));
+		.replace("/* STYLES */", () => read("styles.css"))
+		.replace("/* SCRIPTS */", () => ["cards.js", "history.js", "app.js"].map(read).join("\n"));
 }

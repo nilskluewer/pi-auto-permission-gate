@@ -1,16 +1,20 @@
-import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { notify } from "./gate-display.ts";
-import { type GateState } from "./gate-state.ts";
+import type { GateState } from "./gate-state.ts";
 import {
 	cloneDefaultCommandRuleConfig,
 	formatCommandRules,
 	parseCommandRuleConfig,
 	saveCommandRules,
 } from "./persistence.ts";
-import { type CommandRuleConfig } from "./types.ts";
+import type { CommandRuleConfig } from "./types.ts";
 
 export type PermissionRulesAction = "edit" | "list" | "reset";
-export async function handlePermissionRulesCommand(gate: GateState, action: PermissionRulesAction, ctx: ExtensionContext): Promise<void> {
+export async function handlePermissionRulesCommand(
+	gate: GateState,
+	action: PermissionRulesAction,
+	ctx: ExtensionContext,
+): Promise<void> {
 	if (action === "list") {
 		notify(ctx, formatCommandRules(gate.ruleConfig, gate.ruleScope), "info");
 		return;

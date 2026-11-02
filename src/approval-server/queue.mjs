@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { DEFAULT_TTL_MS, KEEP_RESOLVED_MS, MAX_PENDING, MAX_TTL_MS, MIN_TTL_MS } from "./config.mjs";
-import { REQUIRED_STRINGS, inspectionDisplay, normalizeIntent } from "./display.mjs";
-import { HttpError, clip, sendJson } from "./http.mjs";
+import { inspectionDisplay, normalizeIntent, REQUIRED_STRINGS } from "./display.mjs";
+import { clip, HttpError, sendJson } from "./http.mjs";
 
 /** @param {Set<import('node:http').ServerResponse>} sseClients @param {(force?: boolean) => void} openBrowser @param {import('./types.mjs').HistoryStore} historyStore @param {import('./types.mjs').Broadcast} broadcast */
 export function createQueue(sseClients, openBrowser, historyStore, broadcast) {
@@ -64,7 +64,8 @@ export function createQueue(sseClients, openBrowser, historyStore, broadcast) {
 
 	/** @param {import('./types.mjs').Body} body */
 	function createRequest(body) {
-		for (const k of REQUIRED_STRINGS) if (typeof body[k] !== "string") throw new HttpError(400, `${k} must be a string`);
+		for (const k of REQUIRED_STRINGS)
+			if (typeof body[k] !== "string") throw new HttpError(400, `${k} must be a string`);
 		if (!["command", "lockdown"].includes(body.kind)) throw new HttpError(400, "bad kind");
 		if (!["low", "medium", "critical"].includes(body.risk)) throw new HttpError(400, "bad risk");
 		if (!["approve", "deny", "review"].includes(body.recommendation)) throw new HttpError(400, "bad recommendation");
@@ -135,8 +136,13 @@ export function createQueue(sseClients, openBrowser, historyStore, broadcast) {
 			addHistory(historyFromRequest(r, status, note, "browser"));
 			return;
 		}
-		if (r.risk === "critical" && body.confirm !== true) throw new HttpError(400, "critical request needs confirm: true");
-		resolveRequest(r, "approved", { note, scope, intent: scope === "intent" ? (edited ?? r.intentProposal) : undefined });
+		if (r.risk === "critical" && body.confirm !== true)
+			throw new HttpError(400, "critical request needs confirm: true");
+		resolveRequest(r, "approved", {
+			note,
+			scope,
+			intent: scope === "intent" ? (edited ?? r.intentProposal) : undefined,
+		});
 		addHistory(historyFromRequest(r, "approved", note, "browser"));
 	}
 

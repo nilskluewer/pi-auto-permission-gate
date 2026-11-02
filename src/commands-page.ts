@@ -1,4 +1,4 @@
-import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	canonicalClassifierModelId,
 	findAvailableClassifierModel,
@@ -27,11 +27,11 @@ import {
 	syncAvailableClassifierModels,
 	syncScopedClassifierModels,
 } from "./gate-controls.ts";
-import { type GateState } from "./gate-state.ts";
+import type { GateState } from "./gate-state.ts";
 import {
+	openPermissionSettings,
 	type PermissionSettingsAction,
 	type PermissionSettingsOption,
-	openPermissionSettings,
 } from "./settings-page.ts";
 
 function getPermissionSettingsModelOptions(gate: GateState): PermissionSettingsOption[] {
@@ -111,7 +111,8 @@ function buildPermissionSettingsView(gate: GateState, ctx: ExtensionContext) {
 	};
 }
 
-async function handlePermissionSettingsAction(gate: GateState,
+async function handlePermissionSettingsAction(
+	gate: GateState,
 	action: PermissionSettingsAction,
 	ctx: ExtensionContext,
 ): Promise<void> {

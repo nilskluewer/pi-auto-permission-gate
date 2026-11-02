@@ -148,4 +148,3 @@ test("open: needs the session token and answers 200 (no browser in tests)", asyn
 		await s.stop();
 	}
 });
-

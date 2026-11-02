@@ -1,13 +1,13 @@
 import { homedir } from "node:os";
 import { basename, dirname, relative, resolve, sep } from "node:path";
 import { commandAccess } from "./command-access.ts";
-import { SHELL_CONTROL_CHARACTERS, evaluateUserCommandRules, splitSimpleSegments } from "./command-rules.ts";
+import { evaluateUserCommandRules, SHELL_CONTROL_CHARACTERS, splitSimpleSegments } from "./command-rules.ts";
 import { getAgentConfigDirectory } from "./config-paths.ts";
 import { DEFAULT_COMMAND_RULE_CONFIG } from "./constants.ts";
 import { isAccessChange } from "./criticality.ts";
 import { codeReviewReasons, shellWords } from "./shell-words.ts";
 import { unique } from "./text.ts";
-import { type CommandRuleConfig, type DangerousPattern } from "./types.ts";
+import type { CommandRuleConfig, DangerousPattern } from "./types.ts";
 
 // Recursive rm always needs the classifier (or the user when auto mode is off):
 // neither user allow patterns nor scoped-deletion shortcuts can skip it.

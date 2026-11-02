@@ -206,9 +206,8 @@ test("page provides intent editing, redirect, parking, and distinct history stat
 			"Expired",
 		])
 			assert.ok(html.includes(label), label);
-		assert.ok(html.includes("es.addEventListener('parked'"));
+		assert.ok(html.includes('es.addEventListener("parked"'));
 	} finally {
 		await s.stop();
 	}
 });
-

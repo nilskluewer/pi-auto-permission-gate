@@ -21,8 +21,8 @@ export function startServer(stateFile) {
 	const { otherInstanceAlive, writeState, removeStateFile } = createStateFile(stateFile);
 	/** @type {import('./types.mjs').Broadcast} */
 	const broadcast = (event, data) => {
-	 const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-	 for (const client of sseClients) client.write(msg);
+		const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+		for (const client of sseClients) client.write(msg);
 	};
 	const historyStore = createHistory(stateFile, broadcast);
 	const openBrowser = createBrowser(runtime, sseClients, approverToken);
@@ -89,7 +89,7 @@ export function startServer(stateFile) {
 		setInterval(
 			() => {
 				if (pendingList().length === 0 && sseClients.size === 0 && Date.now() - runtime.lastActivity >= IDLE_MS)
-				shutdown(0);
+					shutdown(0);
 			},
 			Math.max(50, Math.min(30_000, Math.floor(IDLE_MS / 4))),
 		).unref();

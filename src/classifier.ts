@@ -11,17 +11,17 @@ import {
 } from "./classifier-prompt.ts";
 import { CLASSIFIER_TIMEOUT_MS, DEFAULT_CLASSIFIER_HISTORY_MESSAGES } from "./constants.ts";
 import { truncate } from "./text.ts";
-import {
-	type ApprovalRisk,
-	type ClassifierComplete,
-	type ClassifierContext,
-	type ClassifierModelReference,
-	type ClassifierResponse,
-	type ClassifierThinkingLevel,
-	type CommandInspection,
-	type ParsedAutoDecision,
-	type PermissionGateDependencies,
-	type RegistryModel,
+import type {
+	ApprovalRisk,
+	ClassifierComplete,
+	ClassifierContext,
+	ClassifierModelReference,
+	ClassifierResponse,
+	ClassifierThinkingLevel,
+	CommandInspection,
+	ParsedAutoDecision,
+	PermissionGateDependencies,
+	RegistryModel,
 } from "./types.ts";
 
 function createProviderComplete(provider: unknown): ClassifierComplete {

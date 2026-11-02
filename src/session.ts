@@ -7,7 +7,7 @@ import {
 	syncAvailableClassifierModels,
 	syncScopedClassifierModels,
 } from "./gate-controls.ts";
-import { type GateState } from "./gate-state.ts";
+import type { GateState } from "./gate-state.ts";
 import { initializeAutoModePreferences, initializeCommandRules, initializeModeState } from "./persistence.ts";
 
 export function registerSessionHooks(gate: GateState): void {
@@ -47,5 +47,4 @@ export function registerSessionHooks(gate: GateState): void {
 		syncScopedClassifierModels(gate, ctx);
 		refreshStatus(gate, ctx);
 	});
-
 }

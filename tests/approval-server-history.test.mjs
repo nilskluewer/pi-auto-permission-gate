@@ -249,4 +249,3 @@ test("history: posting does not need a browser and counts as activity", async ()
 	const { code } = await s.child.exited;
 	assert.equal(code, 0);
 });
-

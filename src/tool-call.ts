@@ -1,5 +1,5 @@
 import { type ExtensionContext, isToolCallEventType } from "@earendil-works/pi-coding-agent";
-import { type GateState } from "./gate-state.ts";
+import type { GateState } from "./gate-state.ts";
 import { reviewBash } from "./review.ts";
 
 export function registerToolCallHook(gate: GateState): void {

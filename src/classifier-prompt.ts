@@ -7,7 +7,7 @@ import {
 	MAX_RECENT_MESSAGE_LENGTH,
 } from "./constants.ts";
 import { truncate } from "./text.ts";
-import { type CommandInspection, type ParsedAutoDecision } from "./types.ts";
+import type { CommandInspection, ParsedAutoDecision } from "./types.ts";
 
 const AUTO_MODE_SYSTEM_PROMPT = [
 	"You are the safety classifier for a command execution permission gate.",

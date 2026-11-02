@@ -2,8 +2,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { HISTORY_KEEP, HISTORY_MAX_LINES } from "./config.mjs";
-import { REQUIRED_STRINGS, inspectionDisplay } from "./display.mjs";
-import { HttpError, clip } from "./http.mjs";
+import { inspectionDisplay, REQUIRED_STRINGS } from "./display.mjs";
+import { clip, HttpError } from "./http.mjs";
 
 // History is best-effort: missing files, bad lines, and write failures must not block approvals.
 /** @param {string} stateFile @param {import('./types.mjs').Broadcast} broadcast */
@@ -19,7 +19,8 @@ export function createHistory(stateFile, broadcast) {
 
 	/** @param {import('./types.mjs').Body} body @returns {import('./types.mjs').HistoryFields} */
 	function normalizeEntry(body) {
-		for (const k of REQUIRED_STRINGS) if (typeof body[k] !== "string") throw new HttpError(400, `${k} must be a string`);
+		for (const k of REQUIRED_STRINGS)
+			if (typeof body[k] !== "string") throw new HttpError(400, `${k} must be a string`);
 		if (!["low", "medium", "critical"].includes(body.risk)) throw new HttpError(400, "bad risk");
 		if (body.via !== undefined && !["browser", "terminal"].includes(body.via)) throw new HttpError(400, "bad via");
 		if (!Array.isArray(body.reasons) || body.reasons.some((x) => typeof x !== "string"))

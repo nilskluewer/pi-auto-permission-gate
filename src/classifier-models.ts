@@ -3,15 +3,17 @@ import {
 	CLASSIFIER_THINKING_LEVELS,
 	DEFAULT_CLASSIFIER_HISTORY_MESSAGES,
 } from "./constants.ts";
-import {
-	type AvailableClassifierModel,
-	type ClassifierModelReference,
-	type ClassifierThinkingLevel,
-	type CommandCompletion,
-	type RegistryModel,
+import type {
+	AvailableClassifierModel,
+	ClassifierModelReference,
+	ClassifierThinkingLevel,
+	CommandCompletion,
+	RegistryModel,
 } from "./types.ts";
 
-export function cloneClassifierModelReference(reference: ClassifierModelReference | null): ClassifierModelReference | null {
+export function cloneClassifierModelReference(
+	reference: ClassifierModelReference | null,
+): ClassifierModelReference | null {
 	return reference ? { provider: reference.provider, id: reference.id } : null;
 }
 
@@ -82,7 +84,10 @@ function effectiveClassifierThinkingLevel(
 	return model ? clampClassifierThinkingLevel(model, configured) : "unavailable";
 }
 
-export function formatClassifierThinkingLevel(configured: ClassifierThinkingLevel, model: RegistryModel | undefined): string {
+export function formatClassifierThinkingLevel(
+	configured: ClassifierThinkingLevel,
+	model: RegistryModel | undefined,
+): string {
 	const effective = effectiveClassifierThinkingLevel(model, configured);
 	return configured === effective ? `thinking ${configured}` : `thinking ${configured} -> ${effective}`;
 }
@@ -169,7 +174,10 @@ export function getModelDescription(model: AvailableClassifierModel): string {
 	return `${model.providerDisplayName} - ${model.modelName}`;
 }
 
-export function getClassifierThinkingChoices(model: RegistryModel | undefined, configured: ClassifierThinkingLevel): string[] {
+export function getClassifierThinkingChoices(
+	model: RegistryModel | undefined,
+	configured: ClassifierThinkingLevel,
+): string[] {
 	const supportedLevels = model ? getSupportedClassifierThinkingLevels(model) : [];
 	const levels = model
 		? [...supportedLevels, ...CLASSIFIER_THINKING_LEVELS.filter((level) => !supportedLevels.includes(level))]

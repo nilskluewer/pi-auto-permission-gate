@@ -1,4 +1,4 @@
-import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	cacheAvailableClassifierModels,
 	cacheScopedClassifierModels,
@@ -6,17 +6,23 @@ import {
 } from "./classifier-models.ts";
 import { normalizeAutoModePreferences } from "./classifier-prompt.ts";
 import { notify, persistModeState, setGateStatus } from "./gate-display.ts";
-import { type GateState } from "./gate-state.ts";
+import type { GateState } from "./gate-state.ts";
 import {
 	loadConfiguredAutoModePreferences,
 	persistGlobalModeState,
 	saveConfiguredAutoModePreferences,
 } from "./persistence.ts";
 import { truncate } from "./text.ts";
-import { type AvailableClassifierModel, type ModeState } from "./types.ts";
+import type { AvailableClassifierModel, ModeState } from "./types.ts";
 
 export function refreshStatus(gate: GateState, ctx: ExtensionContext): void {
-	setGateStatus(ctx, gate.autoModeEnabled, gate.classifierModel, gate.classifierThinkingLevel, gate.availableClassifierModels);
+	setGateStatus(
+		ctx,
+		gate.autoModeEnabled,
+		gate.classifierModel,
+		gate.classifierThinkingLevel,
+		gate.availableClassifierModels,
+	);
 }
 
 export function clearSessionApprovals(gate: GateState) {
@@ -29,10 +35,13 @@ export function clearSessionApprovals(gate: GateState) {
 	gate.pendingApprovals.clear();
 }
 
-export async function persistMode(gate: GateState, ctx: {
-	hasUI: boolean;
-	ui: { notify: (message: string, level: "info" | "warning" | "error") => void };
-}) {
+export async function persistMode(
+	gate: GateState,
+	ctx: {
+		hasUI: boolean;
+		ui: { notify: (message: string, level: "info" | "warning" | "error") => void };
+	},
+) {
 	const state: ModeState = {
 		autoModeEnabled: gate.autoModeEnabled,
 		classifierModel: cloneClassifierModelReference(gate.classifierModel),
@@ -67,7 +76,8 @@ export async function setGate(gate: GateState, ctx: ExtensionContext, value: "on
 	);
 }
 
-export async function persistAutoModePreferences(gate: GateState,
+export async function persistAutoModePreferences(
+	gate: GateState,
 	ctx: { hasUI: boolean; ui: { notify: (message: string, level: "info" | "warning" | "error") => void } },
 	nextPreferences: string,
 ): Promise<boolean> {
@@ -82,10 +92,13 @@ export async function persistAutoModePreferences(gate: GateState,
 	}
 }
 
-export async function refreshAutoModePreferences(gate: GateState, ctx: {
-	hasUI: boolean;
-	ui: { notify: (message: string, level: "info" | "warning" | "error") => void };
-}): Promise<void> {
+export async function refreshAutoModePreferences(
+	gate: GateState,
+	ctx: {
+		hasUI: boolean;
+		ui: { notify: (message: string, level: "info" | "warning" | "error") => void };
+	},
+): Promise<void> {
 	// A custom saver without a matching loader is commonly used by embedders and tests.
 	// Keep the in-memory value in that case instead of replacing it with the default disk loader.
 	if (!gate.dependencies.loadAutoModePreferences && gate.dependencies.saveAutoModePreferences) return;
@@ -98,9 +111,12 @@ export async function refreshAutoModePreferences(gate: GateState, ctx: {
 	}
 }
 
-export function syncAvailableClassifierModels(gate: GateState, ctx: {
-	modelRegistry: { getAvailable: () => readonly unknown[]; getProviderDisplayName: (provider: string) => string };
-}): void {
+export function syncAvailableClassifierModels(
+	gate: GateState,
+	ctx: {
+		modelRegistry: { getAvailable: () => readonly unknown[]; getProviderDisplayName: (provider: string) => string };
+	},
+): void {
 	try {
 		gate.availableClassifierModels = cacheAvailableClassifierModels(ctx);
 	} catch {
@@ -108,10 +124,13 @@ export function syncAvailableClassifierModels(gate: GateState, ctx: {
 	}
 }
 
-export function syncScopedClassifierModels(gate: GateState, ctx: {
-	scopedModels: readonly { model: unknown }[];
-	modelRegistry: { getProviderDisplayName: (provider: string) => string };
-}): void {
+export function syncScopedClassifierModels(
+	gate: GateState,
+	ctx: {
+		scopedModels: readonly { model: unknown }[];
+		modelRegistry: { getProviderDisplayName: (provider: string) => string };
+	},
+): void {
 	try {
 		gate.scopedClassifierModels = cacheScopedClassifierModels(ctx);
 	} catch {
@@ -119,13 +138,16 @@ export function syncScopedClassifierModels(gate: GateState, ctx: {
 	}
 }
 
-export async function refreshAvailableClassifierModels(gate: GateState, ctx: {
-	modelRegistry: {
-		refresh: () => Promise<unknown>;
-		getAvailable: () => readonly unknown[];
-		getProviderDisplayName: (provider: string) => string;
-	};
-}): Promise<AvailableClassifierModel[]> {
+export async function refreshAvailableClassifierModels(
+	gate: GateState,
+	ctx: {
+		modelRegistry: {
+			refresh: () => Promise<unknown>;
+			getAvailable: () => readonly unknown[];
+			getProviderDisplayName: (provider: string) => string;
+		};
+	},
+): Promise<AvailableClassifierModel[]> {
 	await ctx.modelRegistry.refresh();
 	gate.availableClassifierModels = cacheAvailableClassifierModels(ctx);
 	return gate.availableClassifierModels;

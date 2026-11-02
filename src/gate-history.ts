@@ -1,13 +1,18 @@
 import { basename, join } from "node:path";
-import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHistoryReporter } from "./approval-client.ts";
 import { getAgentConfigDirectory } from "./config-paths.ts";
 import { APPROVAL_STATE_FILENAME } from "./constants.ts";
 import { recordDecision } from "./gate-display.ts";
-import { type GateState } from "./gate-state.ts";
-import { type DecisionEntry, type HistoryEntry } from "./types.ts";
+import type { GateState } from "./gate-state.ts";
+import type { DecisionEntry, HistoryEntry } from "./types.ts";
 
-function toHistoryEntry(gate: GateState, ctx: ExtensionContext, entry: DecisionEntry, historyId?: string): HistoryEntry {
+function toHistoryEntry(
+	gate: GateState,
+	ctx: ExtensionContext,
+	entry: DecisionEntry,
+	historyId?: string,
+): HistoryEntry {
 	return {
 		...(historyId ? { id: historyId } : {}),
 		sessionId: gate.gateSessionId,

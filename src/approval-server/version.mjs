@@ -18,8 +18,9 @@ export function approvalServerVersion() {
 	const hash = crypto.createHash("sha256");
 	const relativeFiles = files(root).map((file) => path.relative(root, file).split(path.sep).join("/"));
 	for (const relative of relativeFiles.sort()) {
-		hash.update(relative);
+		hash.update(`${relative}\0`);
 		hash.update(fs.readFileSync(path.join(root, relative)));
+		hash.update("\0");
 	}
 	return hash.digest("hex");
 }
