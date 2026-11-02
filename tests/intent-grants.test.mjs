@@ -7,7 +7,7 @@ import {
 	grantCovers,
 	isNarrowerOrEqual,
 	proposeIntent,
-} from "../src/intent-grants.mjs";
+} from "../src/intent-grants.ts";
 
 const entry = (path, role = "file") => ({ path, role });
 const proposal = {

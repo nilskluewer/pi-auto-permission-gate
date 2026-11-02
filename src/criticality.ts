@@ -1,5 +1,14 @@
 import { basename } from "node:path";
-import { shellWords } from "./command-inspection.mjs";
+import { shellWords } from "./shell-words.ts";
+
+export type Environment = "production" | "non-production" | "unknown";
+export interface Criticality {
+	critical: boolean;
+	criticalReasons: string[];
+	grantableReasons: string[];
+	environment?: Environment;
+	accessChange: boolean;
+}
 
 export const DEFAULT_PRODUCTION_PATTERNS = ["prod", "prd", "production"];
 export const NON_PRODUCTION_MARKERS = [
@@ -21,9 +30,9 @@ export const ALWAYS_CRITICAL_REASONS = ["sudo", "disk shred/wipe", "partition ed
 
 const ENVIRONMENT_FLAG = /^--(?:project|project-id|context|namespace|profile|subscription|resource-group)(?:=(.*))?$/;
 
-export function environmentIdentifiers(command) {
+export function environmentIdentifiers(command: string): string[] {
 	const words = shellWords(command.toLowerCase());
-	const identifiers = new Set();
+	const identifiers = new Set<string>();
 	for (let i = 0; i < words.length; i++) {
 		const word = words[i];
 		const flag = ENVIRONMENT_FLAG.exec(word);
@@ -54,7 +63,7 @@ export function environmentIdentifiers(command) {
 	return [...identifiers];
 }
 
-function globExpression(pattern) {
+function globExpression(pattern: string): RegExp {
 	let expression = "";
 	for (const char of pattern) {
 		if (char === "*") expression += ".*";
@@ -64,7 +73,10 @@ function globExpression(pattern) {
 	return new RegExp(`^${expression}$`, "i");
 }
 
-export function classifyEnvironment(command, productionPatterns = DEFAULT_PRODUCTION_PATTERNS) {
+export function classifyEnvironment(
+	command: string,
+	productionPatterns: string[] = DEFAULT_PRODUCTION_PATTERNS,
+): Environment {
 	const values = environmentIdentifiers(command).flatMap((id) => [id, ...id.split(/[-_.:/@]/)]);
 	const production = productionPatterns.map(globExpression);
 	if (values.some((value) => production.some((pattern) => pattern.test(value)))) return "production";
@@ -91,7 +103,7 @@ const GLOBAL_VALUE_FLAGS = new Set([
 	"--verbosity",
 ]);
 
-export function isAccessChange(command) {
+export function isAccessChange(command: string): boolean {
 	const raw = shellWords(command.toLowerCase());
 	if (raw.some((word) => /^(?:set-iam-policy|add-iam-policy-binding|remove-iam-policy-binding)$/.test(word)))
 		return true;
@@ -128,13 +140,17 @@ export function isAccessChange(command) {
 	return /\bkubectl\b[^;&|\n]*\b(?:create|apply)\b[^;&|\n]*\b(?:cluster)?rolebindings?\b/.test(text);
 }
 
-export function assessCriticality(command, reasons, options = {}) {
+export function assessCriticality(
+	command: string,
+	reasons: string[],
+	options: { productionPatterns?: string[] } = {},
+): Criticality {
 	const environment = reasons.includes("cloud or infrastructure change")
 		? classifyEnvironment(command, options.productionPatterns)
 		: undefined;
 	const accessChange = isAccessChange(command);
-	const criticalReasons = [],
-		grantableReasons = [];
+	const criticalReasons: string[] = [],
+		grantableReasons: string[] = [];
 	for (const reason of reasons) {
 		const critical =
 			ALWAYS_CRITICAL_REASONS.includes(reason) ||

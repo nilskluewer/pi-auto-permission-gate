@@ -1,19 +1,61 @@
 import { open, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
-const STATUSES = new Set(["approved", "blocked", "redirected", "expired"]);
-const SOURCES = new Set(["hard-deny", "auto-model", "user-rule", "human", "intent-grant"]);
+interface DecisionRange {
+	from?: number;
+	to?: number;
+}
+interface Decision {
+	[field: string]: unknown;
+	timestamp?: number;
+	source?: unknown;
+	status?: unknown;
+	shownAt?: unknown;
+	answeredAt?: unknown;
+	recommendation?: unknown;
+}
+interface FatigueSummary {
+	total: number;
+	autoApproved: number;
+	autoBlocked: number;
+	hardDenied: number;
+	grantCovered: number;
+	ruleDecisions: number;
+	prompts: number;
+	approved: number;
+	denied: number;
+	redirected: number;
+	expired: number;
+	legacyBlocked: number;
+	activeHours: number;
+	promptsPerActiveHour: number;
+	steerOrDenyRate: number;
+	expiryRate: number;
+	disagreement: number;
+	medianAnswerMs?: number;
+}
+
+const STATUSES = new Set<unknown>(["approved", "blocked", "redirected", "expired"]);
+const SOURCES = new Set<unknown>(["hard-deny", "auto-model", "user-rule", "human", "intent-grant"]);
 const NEW_FIELDS = ["recommendation", "shownAt", "answeredAt", "scope", "grantId", "note"];
 
+function finiteNumber(value: unknown): value is number {
+	return Number.isFinite(value);
+}
+
+function objectRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object";
+}
+
 /** Read root files and files in immediate subfolders. Range bounds are inclusive. */
-export async function readSessionDecisions(sessionsDir, range = {}) {
-	const decisions = [];
-	async function walk(directory, descend) {
+export async function readSessionDecisions(sessionsDir: string, range: DecisionRange = {}): Promise<Decision[]> {
+	const decisions: Decision[] = [];
+	async function walk(directory: string, descend: boolean): Promise<void> {
 		let files;
 		try {
 			files = await readdir(directory, { withFileTypes: true });
 		} catch (error) {
-			if (error.code === "ENOENT") return;
+			if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
 			throw error;
 		}
 		files.sort((a, b) => a.name.localeCompare(b.name));
@@ -26,29 +68,38 @@ export async function readSessionDecisions(sessionsDir, range = {}) {
 			}
 		}
 	}
-	async function readFileDecisions(path) {
+	async function readFileDecisions(path: string): Promise<void> {
 		let handle;
 		try {
 			handle = await open(path, "r");
 			for await (const line of handle.readLines()) {
-				let record;
+				let record: unknown;
 				try {
 					record = JSON.parse(line);
 				} catch {
+					// Session files can contain partial or malformed lines.
 					continue;
 				}
-				if (record?.type !== "custom" || record.customType !== "permission-gate-decision") continue;
-				const data = record.data;
-				if (!data || !STATUSES.has(data.status) || !SOURCES.has(data.source)) continue;
-				const timestamp = data.timestamp ?? Date.parse(record.timestamp);
-				if (!Number.isFinite(timestamp)) continue;
+				if (
+					!record ||
+					typeof record !== "object" ||
+					!("type" in record) ||
+					record.type !== "custom" ||
+					!("customType" in record) ||
+					record.customType !== "permission-gate-decision"
+				)
+					continue;
+				const data = "data" in record ? record.data : undefined;
+				if (!objectRecord(data) || !STATUSES.has(data.status) || !SOURCES.has(data.source)) continue;
+				const timestamp = data.timestamp ?? Date.parse(("timestamp" in record ? record.timestamp : undefined) as string);
+				if (!finiteNumber(timestamp)) continue;
 				if (range.from !== undefined && timestamp < range.from) continue;
 				if (range.to !== undefined && timestamp > range.to) continue;
 				decisions.push({ ...data, timestamp });
 			}
 		} catch (error) {
 			// A session can disappear while the report reads the directory.
-			if (error.code !== "ENOENT") throw error;
+			if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
 		} finally {
 			await handle?.close();
 		}
@@ -58,8 +109,8 @@ export async function readSessionDecisions(sessionsDir, range = {}) {
 }
 
 /** Keep old blocks separate: they do not prove that the user answered. */
-export function summarizeDecisions(entries) {
-	const summary = {
+export function summarizeDecisions(entries: Decision[]): FatigueSummary {
+	const summary: FatigueSummary = {
 		total: entries.length,
 		autoApproved: 0,
 		autoBlocked: 0,
@@ -79,9 +130,9 @@ export function summarizeDecisions(entries) {
 		disagreement: 0,
 	};
 	const hours = new Set();
-	const delays = [];
+	const delays: number[] = [];
 	for (const entry of entries) {
-		if (Number.isFinite(entry.timestamp)) hours.add(Math.floor(entry.timestamp / 3_600_000));
+		if (finiteNumber(entry.timestamp)) hours.add(Math.floor(entry.timestamp / 3_600_000));
 		if (entry.source === "auto-model") {
 			if (entry.status === "approved") summary.autoApproved++;
 			if (entry.status === "blocked") summary.autoBlocked++;
@@ -92,7 +143,7 @@ export function summarizeDecisions(entries) {
 		} else if (entry.source === "user-rule") {
 			summary.ruleDecisions++;
 		}
-		if (Number.isFinite(entry.shownAt) && Number.isFinite(entry.answeredAt) && entry.answeredAt >= entry.shownAt) {
+		if (finiteNumber(entry.shownAt) && finiteNumber(entry.answeredAt) && entry.answeredAt >= entry.shownAt) {
 			delays.push(entry.answeredAt - entry.shownAt);
 		}
 		if (entry.source !== "human") continue;
@@ -105,7 +156,8 @@ export function summarizeDecisions(entries) {
 		}
 		if (entry.status === "redirected") summary.redirected++;
 		if (entry.status === "expired") summary.expired++;
-		const answered = !legacy && ["approved", "blocked", "redirected"].includes(entry.status);
+		const answered =
+			!legacy && (entry.status === "approved" || entry.status === "blocked" || entry.status === "redirected");
 		if (
 			answered &&
 			((entry.recommendation === "approve" && entry.status !== "approved") ||
@@ -126,10 +178,10 @@ export function summarizeDecisions(entries) {
 	return summary;
 }
 
-export function formatFatigueSummary(summary, range = {}) {
-	const percent = (value) => `${(value * 100).toFixed(1)}%`;
+export function formatFatigueSummary(summary: FatigueSummary, range: DecisionRange = {}): string {
+	const percent = (value: number): string => `${(value * 100).toFixed(1)}%`;
 	const answerCount = summary.approved + summary.denied + summary.redirected;
-	const answerRate = (count) => percent(answerCount ? count / answerCount : 0);
+	const answerRate = (count: number): string => percent(answerCount ? count / answerCount : 0);
 	const lines = ["Approval fatigue summary"];
 	if (range.from !== undefined || range.to !== undefined) {
 		const from = range.from === undefined ? "start" : new Date(range.from).toISOString();

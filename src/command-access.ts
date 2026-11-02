@@ -1,12 +1,10 @@
-import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
-import { basename, dirname, resolve, sep } from "node:path";
-import { shellWords } from "./command-inspection.mjs";
+import { basename } from "node:path";
+import { shellWords } from "./shell-words.ts";
 
 const ASSIGNMENT = /^[A-Za-z_]\w*=/;
 const SEPARATOR = /^[;&|()\n]$/;
 const LAUNCHERS = new Set(["env", "rtk", "command", "exec", "timeout", "nice", "nohup", "time", "stdbuf"]);
-const OPTION_ARGUMENTS = {
+const OPTION_ARGUMENTS: Record<string, Set<string>> = {
 	env: new Set(["-u", "--unset", "-C", "--chdir", "--argv0"]),
 	exec: new Set(["-a"]),
 	timeout: new Set(["-s", "--signal", "-k", "--kill-after"]),
@@ -28,7 +26,7 @@ const OPTION_ARGUMENTS = {
 	]),
 };
 
-function executableIndex(words) {
+function executableIndex(words: string[]): number {
 	let i = 0;
 	while (i < words.length) {
 		if (ASSIGNMENT.test(words[i])) {
@@ -53,9 +51,9 @@ function executableIndex(words) {
 	return -1;
 }
 
-function commandSegments(command) {
-	const segments = [];
-	let current = [];
+function commandSegments(command: string): string[][] {
+	const segments: string[][] = [];
+	let current: string[] = [];
 	const flush = () => {
 		if (current.length) segments.push(current);
 		current = [];
@@ -80,7 +78,7 @@ function commandSegments(command) {
 	return segments;
 }
 
-export function commandExecutables(command) {
+export function commandExecutables(command: string): string[] {
 	return commandSegments(command).flatMap((words) => {
 		const index = executableIndex(words);
 		return index < 0 ? [] : [basename(words[index])];
@@ -155,7 +153,7 @@ const GCLOUD_GROUPS = new Set(
 	),
 );
 
-function cloudReadOnly(name, args) {
+function cloudReadOnly(name: string, args: string[]): boolean {
 	const positional = [];
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
@@ -177,7 +175,7 @@ function cloudReadOnly(name, args) {
 	return false;
 }
 
-function readOnlySegment(words) {
+function readOnlySegment(words: string[]): boolean {
 	const index = executableIndex(words);
 	if (index < 0) return false;
 	const name = basename(words[index]);
@@ -244,7 +242,7 @@ function readOnlySegment(words) {
 	return false;
 }
 
-function hasExpansion(command) {
+function hasExpansion(command: string): boolean {
 	let quote = "";
 	for (let i = 0; i < command.length; i++) {
 		const char = command[i];
@@ -269,7 +267,7 @@ function hasExpansion(command) {
 	return quote !== "";
 }
 
-export function commandAccess(command) {
+export function commandAccess(command: string): "read" | "write" {
 	// Expansions and shell programs need classifier review, not a read grant.
 	if (hasExpansion(command) || /<<|\b(?:source|eval)\b/.test(command)) return "write";
 	const words = shellWords(command);
@@ -284,114 +282,4 @@ export function commandAccess(command) {
 	}
 	const segments = commandSegments(command);
 	return segments.length > 0 && segments.every(readOnlySegment) ? "read" : "write";
-}
-
-const directory = (path) => {
-	const result = resolve(path);
-	return result.endsWith(sep) ? result : result + sep;
-};
-function inside(path, parent) {
-	const resolved = resolve(path),
-		base = resolve(parent);
-	return resolved === base || resolved.startsWith(directory(base));
-}
-const pathTargets = (targets) =>
-	targets.filter((target) => target.startsWith("path:")).map((target) => target.slice(5));
-const copy = (proposal) => ({ ...proposal, reasons: [...proposal.reasons], targets: [...proposal.targets] });
-
-export function proposeIntent({ command, cwd, grantableReasons, paths, home = homedir() }) {
-	if (!grantableReasons.length || paths.some((entry) => entry.unresolved)) return undefined;
-	const executables = [...new Set(commandExecutables(command))];
-	if (!executables.length) return undefined;
-	const directories = [
-		...new Set(
-			paths.map((entry) => {
-				const path = resolve(cwd, entry.path);
-				const roles = entry.role.split(", ");
-				return directory(roles.includes("working directory") || roles.includes("directory") ? path : dirname(path));
-			}),
-		),
-	];
-	if (directories.some((path) => resolve(path) === sep || resolve(path) === resolve(home))) return undefined;
-	const collapsed = directories.filter((path) => !directories.some((other) => other !== path && inside(path, other)));
-	const access = commandAccess(command);
-	const display = collapsed.map((path) => (inside(path, home) ? `~/${path.slice(directory(home).length)}` : path));
-	const label = `${access} via ${executables.join(", ")} in ${display.join(", ") || directory(cwd)}`.slice(0, 160);
-	return {
-		label,
-		access,
-		reasons: [...new Set(grantableReasons)],
-		targets: [...executables.map((name) => `exec:${name}`), ...collapsed.map((path) => `path:${path}`)],
-	};
-}
-
-function validProposal(proposal) {
-	return (
-		proposal &&
-		typeof proposal.label === "string" &&
-		proposal.label.trim().length > 0 &&
-		proposal.label.length <= 160 &&
-		["read", "write"].includes(proposal.access) &&
-		Array.isArray(proposal.reasons) &&
-		proposal.reasons.length > 0 &&
-		proposal.reasons.every((reason) => typeof reason === "string" && reason.length > 0) &&
-		Array.isArray(proposal.targets) &&
-		proposal.targets.length > 0 &&
-		proposal.targets.every((target) => typeof target === "string" && /^(?:path:\/|exec:[^/]+$)/.test(target))
-	);
-}
-
-export function isNarrowerOrEqual(edited, original) {
-	if (!validProposal(edited) || !validProposal(original)) return false;
-	if (edited.access === "write" && original.access !== "write") return false;
-	// No executable targets means unrestricted executables, not an empty set.
-	if (
-		original.targets.some((target) => target.startsWith("exec:")) &&
-		!edited.targets.some((target) => target.startsWith("exec:"))
-	)
-		return false;
-	if (!edited.reasons.every((reason) => original.reasons.includes(reason))) return false;
-	return edited.targets.every((target) =>
-		target.startsWith("path:")
-			? pathTargets(original.targets).some((parent) => inside(target.slice(5), parent))
-			: original.targets.includes(target),
-	);
-}
-
-export function grantCovers(grant, { command, reasons, paths }) {
-	if (!validProposal(grant) || !reasons.length || !reasons.every((reason) => grant.reasons.includes(reason)))
-		return false;
-	if (commandAccess(command) !== "read" && grant.access !== "write") return false;
-	const directories = pathTargets(grant.targets);
-	if (paths.some((entry) => entry.unresolved || !directories.some((parent) => inside(entry.path, parent))))
-		return false;
-	const execTargets = grant.targets.filter((target) => target.startsWith("exec:"));
-	return !execTargets.length || commandExecutables(command).every((name) => execTargets.includes(`exec:${name}`));
-}
-
-export function createIntentStore({ now = Date.now, randomId = randomUUID } = {}) {
-	const grants = new Map();
-	return {
-		add(sessionId, proposal) {
-			const grant = { ...copy(proposal), id: randomId(), sessionId, createdAt: now() };
-			grants.set(grant.id, grant);
-			return copy(grant);
-		},
-		match(sessionId, input) {
-			const grant = [...grants.values()].find(
-				(candidate) => candidate.sessionId === sessionId && grantCovers(candidate, input),
-			);
-			return grant ? copy(grant) : undefined;
-		},
-		list(sessionId) {
-			return [...grants.values()].filter((grant) => sessionId === undefined || grant.sessionId === sessionId).map(copy);
-		},
-		revoke(id) {
-			return grants.delete(id);
-		},
-		clear(sessionId) {
-			if (sessionId === undefined) grants.clear();
-			else for (const [id, grant] of grants) if (grant.sessionId === sessionId) grants.delete(id);
-		},
-	};
 }

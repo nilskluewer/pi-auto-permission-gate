@@ -8,7 +8,7 @@ import {
 	environmentIdentifiers,
 	isAccessChange,
 	NON_PRODUCTION_MARKERS,
-} from "../src/criticality.mjs";
+} from "../src/criticality.ts";
 
 const cloud = "cloud or infrastructure change";
 // Oracle: /tmp/pg-fatigue-contracts.md, Module A. These pairs reject policies

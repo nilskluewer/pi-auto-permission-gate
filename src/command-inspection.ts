@@ -1,11 +1,36 @@
 // Static evidence for permission review, not a shell parser or a sandbox.
 // Never execute code, expand shell expressions, or fetch remote dependencies.
 
-import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { open, realpath, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { realpath, stat } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
+import { localPath, readRegularFile, sensitivePath } from "./inspection-files.ts";
+import { DYNAMIC, INTERPRETER, LAUNCHER, localExecutable, OPTION_VALUE, SHELL_BRANCH, shellWords } from "./shell-words.ts";
+export { codeReviewReasons, shellWords } from "./shell-words.ts";
+
+export interface InspectedPath {
+	path: string;
+	role: string;
+	inspected: boolean;
+	unresolved?: boolean;
+}
+export interface Inspection {
+	command: string;
+	cwd: string;
+	paths: InspectedPath[];
+	notes: string[];
+	files: { path: string; content: string }[];
+	fingerprints: Map<string, string>;
+}
+interface InlineSource {
+	content: string;
+	base: string;
+	depth: number;
+	interpreter: string;
+}
+interface PathGroup {
+	directory: string;
+	files: (InspectedPath & { name: string })[];
+}
 
 export const INSPECTION_LIMITS = Object.freeze({
 	files: 16,
@@ -13,129 +38,26 @@ export const INSPECTION_LIMITS = Object.freeze({
 	depth: 4,
 	paths: 256,
 });
-const INTERPRETER =
-	/^(?:python(?:\d+(?:\.\d+)*)?|node|nodejs|bun|deno|bash|sh|zsh|dash|fish|ruby|perl|php|lua|Rscript)$/;
-const SCRIPT = /\.(?:py|[cm]?js|[cm]?ts|tsx|jsx|sh|bash|zsh|rb|pl|php|lua|r)$/i;
-const SHELL_BRANCH = /^(?:if|then|elif|else|for|while|until|do|case|select|function|coproc)$/;
-const localExecutable = (word) =>
-	word.includes("/") && (!isAbsolute(word) || !/^\/(?:usr\/)?s?bin\//.test(word) || SCRIPT.test(word));
-const DYNAMIC = /[$`*?[\]{}]/;
-const LAUNCHER = /^(?:env|rtk|uv|run|sudo|command|exec|timeout|nice|time|nohup|stdbuf)$/;
-const OPTION_VALUE =
-	/^(?:-u|-n|--unset|--user|--group|--project|--directory|--package|--with|--with-editable|--with-requirements|--extra|--python)$/;
-const SECRET =
-	/^(?:\.env(?:\..*)?|id_(?:rsa|ed25519|ecdsa)(?:\.pub)?|credentials(?:\..*)?|auth\.json|approval-(?:queue\.json|history\.jsonl)|.*\.(?:pem|key|p12|pfx))$/i;
-const sensitivePath = (path) =>
-	SECRET.test(basename(path)) || /(?:^|\/)(?:\.ssh|\.aws|\.azure|\.kube)(?:\/|$)|\/\.config\/gcloud\//.test(path);
-const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
-
-// Preserve word boundaries and quote contents for display. This intentionally does not
-// claim to understand expansions, heredocs, branches, aliases, or shell functions.
-export function shellWords(command) {
-	const words = [];
-	let value = "",
-		quote = "",
-		started = false;
-	const flush = () => {
-		if (started) words.push(value);
-		value = "";
-		started = false;
-	};
-	for (let i = 0; i < command.length; i++) {
-		const c = command[i];
-		if (c === "\\" && quote !== "'") {
-			started = true;
-			if (i + 1 < command.length) value += command[++i];
-		} else if (quote) {
-			if (c === quote) quote = "";
-			else value += c;
-		} else if (c === "'" || c === '"') {
-			quote = c;
-			started = true;
-		} else if (/\s/.test(c) || /[;&|<>()]/.test(c)) {
-			flush();
-			if (/[;&|<>\n()]/.test(c)) words.push(c);
-		} else {
-			value += c;
-			started = true;
-		}
-	}
-	flush();
-	return words;
-}
-
-export function codeReviewReasons(command) {
-	const words = shellWords(command);
-	let start = true;
-	for (let index = 0; index < words.length; index++) {
-		const word = words[index];
-		if (start && word.startsWith("-")) {
-			if (/^(?:-S|--split-string)(?:=|$)/.test(word)) return ["interpreter or script execution"];
-			if (OPTION_VALUE.test(word)) index++;
-			continue;
-		}
-		if (start && /^\d+(?:\.\d+)?[smh]?$/.test(word)) continue;
-		if (/^[;&|\n()]$/.test(word)) {
-			start = true;
-			continue;
-		}
-		if (start && localExecutable(word) && !/^[A-Za-z_]\w*=/.test(word)) return ["interpreter or script execution"];
-		if (start && (/^[A-Za-z_]\w*=/.test(word) || LAUNCHER.test(basename(word)))) continue;
-		if (start && SHELL_BRANCH.test(word)) return ["shell syntax requires classifier assessment"];
-		if (start && (INTERPRETER.test(basename(word)) || /^(?:source|\.|eval)$/.test(word) || localExecutable(word))) {
-			return ["interpreter or script execution"];
-		}
-		start = false;
-	}
-	return [];
-}
-
-async function readRegularFile(path, maxBytes) {
-	const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
-	try {
-		const info = await file.stat();
-		if (!info.isFile()) throw new Error("not a regular file");
-		if (info.size > maxBytes) throw new Error("inspection byte limit exceeded");
-		// Bound the actual read too: a file can grow after stat().
-		const buffer = Buffer.alloc(maxBytes + 1);
-		let size = 0;
-		while (size < buffer.length) {
-			const { bytesRead } = await file.read(buffer, size, buffer.length - size, null);
-			if (!bytesRead) break;
-			size += bytesRead;
-		}
-		if (size > maxBytes) throw new Error("inspection byte limit exceeded");
-		const bytes = buffer.subarray(0, size);
-		if (bytes.includes(0)) throw new Error("binary file; code was not inspected");
-		return { content: bytes.toString("utf8"), digest: hash(bytes) };
-	} finally {
-		await file.close();
-	}
-}
-
-function localPath(value, cwd) {
-	return resolve(cwd, value === "~" ? homedir() : value.startsWith("~/") ? join(homedir(), value.slice(2)) : value);
-}
-
-export async function inspectCommand(command, cwd) {
-	const paths = new Map();
+export async function inspectCommand(command: string, cwd: string): Promise<Inspection> {
+	const paths = new Map<string, InspectedPath>();
 	const notes = new Set([
 		"External packages, shell profiles, aliases, and runtime-created code are not included in static inspection.",
 		"Local dependency discovery supports common shell, Python, and JavaScript/TypeScript references; dynamic or unsupported import forms may be missing.",
 	]);
-	const files = [];
-	const fingerprints = new Map();
-	const queued = new Set();
-	const queue = [];
-	const inlineSources = [];
+	const files: Inspection["files"] = [];
+	const fingerprints = new Map<string, string>();
+	const queued = new Set<string>();
+	const queue: { entry: InspectedPath; depth: number }[] = [];
+	const inlineSources: InlineSource[] = [];
 	let bytes = 0;
 	let pathBytes = 0;
-	const add = (value, role, base = cwd) => {
+	const add = (value: string, role: string, base = cwd): InspectedPath | undefined => {
 		if (!value || /^(?:[a-z][a-z\d+.-]*:\/\/|data:)/i.test(value)) return;
 		const dynamic = DYNAMIC.test(value);
 		const path = dynamic ? value : localPath(value, base);
-		if (paths.has(path)) {
-			const entry = paths.get(path);
+		const existing = paths.get(path);
+		if (existing) {
+			const entry = existing;
 			if (!entry.role.split(", ").includes(role)) entry.role += `, ${role}`;
 			return entry;
 		}
@@ -158,21 +80,21 @@ export async function inspectCommand(command, cwd) {
 		if (dynamic) notes.add("Some paths contain runtime expressions or globs and could not be resolved.");
 		return entry;
 	};
-	const enqueue = (value, role, base, depth = 0) => {
+	const enqueue = (value: string, role: string, base: string, depth = 0): void => {
 		const entry = add(value, role, base);
 		if (!entry || entry.unresolved || queued.has(entry.path)) return;
 		queued.add(entry.path);
 		queue.push({ entry, depth });
 	};
 	add(cwd, "working directory");
-	const scanShell = async (shell, shellCwd, depth = 0) => {
+	const scanShell = async (shell: string, shellCwd: string, depth = 0): Promise<void> => {
 		const allWords = shellWords(shell);
 		const words = allWords.slice(0, 4096);
 		if (allWords.length > words.length) notes.add("Command word limit reached; inspection is incomplete.");
 		let base = shellCwd;
 		let start = true;
 		let activeCommand = "";
-		const inlineWords = new Set();
+		const inlineWords = new Set<number>();
 		for (let i = 0; i < words.length; i++) {
 			if (inlineWords.has(i)) continue;
 			const word = words[i];
@@ -304,7 +226,9 @@ export async function inspectCommand(command, cwd) {
 					const info = await stat(localPath(candidate, base));
 					if (info.isFile() || info.isDirectory())
 						add(candidate, info.isDirectory() ? "directory" : "referenced file", base);
-				} catch {}
+				} catch {
+					// Missing or unreadable candidates are not evidence of local files.
+				}
 			}
 		}
 		if (/[`$]|<<|\b(?:eval|exec)\b/.test(shell))
@@ -317,7 +241,7 @@ export async function inspectCommand(command, cwd) {
 			);
 	};
 	await scanShell(command, cwd);
-	const scanSource = async (content, source, depth) => {
+	const scanSource = async (content: string, source: string, depth: number): Promise<void> => {
 		const sourceDir = dirname(source);
 		if (/\.(?:sh|bash|zsh)$/.test(source) || /^#![^\n]*\b(?:ba|z|da)?sh\b/.test(content))
 			await scanShell(content, cwd, depth + 1);
@@ -378,7 +302,12 @@ export async function inspectCommand(command, cwd) {
 		)
 			notes.add(`Dynamic code loading was found in ${source}; its dependencies may be missing.`);
 	};
-	const resolveDependency = async (basePath, suffixes, depth, required = true) => {
+	const resolveDependency = async (
+		basePath: string,
+		suffixes: string[],
+		depth: number,
+		required = true,
+	): Promise<string | undefined> => {
 		for (const suffix of suffixes) {
 			const candidate = basePath + suffix;
 			try {
@@ -386,7 +315,9 @@ export async function inspectCommand(command, cwd) {
 					enqueue(candidate, "local dependency", cwd, depth + 1);
 					return candidate;
 				}
-			} catch {}
+			} catch {
+				// Missing or unreadable candidates are not evidence of local files.
+			}
 		}
 		if (required) {
 			add(basePath, "unresolved local dependency");
@@ -436,7 +367,7 @@ export async function inspectCommand(command, cwd) {
 			await scanSource(read.content, entry.path, depth);
 			await scanInline();
 		} catch (error) {
-			notes.add(`Code was not inspected: ${entry.path} (${error.message}).`);
+			notes.add(`Code was not inspected: ${entry.path} (${(error as Error).message}).`);
 		}
 	}
 	const displayNotes = [];
@@ -461,7 +392,7 @@ export async function inspectCommand(command, cwd) {
 	};
 }
 
-export async function inspectionIsFresh(inspection) {
+export async function inspectionIsFresh(inspection: Inspection): Promise<boolean> {
 	// Rebuild the graph as well as checking bytes. A previously missing module may
 	// have appeared, or import resolution may now select a different local file.
 	const current = await inspectCommand(inspection.command, inspection.cwd);
@@ -471,7 +402,7 @@ export async function inspectionIsFresh(inspection) {
 	);
 }
 
-export function inspectionPrompt(inspection) {
+export function inspectionPrompt(inspection: Pick<Inspection, "paths" | "notes" | "files">): string {
 	return JSON.stringify({
 		paths: inspection.paths,
 		limitations: inspection.notes,
@@ -479,12 +410,16 @@ export function inspectionPrompt(inspection) {
 	});
 }
 
-export function groupPaths(paths = []) {
-	const groups = new Map();
+export function groupPaths(paths: InspectedPath[] = []): PathGroup[] {
+	const groups = new Map<string, PathGroup["files"]>();
 	for (const entry of paths) {
 		const directory = entry.unresolved ? "Unresolved paths" : dirname(entry.path);
-		if (!groups.has(directory)) groups.set(directory, []);
-		groups.get(directory).push({
+		let files = groups.get(directory);
+		if (!files) {
+			files = [];
+			groups.set(directory, files);
+		}
+		files.push({
 			...entry,
 			name: entry.unresolved ? entry.path : basename(entry.path) || entry.path,
 		});
@@ -492,7 +427,7 @@ export function groupPaths(paths = []) {
 	return [...groups].map(([directory, files]) => ({ directory, files }));
 }
 
-export function formatPaths(paths = []) {
+export function formatPaths(paths: InspectedPath[] = []): string {
 	return groupPaths(paths)
 		.flatMap(({ directory, files }) => [
 			directory + (directory.endsWith("/") ? "" : "/"),

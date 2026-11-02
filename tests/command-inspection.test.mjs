@@ -11,7 +11,7 @@ import {
 	inspectCommand,
 	inspectionIsFresh,
 	inspectionPrompt,
-} from "../src/command-inspection.mjs";
+} from "../src/command-inspection.ts";
 
 async function project(t, files) {
 	const dir = await mkdtemp(join(tmpdir(), "gate-inspection-"));
@@ -241,7 +241,7 @@ test("a FIFO script cannot block the inspection worker", async (t) => {
 	const dir = await project(t, {});
 	const fifo = spawnSync("mkfifo", [join(dir, "blocked.py")]);
 	assert.equal(fifo.status, 0);
-	const module = new URL("../src/command-inspection.mjs", import.meta.url).href;
+	const module = new URL("../src/command-inspection.ts", import.meta.url).href;
 	const child = spawnSync(
 		process.execPath,
 		[

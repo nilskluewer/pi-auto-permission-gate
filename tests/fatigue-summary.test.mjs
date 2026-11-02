@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { formatFatigueSummary, readSessionDecisions, summarizeDecisions } from "../src/fatigue-summary.mjs";
+import { formatFatigueSummary, readSessionDecisions, summarizeDecisions } from "../src/fatigue-summary.ts";
 
 const fixtures = fileURLToPath(new URL("./fixtures/fatigue-sessions/", import.meta.url));
 
