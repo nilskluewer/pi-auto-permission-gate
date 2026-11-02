@@ -18,7 +18,7 @@ import type { AvailableClassifierModel, ModeState } from "./types.ts";
 export function refreshStatus(gate: GateState, ctx: ExtensionContext): void {
 	setGateStatus(
 		ctx,
-		gate.autoModeEnabled,
+		gate.gateEnabled,
 		gate.classifierModel,
 		gate.classifierThinkingLevel,
 		gate.availableClassifierModels,
@@ -43,7 +43,7 @@ export async function persistMode(
 	},
 ) {
 	const state: ModeState = {
-		autoModeEnabled: gate.autoModeEnabled,
+		autoModeEnabled: gate.gateEnabled,
 		classifierModel: cloneClassifierModelReference(gate.classifierModel),
 		classifierThinkingLevel: gate.classifierThinkingLevel,
 		classifierHistoryMessages: gate.classifierHistoryMessages,
@@ -58,8 +58,8 @@ export async function persistMode(
 }
 
 export async function setGate(gate: GateState, ctx: ExtensionContext, value: "on" | "off"): Promise<void> {
-	gate.autoModeEnabled = value === "on";
-	if (!gate.autoModeEnabled) {
+	gate.gateEnabled = value === "on";
+	if (!gate.gateEnabled) {
 		for (const controller of gate.activeReviews) controller.abort(gate.disabledReason);
 		clearSessionApprovals(gate);
 		gate.consecutiveDenials = 0;
@@ -71,7 +71,7 @@ export async function setGate(gate: GateState, ctx: ExtensionContext, value: "on
 	await persistMode(gate, ctx);
 	notify(
 		ctx,
-		`Permission gate: ${gate.autoModeEnabled ? "ON" : "OFF"}. ${gate.autoModeEnabled ? "Rules, classifier, and approvals are enabled." : "No checks, classifier, or approvals."}`,
+		`Permission gate: ${gate.gateEnabled ? "ON" : "OFF"}. ${gate.gateEnabled ? "Rules, classifier, and approvals are enabled." : "No checks, classifier, or approvals."}`,
 		"info",
 	);
 }

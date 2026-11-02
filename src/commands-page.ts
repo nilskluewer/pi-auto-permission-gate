@@ -94,7 +94,7 @@ function buildPermissionSettingsView(gate: GateState, ctx: ExtensionContext) {
 	syncScopedClassifierModels(gate, ctx);
 	const selected = findAvailableClassifierModel(gate.availableClassifierModels, gate.classifierModel);
 	return {
-		autoModeEnabled: gate.autoModeEnabled,
+		gateEnabled: gate.gateEnabled,
 		classifierModel: formatClassifierModelLabel(gate.classifierModel, selected, gate.classifierThinkingLevel),
 		classifierModelOptions: getPermissionSettingsModelOptions(gate),
 		classifierThinking: formatClassifierThinkingLevel(gate.classifierThinkingLevel, selected?.model),

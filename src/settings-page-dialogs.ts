@@ -11,7 +11,7 @@ export async function openPermissionSettingsWithDialogs(
 	state: PermissionSettingsView,
 ): Promise<PermissionSettingsAction | undefined> {
 	const cancel = "Cancel";
-	const gateOption = `Permission gate - ${state.autoModeEnabled ? "on" : "off"}`;
+	const gateOption = `Permission gate - ${state.gateEnabled ? "on" : "off"}`;
 	const mainOptions = [
 		gateOption,
 		`Classifier model - ${state.classifierModel}`,
@@ -31,8 +31,8 @@ export async function openPermissionSettingsWithDialogs(
 	if (!choice || choice === cancel) return undefined;
 	if (choice === gateOption) {
 		const selected = await ctx.ui.select(`Permission gate. ${GATE_OFF_DESCRIPTION}`, [
-			state.autoModeEnabled ? "on" : "off",
-			state.autoModeEnabled ? "off" : "on",
+			state.gateEnabled ? "on" : "off",
+			state.gateEnabled ? "off" : "on",
 			cancel,
 		]);
 		if (!selected || selected === cancel) return undefined;

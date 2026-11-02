@@ -30,7 +30,7 @@ export function registerSessionHooks(gate: GateState): void {
 			initializeAutoModePreferences(gate.dependencies, ctx),
 		]);
 		if (!gate.initialized) {
-			gate.autoModeEnabled = gate.dependencies.startOff?.() ? false : restored.autoModeEnabled;
+			gate.gateEnabled = gate.dependencies.startOff?.() ? false : restored.autoModeEnabled;
 			gate.initialized = true;
 		}
 		gate.classifierModel = cloneClassifierModelReference(restored.classifierModel);

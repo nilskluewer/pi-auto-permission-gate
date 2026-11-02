@@ -4,7 +4,7 @@ import { reviewBash } from "./review.ts";
 
 export function registerToolCallHook(gate: GateState): void {
 	gate.pi.on("tool_call", async (event, outerContext) => {
-		if (!gate.autoModeEnabled || !isToolCallEventType("bash", event)) return undefined;
+		if (!gate.gateEnabled || !isToolCallEventType("bash", event)) return undefined;
 		const controller = new AbortController();
 		gate.activeReviews.add(controller);
 		const signal = outerContext.signal ? AbortSignal.any([outerContext.signal, controller.signal]) : controller.signal;

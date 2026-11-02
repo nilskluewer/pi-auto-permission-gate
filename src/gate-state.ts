@@ -24,7 +24,7 @@ import type {
 export type GateState = {
 	pi: ExtensionAPI;
 	dependencies: PermissionGateDependencies;
-	autoModeEnabled: boolean;
+	gateEnabled: boolean;
 	classifierModel: ClassifierModelReference | null;
 	classifierThinkingLevel: ClassifierThinkingLevel;
 	classifierHistoryMessages: number;
@@ -57,7 +57,7 @@ export function createGateState(pi: ExtensionAPI, dependencies: PermissionGateDe
 	return {
 		pi,
 		dependencies,
-		autoModeEnabled: true,
+		gateEnabled: true,
 		classifierModel: cloneClassifierModelReference(DEFAULT_CLASSIFIER_MODEL),
 		classifierThinkingLevel: DEFAULT_CLASSIFIER_THINKING_LEVEL,
 		classifierHistoryMessages: DEFAULT_CLASSIFIER_HISTORY_MESSAGES,

@@ -19,7 +19,7 @@ function snapshotKey(inspection: CommandInspection): string {
 }
 
 function registerDenial(gate: GateState, ctx: ExtensionContext): boolean {
-	if (!gate.autoModeEnabled) return false;
+	if (!gate.gateEnabled) return false;
 	gate.consecutiveDenials += 1;
 	gate.totalDenials += 1;
 	if (gate.lockdown || (gate.consecutiveDenials < MAX_CONSECUTIVE_DENIALS && gate.totalDenials < MAX_TOTAL_DENIALS))

@@ -16,7 +16,7 @@ export type PermissionSettingsAction =
 export type PermissionSettingsOption = SelectItem;
 
 export interface PermissionSettingsView {
-	autoModeEnabled: boolean;
+	gateEnabled: boolean;
 	classifierModel: string;
 	classifierModelOptions: readonly PermissionSettingsOption[];
 	classifierThinking: string;

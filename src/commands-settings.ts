@@ -123,7 +123,7 @@ export async function handleAutoModeSettingsCommand(
 		const selected = findAvailableClassifierModel(gate.availableClassifierModels, gate.classifierModel);
 		notify(
 			ctx,
-			`Permission gate: ${gate.autoModeEnabled ? "ON" : "OFF"}; classifier model is ${formatClassifierModelLabel(gate.classifierModel, selected, gate.classifierThinkingLevel)}; context history: ${gate.classifierHistoryMessages} message${gate.classifierHistoryMessages === 1 ? "" : "s"}; approval wait: ${gate.approvalWaitSeconds}s; production patterns: ${gate.productionPatterns.join(", ")}; active grants: ${gate.intentStore.list(gate.gateSessionId).length}.`,
+			`Permission gate: ${gate.gateEnabled ? "ON" : "OFF"}; classifier model is ${formatClassifierModelLabel(gate.classifierModel, selected, gate.classifierThinkingLevel)}; context history: ${gate.classifierHistoryMessages} message${gate.classifierHistoryMessages === 1 ? "" : "s"}; approval wait: ${gate.approvalWaitSeconds}s; production patterns: ${gate.productionPatterns.join(", ")}; active grants: ${gate.intentStore.list(gate.gateSessionId).length}.`,
 			"info",
 		);
 		refreshStatus(gate, ctx);

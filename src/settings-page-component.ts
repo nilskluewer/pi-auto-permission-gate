@@ -21,7 +21,7 @@ export function createSettingsComponent(
 			id: "gate",
 			label: "Permission gate",
 			description: GATE_OFF_DESCRIPTION,
-			currentValue: state.autoModeEnabled ? "on" : "off",
+			currentValue: state.gateEnabled ? "on" : "off",
 			values: ["on", "off"],
 		},
 		{

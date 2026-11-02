@@ -334,24 +334,14 @@ pi install /path/to/pi-auto-permission-gate
 
 ## Development
 
-The extension entry point is `src/index.ts`.
+Start with [AGENTS.md](AGENTS.md) for contributor checks and change boundaries.
+Read [ARCHITECTURE.md](ARCHITECTURE.md) for the decision pipeline and module map.
 
-Run the unit tests with:
-
-```bash
-npm test
-```
-
-Inspect the npm tarball without publishing it with:
+Contributor commands (run conditions are in AGENTS.md):
 
 ```bash
-npm run pack:dry
-```
-
-Load the local package temporarily with:
-
-```bash
-pi -e .
+npm run check
+npm run smoke
 ```
 
 ## License

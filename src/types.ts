@@ -128,6 +128,7 @@ export type AvailableClassifierModel = {
 	modelName: string;
 };
 
+// Persisted in permission-gate.json. The key `autoModeEnabled` is the stored name of the gate on/off switch.
 export type ModeState = {
 	autoModeEnabled: boolean;
 	// null represents an explicitly malformed persisted model reference.
