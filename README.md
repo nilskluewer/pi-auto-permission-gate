@@ -310,6 +310,7 @@ The permission gate has one switch. When it is on, it runs full rule checks, the
 - The first row of `/automode-settings` ("Permission gate", values `on` / `off`, description `Off: no checks, classifier, or approvals.`) toggles the same switch.
 - Explicit toggles are persisted globally in `~/.pi/agent/permission-gate.json` (`autoModeEnabled`).
 - `pi --no-permission-gate` overrides this state for the current Pi process on startup without persisting the flag by itself; any explicit toggle afterward persists the new state.
+- `PI_PERMISSION_GATE=0` in the environment has the same effect as `--no-permission-gate`, for launchers that cannot pass CLI flags.
 - Turning the gate off cancels pending model or human review, starts no new review stages, and suppresses late approval messages. While the gate is off, the footer shows `permission gate: OFF`.
 
 ## Install

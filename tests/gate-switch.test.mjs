@@ -45,6 +45,16 @@ test("the default export registers --no-permission-gate", async () => {
 	assert.equal(NO_GATE_FLAG, "no-permission-gate");
 });
 
+test("--no-permission-gate or PI_PERMISSION_GATE=0 starts the gate off", async () => {
+	const { startsOff, GATE_ENV } = await import("../src/index.ts");
+	assert.equal(GATE_ENV, "PI_PERMISSION_GATE");
+	assert.equal(startsOff(true, {}), true);
+	assert.equal(startsOff(false, { PI_PERMISSION_GATE: "0" }), true);
+	assert.equal(startsOff(false, {}), false);
+	assert.equal(startsOff(false, { PI_PERMISSION_GATE: "1" }), false);
+	assert.equal(startsOff(false, { PI_PERMISSION_GATE: "" }), false);
+});
+
 // Off bypasses every rule and cancels all remaining stages of an active review.
 for (const commandName of ["permission-gate", "automode-settings"]) {
 	test(`${commandName} off disables the full gate and shares persisted status`, async () => {
