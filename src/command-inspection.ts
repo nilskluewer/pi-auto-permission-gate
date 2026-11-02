@@ -4,7 +4,16 @@
 import { realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { localPath, readRegularFile, sensitivePath } from "./inspection-files.ts";
-import { DYNAMIC, INTERPRETER, LAUNCHER, localExecutable, OPTION_VALUE, SHELL_BRANCH, shellWords } from "./shell-words.ts";
+import {
+	DYNAMIC,
+	INTERPRETER,
+	LAUNCHER,
+	localExecutable,
+	OPTION_VALUE,
+	SHELL_BRANCH,
+	shellWords,
+} from "./shell-words.ts";
+
 export { codeReviewReasons, shellWords } from "./shell-words.ts";
 
 export interface InspectedPath {

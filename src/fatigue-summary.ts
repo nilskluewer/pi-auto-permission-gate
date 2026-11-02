@@ -1,4 +1,5 @@
-import { open, readdir } from "node:fs/promises";
+import type { Dirent } from "node:fs";
+import { type FileHandle, open, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
 interface DecisionRange {
@@ -51,7 +52,7 @@ function objectRecord(value: unknown): value is Record<string, unknown> {
 export async function readSessionDecisions(sessionsDir: string, range: DecisionRange = {}): Promise<Decision[]> {
 	const decisions: Decision[] = [];
 	async function walk(directory: string, descend: boolean): Promise<void> {
-		let files;
+		let files: Dirent[];
 		try {
 			files = await readdir(directory, { withFileTypes: true });
 		} catch (error) {
@@ -69,7 +70,7 @@ export async function readSessionDecisions(sessionsDir: string, range: DecisionR
 		}
 	}
 	async function readFileDecisions(path: string): Promise<void> {
-		let handle;
+		let handle: FileHandle | undefined;
 		try {
 			handle = await open(path, "r");
 			for await (const line of handle.readLines()) {
@@ -91,7 +92,8 @@ export async function readSessionDecisions(sessionsDir: string, range: DecisionR
 					continue;
 				const data = "data" in record ? record.data : undefined;
 				if (!objectRecord(data) || !STATUSES.has(data.status) || !SOURCES.has(data.source)) continue;
-				const timestamp = data.timestamp ?? Date.parse(("timestamp" in record ? record.timestamp : undefined) as string);
+				const timestamp =
+					data.timestamp ?? Date.parse(("timestamp" in record ? record.timestamp : undefined) as string);
 				if (!finiteNumber(timestamp)) continue;
 				if (range.from !== undefined && timestamp < range.from) continue;
 				if (range.to !== undefined && timestamp > range.to) continue;

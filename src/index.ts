@@ -27,10 +27,10 @@ import {
 	inspectionIsFresh,
 	inspectionPrompt,
 	shellWords,
-} from "./command-inspection.mjs";
-import { assessCriticality, DEFAULT_PRODUCTION_PATTERNS, isAccessChange } from "./criticality.mjs";
-import { formatFatigueSummary, readSessionDecisions, summarizeDecisions } from "./fatigue-summary.mjs";
-import { commandAccess, createIntentStore, isNarrowerOrEqual, proposeIntent } from "./intent-grants.mjs";
+} from "./command-inspection.ts";
+import { assessCriticality, DEFAULT_PRODUCTION_PATTERNS, isAccessChange } from "./criticality.ts";
+import { formatFatigueSummary, readSessionDecisions, summarizeDecisions } from "./fatigue-summary.ts";
+import { commandAccess, createIntentStore, isNarrowerOrEqual, proposeIntent } from "./intent-grants.ts";
 
 type IntentProposal = { label: string; access: "read" | "write"; reasons: string[]; targets: string[] };
 type DecisionMeasurements = {

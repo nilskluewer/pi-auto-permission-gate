@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, resolve, sep } from "node:path";
 import { commandAccess, commandExecutables } from "./command-access.ts";
 import type { InspectedPath } from "./command-inspection.ts";
+
 export { commandAccess, commandExecutables } from "./command-access.ts";
 
 export interface IntentProposal {
@@ -89,16 +90,16 @@ function validProposal(proposal: unknown): proposal is IntentProposal {
 	const value = proposal as Partial<Record<keyof IntentProposal, unknown>> | null | undefined;
 	return Boolean(
 		value &&
-		typeof value.label === "string" &&
-		value.label.trim().length > 0 &&
-		value.label.length <= 160 &&
-		(value.access === "read" || value.access === "write") &&
-		Array.isArray(value.reasons) &&
-		value.reasons.length > 0 &&
-		value.reasons.every((reason) => typeof reason === "string" && reason.length > 0) &&
-		Array.isArray(value.targets) &&
-		value.targets.length > 0 &&
-		value.targets.every((target) => typeof target === "string" && /^(?:path:\/|exec:[^/]+$)/.test(target))
+			typeof value.label === "string" &&
+			value.label.trim().length > 0 &&
+			value.label.length <= 160 &&
+			(value.access === "read" || value.access === "write") &&
+			Array.isArray(value.reasons) &&
+			value.reasons.length > 0 &&
+			value.reasons.every((reason) => typeof reason === "string" && reason.length > 0) &&
+			Array.isArray(value.targets) &&
+			value.targets.length > 0 &&
+			value.targets.every((target) => typeof target === "string" && /^(?:path:\/|exec:[^/]+$)/.test(target)),
 	);
 }
 
@@ -133,7 +134,10 @@ export function grantCovers(grant: unknown, { command, reasons, paths }: GrantIn
 export function createIntentStore({
 	now = Date.now,
 	randomId = randomUUID,
-}: { now?: () => number; randomId?: () => string } = {}): IntentStore {
+}: {
+	now?: () => number;
+	randomId?: () => string;
+} = {}): IntentStore {
 	const grants = new Map<string, IntentGrant>();
 	return {
 		add(sessionId, proposal) {
