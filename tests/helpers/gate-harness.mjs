@@ -25,7 +25,7 @@ export function createHarness({
 			reasoning: true,
 		},
 	],
-	scopedModels = models.map((model) => ({ model })),
+	scopedModels = [],
 	providerDisplayNames = {},
 	providerAuth,
 	requestAuth,

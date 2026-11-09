@@ -153,10 +153,14 @@ export function cacheAvailableClassifierModels(ctx: {
 
 export function cacheScopedClassifierModels(ctx: {
 	scopedModels: readonly { model: unknown }[];
-	modelRegistry: { getProviderDisplayName: (provider: string) => string };
+	modelRegistry: {
+		getAvailable: () => readonly unknown[];
+		getProviderDisplayName: (provider: string) => string;
+	};
 }): AvailableClassifierModel[] {
+	// An empty Pi session scope permits all available models.
 	return describeClassifierModels(
-		ctx.scopedModels.map((scoped) => scoped.model),
+		ctx.scopedModels.length > 0 ? ctx.scopedModels.map((scoped) => scoped.model) : ctx.modelRegistry.getAvailable(),
 		(provider) => ctx.modelRegistry.getProviderDisplayName(provider),
 	);
 }

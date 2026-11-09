@@ -100,14 +100,14 @@ test("model picker and completions only expose scoped text models", async () => 
 	assert.doesNotMatch(harness.notifications.at(-1).message, /registry-only/);
 });
 
-test("warns instead of opening the picker when the session has no scoped models", async () => {
-	const harness = createHarness({ hasUI: true, scopedModels: [] });
+test("warns instead of opening the picker when no models are available", async () => {
+	const harness = createHarness({ hasUI: true, models: [], scopedModels: [] });
 
 	await harness.startSession();
 	await harness.commands.get("automode-settings").handler("model", harness.context);
 
 	assert.equal(harness.selectCalls.length, 0);
-	assert.match(harness.notifications.at(-1).message, /no scoped models/i);
+	assert.match(harness.notifications.at(-1).message, /no text-capable classifier models/i);
 	assert.match(harness.notifications.at(-1).message, /--models/);
 });
 

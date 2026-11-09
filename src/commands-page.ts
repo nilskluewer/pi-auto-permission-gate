@@ -45,8 +45,8 @@ function getPermissionSettingsModelOptions(gate: GateState): PermissionSettingsO
 	if (gate.scopedClassifierModels.length === 0) {
 		options.push({
 			value: "info:no-models",
-			label: "No scoped models available",
-			description: "Configure Pi's --models option or enabledModels setting to choose a model.",
+			label: "No text-capable models available",
+			description: "Check Pi's provider authentication and any --models or enabledModels scope.",
 		});
 		return options;
 	}

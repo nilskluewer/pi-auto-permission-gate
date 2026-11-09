@@ -10,8 +10,8 @@ export const DEFAULT_CLASSIFIER_MODEL: ClassifierModelReference = {
 	provider: AUTO_MODE_MODEL_PROVIDER,
 	id: AUTO_MODE_MODEL_ID,
 };
-export const NO_SCOPED_CLASSIFIER_MODELS_WARNING =
-	"This session has no scoped models. Configure a session model scope with Pi's --models option or the enabledModels setting before using the model picker.";
+export const NO_CLASSIFIER_MODELS_WARNING =
+	"No text-capable classifier models are available in this session. Check Pi's provider authentication and any --models or enabledModels scope.";
 export const STATUS_ID = "permission-gate";
 export const GATE_COMMAND = "permission-gate";
 export const MODE_ENTRY_TYPE = "permission-gate-mode";

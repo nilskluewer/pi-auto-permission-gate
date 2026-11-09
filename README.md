@@ -60,6 +60,7 @@ For example, `find build -type f -delete` passes without confirmation.
 Recursive `rm` is never allowed without a check while the gate is enabled: the classifier, or the user when human review is required, must approve every `rm -r` or `rm -rf`.
 Variables assigned once from `$(mktemp ...)` and `$TMPDIR` are not hard-blocked, so the classifier can approve temp-directory cleanup.
 Parent paths, filesystem roots, `.git` metadata, shell expansions, globs, and broad `find . -delete` remain protected.
+
 - Package execution and publishing commands such as `npm run`, `npm publish`, and `npx`.
 - `sudo` and recursive `chmod` or `chown` commands.
 - World-writable permissions such as `chmod 777`.
@@ -163,8 +164,9 @@ Choose the classifier with these central settings commands:
 `/automode-settings model provider/model-id` selects the exact provider and model ID and also works in noninteractive modes.
 The provider is the text before the first slash, so model IDs containing additional slashes are supported.
 `/automode-settings model reset` restores `github-copilot/gpt-6-luna`.
-The picker and model argument completions use only scoped text-capable models from the current Pi session.
-Configure a session model scope with Pi's `--models` option or the `enabledModels` setting before using the picker.
+The picker and model argument completions use text-capable models from the current Pi session scope.
+Without a configured scope, they use all available authenticated text-capable models. No scope setup is needed after installation.
+Pi's `--models` option or the `enabledModels` setting limits the picker and completions to that scope.
 Explicit `provider/model-id` arguments still resolve exact current models from Pi's model registry.
 The command autocomplete does not expose authentication details.
 

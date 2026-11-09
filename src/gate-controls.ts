@@ -128,7 +128,10 @@ export function syncScopedClassifierModels(
 	gate: GateState,
 	ctx: {
 		scopedModels: readonly { model: unknown }[];
-		modelRegistry: { getProviderDisplayName: (provider: string) => string };
+		modelRegistry: {
+			getAvailable: () => readonly unknown[];
+			getProviderDisplayName: (provider: string) => string;
+		};
 	},
 ): void {
 	try {

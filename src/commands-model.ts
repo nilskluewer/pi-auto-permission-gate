@@ -17,7 +17,7 @@ import {
 	DEFAULT_CLASSIFIER_THINKING_LEVEL,
 	MAX_CLASSIFIER_HISTORY_MESSAGES,
 	MIN_CLASSIFIER_HISTORY_MESSAGES,
-	NO_SCOPED_CLASSIFIER_MODELS_WARNING,
+	NO_CLASSIFIER_MODELS_WARNING,
 } from "./constants.ts";
 import {
 	canPromptForSelection,
@@ -53,7 +53,7 @@ export async function handleClassifierModelCommand(
 		syncScopedClassifierModels(gate, ctx);
 		const models = gate.scopedClassifierModels;
 		if (models.length === 0) {
-			notify(ctx, NO_SCOPED_CLASSIFIER_MODELS_WARNING, "warning");
+			notify(ctx, NO_CLASSIFIER_MODELS_WARNING, "warning");
 			return;
 		}
 
