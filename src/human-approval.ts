@@ -1,11 +1,10 @@
 import { basename, join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createApprovalRequester } from "./approval-client.ts";
-import { formatPaths } from "./command-inspection.ts";
 import { getAgentConfigDirectory } from "./config-paths.ts";
 import { APPROVAL_STATE_FILENAME, LATE_ANSWER_WINDOW_MS } from "./constants.ts";
 import type { GateState } from "./gate-state.ts";
-import { preview } from "./text.ts";
+import { selectTerminalApproval } from "./terminal-approval.ts";
 import type { ApprovalOutcome, ApprovalRequest, ApprovalRequester, HumanDecision } from "./types.ts";
 
 function getApprovalRequester(gate: GateState): ApprovalRequester | undefined {
@@ -178,26 +177,9 @@ export function askHuman(
 			...(intentOption ? [intentOption] : []),
 			"Redirect…",
 		];
-		const title = [
-			`Execution summary: ${request.tldr}`,
-			`Recommended: ${request.recommendation}`,
-			`Permission gate: ${request.risk.toUpperCase()} risk`,
-			...(request.environment ? [`Environment: ${request.environment}`] : []),
-			"",
-			`Project: ${basename(ctx.cwd)} — ${ctx.cwd}`,
-			"",
-			"Files and paths:",
-			formatPaths(request.paths),
-			"Static references only; runtime code can construct additional paths.",
-			...(request.pathNotes ?? []),
-			"",
-			preview(request.command),
-			"",
-			"Allow this command to run? (You can also answer in the browser queue.)",
-		].join("\n");
 		void (async () => {
 			while (!settled) {
-				const choice = await ctx.ui.select(title, options, { signal: terminal.signal });
+				const choice = await selectTerminalApproval(ctx, request, options, terminal.signal);
 				if (settled) return;
 				if (terminal.signal.aborted) return settle({ approved: false, cancelled: true });
 				if (choice === "Redirect…") {

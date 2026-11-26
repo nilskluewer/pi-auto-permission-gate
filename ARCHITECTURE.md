@@ -35,6 +35,8 @@ Paths below are relative to `src/`. Each line names one module or asset.
 - `session.ts`: session initialization, reset, and branch status refresh.
 - `review.ts`: decision sequence and fresh-evidence retries.
 - `human-approval.ts`: races terminal and browser answers and handles late answers.
+- `terminal-approval.ts`: formats terminal approval data and selects TUI or RPC dialogs.
+- `terminal-approval-component.ts`: compact terminal approval with expandable, scrollable details.
 - `gate-controls.ts`: state changes, persistence requests, model caches, and approval reset.
 - `gate-display.ts`: status text, notifications, and Pi custom entries.
 - `gate-renderer.ts`: decision entry renderer.

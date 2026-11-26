@@ -156,7 +156,14 @@ test("repeated denials start a lockdown that a human can lift", async () => {
 	assert.equal(await run(harness, "echo hello"), undefined);
 	assert.equal(harness.classifierCalls.length, callsBefore);
 	assert.match(harness.selectCalls.at(-1).title, /Lockdown/);
-	assert.deepEqual(harness.selectCalls.at(-1).options, ["No", "Yes", "Yes, and lift lockdown", "Redirect…"]);
+	assert.deepEqual(harness.selectCalls.at(-1).options, [
+		"No",
+		"Yes",
+		"Yes, and lift lockdown",
+		"Redirect…",
+		"Show files and paths…",
+		"Show command / inline code…",
+	]);
 
 	// The human lifted it, so harmless commands run freely again.
 	const selectsBefore = harness.selectCalls.length;

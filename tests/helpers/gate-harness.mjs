@@ -6,7 +6,8 @@ import { createPermissionGate } from "../../src/gate.ts";
 
 export function createHarness({
 	hasUI = false,
-	mode = "tui",
+	// Dialog fixtures use RPC; TUI tests provide a custom component driver.
+	mode = "rpc",
 	activeModel = { provider: "active-provider", id: "active-model" },
 	choice,
 	modelChoice,
