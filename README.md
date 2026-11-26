@@ -86,7 +86,7 @@ A command that matches a pattern is shown to the user for review, but confirmati
 
 ## Behavior
 
-In interactive mode, the extension displays the matched reasons and a truncated command preview.
+In interactive mode, the extension displays an execution summary, risk, recommendation, and approval choices. Files, inspection notes, and the complete command are available on demand.
 When human review is required, the command runs only after an explicit approval, either once or under a session intent grant.
 When the permission gate is enabled, hard-deny operations are blocked before the classifier or human confirmation flow. When the permission gate is off, no checks run.
 
@@ -244,7 +244,9 @@ In an interactive session the request is sent to one shared local approval queue
 The queue is a small local web server (`127.0.0.1`, random port) that all pi sessions on the machine share, so you watch one browser tab.
 The first request starts the server and opens the tab.
 Each card shows the project name and full working directory, a visible **Execution summary**, risk, recommendation, exact command, matched rules, and session. The summary describes the execution and its important effects, not just why review was requested.
-A collapsed **Files and paths** section groups filenames under each full directory, with roles and code-inspection status. It includes identified inputs, scripts, directories, outputs, and deletion targets. Dynamic references and incomplete inspection are marked explicitly: this is a static list, not a claim to show every runtime access. History details retain the same grouping. Terminal approvals show the project, explanation, and grouped paths as text.
+A collapsed **Files and paths** section groups filenames under each full directory, with roles and code-inspection status. It includes identified inputs, scripts, directories, outputs, and deletion targets. Dynamic references and incomplete inspection are marked explicitly: this is a static list, not a claim to show every runtime access. History details retain the same grouping.
+
+Terminal approvals start with the execution summary, risk, recommendation, environment when known, and project. A separate **Details** menu contains **Files and paths** and **Command / inline code**, collapsed by default. This menu and its expanded content appear above the approval question and choices. Use the arrow keys to select a section and Enter or Space to toggle it; Page Up and Page Down scroll the expanded details without replacing the approval menu. On short terminals, the menu scrolls around the selected choice; details may require a taller terminal. Long summaries continue in the command details. The command section shows the complete command, including inline code, not the contents of referenced source files. No is selected by default; Up moves into the details menu, and Escape denies. RPC clients use a compact selection dialog with separate **Show files and paths…** and **Show command / inline code…** choices that return to the approval dialog.
 Critical cards are red and need a second click to approve. You can add a note for the agent when you deny.
 The wait defaults to **300 seconds** (5 minutes). If you do not answer, the gate records **expired**, cancels the terminal dialog, and parks the browser request. The command does not run. The agent is told to continue with other work that does not need the command, or end its turn and ask in plain text. The browser request stays answerable for 10 more minutes after the wait ends.
 
